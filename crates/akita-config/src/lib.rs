@@ -139,6 +139,10 @@ pub fn policy_of<Cfg: CommitmentConfig>() -> PlannerPolicy {
         cost_model: akita_planner::PlannerCostModelId::ExactPayloadAndSetupEnvelope,
         selection_policy: if recursive_setup_planning {
             akita_planner::SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope
+        } else if Cfg::selection_payload_slack_permille() > 0 {
+            akita_planner::SelectionPolicyId::MinRootRankThenPayloadWithinSlack {
+                slack_permille: Cfg::selection_payload_slack_permille(),
+            }
         } else {
             akita_planner::SelectionPolicyId::MinEstimatedProofPayload
         },
@@ -319,6 +323,17 @@ pub trait CommitmentConfig: Clone + Send + Sync + 'static {
     /// setup offloading override this and use a separate generated catalog.
     fn recursive_setup_planning() -> bool {
         false
+    }
+
+    /// Payload slack (in permille of the byte-optimal candidate) within which
+    /// schedule selection may prefer a smaller root inner SIS rank `n_a`.
+    ///
+    /// `n_a` multiplies the entire commit kernel, so trading a fraction of a
+    /// percent of proof size for a lower rank is usually prover-time positive.
+    /// The default `0` keeps the pure payload objective. Only consulted for
+    /// direct-only planning.
+    fn selection_payload_slack_permille() -> u32 {
+        0
     }
 
     /// Optional shipped schedule catalog for this preset.

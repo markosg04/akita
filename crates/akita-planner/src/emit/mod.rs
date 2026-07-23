@@ -424,6 +424,15 @@ fn emit_witness_chunk(cfg: akita_types::ChunkedWitnessCfg) -> String {
     )
 }
 
+fn emit_selection_policy(id: crate::SelectionPolicyId) -> String {
+    match id {
+        crate::SelectionPolicyId::MinRootRankThenPayloadWithinSlack { slack_permille } => {
+            format!("MinRootRankThenPayloadWithinSlack {{ slack_permille: {slack_permille} }}")
+        }
+        other => other.name().to_string(),
+    }
+}
+
 fn emit_identity_const(identity: &GeneratedScheduleCatalogIdentity) -> String {
     let ring_dims: String = identity
         .ring_dimensions
@@ -467,7 +476,7 @@ fn emit_identity_const(identity: &GeneratedScheduleCatalogIdentity) -> String {
         family_name = identity.family_name,
         protocol_epoch = identity.protocol_epoch,
         cost_model = identity.cost_model.name(),
-        selection_policy = identity.selection_policy.name(),
+        selection_policy = emit_selection_policy(identity.selection_policy),
         max_setup_envelope_field_elements = identity.max_setup_envelope_field_elements,
         min_offloaded_witness_contraction = identity.min_offloaded_witness_contraction,
         sis_modulus_profile = emit_sis_modulus_profile(identity.sis_modulus_profile),

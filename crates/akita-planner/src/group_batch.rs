@@ -733,11 +733,29 @@ fn find_group_batch_schedule_inner(
                                 ));
                             }
                         };
+                    // PERF ITERATION SCAFFOLDING: dump every scored root
+                    // candidate so time-vs-bytes corners can be compared
+                    // offline. Remove before upstreaming.
+                    if std::env::var_os("AKITA_PLANNER_DEBUG_CANDIDATES").is_some() {
+                        eprintln!(
+                            "root-candidate lb={candidate_log_basis} ppb=2^{position_index_bits} live_blocks={} n_a={} n_b={} folds={} root_payload={root_direct_payload_bytes} total_bytes={total}",
+                            fold_candidate_params.num_live_blocks,
+                            fold_candidate_params.inner_commit_matrix.output_rank(),
+                            fold_candidate_params.outer_commit_matrix.output_rank(),
+                            1 + suffix_fold.folds.len(),
+                        );
+                    }
                     let is_better = if let Some(best) = &best {
                         match policy.selection_policy {
-                            crate::SelectionPolicyId::MinEstimatedProofPayload => {
-                                total < best.total_bytes
-                            }
+                            // Multi-group roots do not implement rank-aware
+                            // slack selection; they fall back to the payload
+                            // objective. Single-group (scalar) keys — the only
+                            // shape Jolt schedules — take `find_schedule`,
+                            // which honors the slack.
+                            crate::SelectionPolicyId::MinEstimatedProofPayload
+                            | crate::SelectionPolicyId::MinRootRankThenPayloadWithinSlack {
+                                ..
+                            } => total < best.total_bytes,
                             crate::SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope => {
                                 let setup_field_len = first_direct_setup_field_len.ok_or_else(|| {
                                     AkitaError::InvalidSetup(

@@ -65,6 +65,12 @@ impl PlannerCostModelId {
 pub enum SelectionPolicyId {
     MinEstimatedProofPayload,
     MinFirstDirectSetupThenPayloadWithinSupportedEnvelope,
+    /// Prover-time-aware selection: among candidates whose estimated payload
+    /// is within `slack_permille` of the byte-optimal candidate, prefer the
+    /// smallest root inner SIS rank `n_a` (the factor that multiplies the
+    /// entire commit kernel), then the smallest payload. `0` is equivalent to
+    /// [`Self::MinEstimatedProofPayload`].
+    MinRootRankThenPayloadWithinSlack { slack_permille: u32 },
 }
 
 impl SelectionPolicyId {
@@ -72,6 +78,11 @@ impl SelectionPolicyId {
         match self {
             Self::MinEstimatedProofPayload => 1,
             Self::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope => 2,
+            // The slack is selection-relevant, so it must be identity-bound;
+            // encode it in a disjoint tag namespace to keep tags injective.
+            Self::MinRootRankThenPayloadWithinSlack { slack_permille } => {
+                0x5A00_0000 | slack_permille
+            }
         }
     }
 
@@ -80,6 +91,9 @@ impl SelectionPolicyId {
             Self::MinEstimatedProofPayload => "MinEstimatedProofPayload",
             Self::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope => {
                 "MinFirstDirectSetupThenPayloadWithinSupportedEnvelope"
+            }
+            Self::MinRootRankThenPayloadWithinSlack { .. } => {
+                "MinRootRankThenPayloadWithinSlack"
             }
         }
     }
@@ -152,7 +166,12 @@ impl PlannerPolicy {
     pub fn direct_only(self) -> Self {
         Self {
             recursive_setup_planning: false,
-            selection_policy: SelectionPolicyId::MinEstimatedProofPayload,
+            // Slack-based selection is a refinement of the payload policy, so
+            // it survives the direct-only projection.
+            selection_policy: match self.selection_policy {
+                keep @ SelectionPolicyId::MinRootRankThenPayloadWithinSlack { .. } => keep,
+                _ => SelectionPolicyId::MinEstimatedProofPayload,
+            },
             ..self
         }
     }

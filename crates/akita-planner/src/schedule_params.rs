@@ -237,12 +237,19 @@ fn witness_partition(num_chunks: usize) -> WitnessPartition {
 /// Returns [`AkitaError::InvalidSetup`] for an invalid [`akita_types::ChunkedWitnessCfg`], or
 /// `num_activated_levels` beyond the planner recursion cap. Verifier-reachable: never panics.
 pub(crate) fn validate_policy(policy: &PlannerPolicy) -> Result<(), AkitaError> {
-    let expected_selection_policy = if policy.recursive_setup_planning {
-        crate::SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope
+    let selection_policy_ok = if policy.recursive_setup_planning {
+        matches!(
+            policy.selection_policy,
+            crate::SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope
+        )
     } else {
-        crate::SelectionPolicyId::MinEstimatedProofPayload
+        matches!(
+            policy.selection_policy,
+            crate::SelectionPolicyId::MinEstimatedProofPayload
+                | crate::SelectionPolicyId::MinRootRankThenPayloadWithinSlack { .. }
+        )
     };
-    if policy.selection_policy != expected_selection_policy {
+    if !selection_policy_ok {
         return Err(AkitaError::InvalidSetup(
             "planner selection policy disagrees with recursive setup capability".to_string(),
         ));
@@ -417,6 +424,15 @@ fn find_schedule_inner(
 
     let field_bits = policy.decomposition.field_bits();
     let mut best: Option<CandidateScheduleChoice> = None;
+    // Rank-aware selection collects every scored candidate and picks the
+    // smallest root inner rank within the payload slack after the sweep.
+    let slack_permille = match policy.selection_policy {
+        crate::SelectionPolicyId::MinRootRankThenPayloadWithinSlack { slack_permille } => {
+            Some(slack_permille as usize)
+        }
+        _ => None,
+    };
+    let mut slack_candidates: Vec<(usize, usize, CandidateScheduleChoice)> = Vec::new();
     let fold_challenge_shape = fold_shape(AkitaScheduleInputs {
         num_vars: key.num_vars(),
         level: 0,
@@ -525,13 +541,28 @@ fn find_schedule_inner(
                     Some(next_witness_binding),
                 )? + eor_bytes;
                 let total = root_proof_size + suffix_fold.total_bytes;
+                // PERF ITERATION SCAFFOLDING: dump every scored root candidate
+                // so time-vs-bytes corners can be compared offline. Remove
+                // before upstreaming.
+                if std::env::var_os("AKITA_PLANNER_DEBUG_CANDIDATES").is_some() {
+                    eprintln!(
+                        "root-candidate lb={candidate_log_basis} block_bits={block_index_bits} ppb={} live_blocks={} n_a={} n_b={} folds={} root_payload={root_proof_size} total_bytes={total}",
+                        candidate_params.num_positions_per_block,
+                        candidate_params.num_live_blocks,
+                        candidate_params.inner_commit_matrix.output_rank(),
+                        candidate_params.outer_commit_matrix.output_rank(),
+                        1 + suffix_fold.folds.len(),
+                    );
+                }
                 let mut root_envelope = akita_types::SetupMatrixEnvelope::minimum().max_setup_len;
                 akita_types::accumulate_matrix_envelope_for_level(
                     &candidate_params,
                     &mut root_envelope,
                 )?;
                 let setup_envelope = root_envelope.max(suffix_fold.setup_envelope_ring_elements);
-                if best.as_ref().is_none_or(|best| total < best.total_bytes) {
+                let is_streaming_best =
+                    best.as_ref().is_none_or(|best| total < best.total_bytes);
+                if is_streaming_best || slack_permille.is_some() {
                     let mut folds = Vec::with_capacity(1 + suffix_fold.folds.len());
                     folds.push(CandidateFoldStep {
                         params: candidate_params.clone(),
@@ -541,15 +572,37 @@ fn find_schedule_inner(
                         estimated_stage3_payload_bytes: 0,
                     });
                     folds.extend(suffix_fold.folds.iter().cloned());
-                    best = Some(CandidateScheduleChoice {
+                    let choice = CandidateScheduleChoice {
                         first_direct_setup_field_len: None,
                         total_bytes: total,
                         setup_envelope_ring_elements: setup_envelope,
                         folds,
                         terminal: suffix_fold.terminal.clone(),
-                    });
+                    };
+                    if slack_permille.is_some() {
+                        slack_candidates.push((
+                            total,
+                            candidate_params.inner_commit_matrix.output_rank(),
+                            choice,
+                        ));
+                    } else if is_streaming_best {
+                        best = Some(choice);
+                    }
                 }
             }
+        }
+    }
+
+    if let Some(slack) = slack_permille {
+        if let Some(min_total) = slack_candidates.iter().map(|(total, ..)| *total).min() {
+            let budget = min_total.saturating_add(min_total.saturating_mul(slack) / 1000);
+            // `min_by_key` keeps the first minimum, so ties resolve in sweep
+            // order — deterministic for a fixed policy and key.
+            best = slack_candidates
+                .into_iter()
+                .filter(|(total, ..)| *total <= budget)
+                .min_by_key(|&(total, rank, _)| (rank, total))
+                .map(|(.., choice)| choice);
         }
     }
 
