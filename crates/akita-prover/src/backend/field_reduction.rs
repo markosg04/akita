@@ -1,6 +1,6 @@
 //! Tensor extension-opening packing helpers.
 
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, HasWide, ReduceTo};
 use akita_field::{AdditiveGroup, CanonicalField, FromPrimitiveInt, MulBaseUnreduced};
 use akita_field::{AkitaError, ExtField, FieldCore};
 use akita_types::{pack_tensor_base_lift_i8_digits, FpExtEncoding};
@@ -162,8 +162,9 @@ where
 
 impl<F, const D: usize> RootCommitKernel<RootTensorProjectionView<'_, F, D>, F, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + HasCommitAccum,
     F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn commit_inner(
         &self,
@@ -194,8 +195,9 @@ where
 
 impl<F, const D: usize> OpeningFoldKernel<RootTensorProjectionView<'_, F, D>, F, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + HasCommitAccum,
     F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn evaluate_and_fold(
         &self,
@@ -253,8 +255,9 @@ where
 impl<F, const D: usize> OpeningBatchKernel<RootTensorProjectionBatchView<'_, F, D>, F, D>
     for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + HasCommitAccum,
     F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn decompose_fold_batch(
         &self,
@@ -326,8 +329,9 @@ where
 impl<F, E, const D: usize> TensorProjectionKernel<RootTensorProjectionView<'_, F, D>, F, E, D>
     for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + HasCommitAccum,
     F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     E: ExtField<F>,
 {
     fn column_partials(
@@ -412,8 +416,9 @@ where
 impl<F, E, const D: usize>
     TensorProjectionBatchKernel<RootTensorProjectionBatchView<'_, F, D>, F, E, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + HasCommitAccum,
     F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     E: ExtField<F>,
 {
     fn column_partials_batch(

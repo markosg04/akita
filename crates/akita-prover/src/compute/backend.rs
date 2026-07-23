@@ -5,7 +5,7 @@ use crate::compute::plans::{
 };
 use crate::AkitaProverSetup;
 use akita_algebra::CyclotomicRing;
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{AdditiveGroup, AkitaError, CanonicalField, FieldCore, HalvingField};
 use akita_types::{dispatch_for_field, AkitaExpandedSetup, NttCacheKey};
 use std::sync::Arc;
@@ -166,8 +166,8 @@ where
         plan: OneHotCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>;
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>;
 
     /// Sparse signed-ring A-side commit rows.
     fn sparse_ring_commit_rows<const D: usize>(
@@ -176,8 +176,8 @@ where
         plan: SparseRingCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>;
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>;
 
     /// Recursive witness A-side commit rows.
     fn recursive_witness_commit_rows<const D: usize>(

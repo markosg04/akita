@@ -16,8 +16,10 @@ use crate::{AdditiveGroup, CanonicalField, FieldCore};
 use super::prime::{Fp128, Fp32, Fp64};
 
 mod accum;
+mod lazy128;
 mod native_algebra;
 pub use accum::*;
+pub use lazy128::Fp128Lazy;
 
 /// Wide unreduced accumulator for `Fp32`: 2 × i32 limbs (16-bit data each).
 #[cfg_attr(feature = "jolt-compat", derive(allocative::Allocative))]
@@ -813,6 +815,41 @@ impl<const P: u64> HasWide for Fp64<P> {
 
 impl<const P: u128> HasWide for Fp128<P> {
     type Wide = Fp128x8i32;
+}
+
+/// Accumulator for unit-scale add/sub streams (the one-hot commit sweep).
+///
+/// Distinct from [`HasWide`]: no small-scalar scaling is required, so fields
+/// with a cheaper lazily-reduced representation can override the default
+/// digit-limbed accumulator. `MAX_COMMIT_ACCUMULATIONS` bounds how many
+/// unit-scale accumulations are safe before overflow (`usize::MAX` = no cap).
+pub trait HasCommitAccum: FieldCore {
+    /// The accumulator type for unit-scale add/sub streams.
+    type CommitAccum: AdditiveGroup + From<Self> + ReduceTo<Self>;
+
+    /// Unit-scale accumulations safe before overflow (`usize::MAX` = no cap).
+    const MAX_COMMIT_ACCUMULATIONS: usize;
+}
+
+/// Wide accumulators hold 16-bit digits in i32 lanes, so they can absorb at
+/// most 2^15 unit-scale additions before a lane can overflow.
+const MAX_WIDE_LANE_ACCUMULATIONS: usize = 1 << 15;
+
+impl<const P: u32> HasCommitAccum for Fp32<P> {
+    type CommitAccum = Fp32x2i32;
+    const MAX_COMMIT_ACCUMULATIONS: usize = MAX_WIDE_LANE_ACCUMULATIONS;
+}
+
+impl<const P: u64> HasCommitAccum for Fp64<P> {
+    type CommitAccum = Fp64x4i32;
+    const MAX_COMMIT_ACCUMULATIONS: usize = MAX_WIDE_LANE_ACCUMULATIONS;
+}
+
+impl<const P: u128> HasCommitAccum for Fp128<P> {
+    /// Full-width lazily-reduced residue: half the bytes of [`Fp128x8i32`]
+    /// and no accumulation cap.
+    type CommitAccum = Fp128Lazy<P>;
+    const MAX_COMMIT_ACCUMULATIONS: usize = usize::MAX;
 }
 
 #[cfg(test)]

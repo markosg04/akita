@@ -48,8 +48,8 @@ fn column_sweep_core<E, F, const D: usize>(
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     column_sweep_core_budgeted::<E, F, D>(
         a_view,
@@ -73,15 +73,15 @@ fn column_sweep_core_budgeted<E, F, const D: usize>(
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let num_live_blocks = blocks.len();
     // Row-pass accumulation: one wide ring per block is live at a time, so
     // the tile is sized by a single row's accumulators. This lets a thread's
     // whole block range fit one tile at trace-scale shapes, which is what
     // bounds how often the A matrix is re-streamed.
-    let accum_bytes = D * std::mem::size_of::<F::Wide>();
+    let accum_bytes = D * std::mem::size_of::<F::CommitAccum>();
     let block_tile = tile_budget
         .checked_div(accum_bytes)
         .map_or(num_live_blocks, |tile| tile.max(1))
@@ -160,7 +160,7 @@ where
                 for slot in &mut result[tile_start..tile_end] {
                     *slot = Vec::with_capacity(n_a);
                 }
-                let mut row_accums: Vec<WideCyclotomicRing<F::Wide, D>> =
+                let mut row_accums: Vec<WideCyclotomicRing<F::CommitAccum, D>> =
                     vec![WideCyclotomicRing::zero(); tile_len];
 
                 {
@@ -214,11 +214,11 @@ pub(crate) fn column_sweep_core_row_outer_budgeted<E, F, const D: usize>(
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let num_live_blocks = blocks.len();
-    let accum_bytes = n_a * D * std::mem::size_of::<F::Wide>();
+    let accum_bytes = n_a * D * std::mem::size_of::<F::CommitAccum>();
     let block_tile = tile_budget
         .checked_div(accum_bytes)
         .map_or(num_live_blocks, |tile| tile.max(1))
@@ -272,7 +272,7 @@ where
                         }
                     }
                 }
-                let mut accums: Vec<Vec<WideCyclotomicRing<F::Wide, D>>> = (0..tile_len)
+                let mut accums: Vec<Vec<WideCyclotomicRing<F::CommitAccum, D>>> = (0..tile_len)
                     .map(|_| vec![WideCyclotomicRing::zero(); n_a])
                     .collect();
                 for (a_idx, a_row) in a_view.rows().enumerate().take(n_a) {
@@ -317,8 +317,8 @@ pub(crate) fn sweep_bench_entry<E, F, const D: usize>(
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     match variant {
         "row_pass" => column_sweep_core_budgeted::<E, F, D>(
@@ -333,10 +333,11 @@ where
 
 /// Column-sweep Ajtai commitment for one-hot blocks.
 ///
-/// Uses [`column_sweep_core`] for the tiled sweep plus a safety fallback when
-/// any block would exceed [`MAX_WIDE_SHIFT_ACCUMULATIONS`] shift-adds (the
-/// wide accumulator would overflow) and a small-block fast path when
-/// `blocks_per_thread` is already L2-friendly.
+/// Uses [`column_sweep_core`] for the tiled sweep plus sub-block chunking
+/// when any block would exceed `F::MAX_COMMIT_ACCUMULATIONS` shift-adds
+/// (capped accumulators would overflow; lazily-reduced accumulators are
+/// uncapped, so the chunking never triggers for them) and a small-block fast
+/// path when `blocks_per_thread` is already L2-friendly.
 pub(crate) fn column_sweep_ajtai_onehot<E, F, const D: usize>(
     a_view: &RingMatrixView<'_, F, D>,
     blocks: &[&[E]],
@@ -346,8 +347,8 @@ pub(crate) fn column_sweep_ajtai_onehot<E, F, const D: usize>(
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let num_live_blocks = blocks.len();
     debug_assert!(
@@ -357,7 +358,7 @@ where
 
     if blocks
         .iter()
-        .any(|entries| shift_accumulation_count(entries) > MAX_WIDE_SHIFT_ACCUMULATIONS)
+        .any(|entries| shift_accumulation_count(entries) > F::MAX_COMMIT_ACCUMULATIONS)
     {
         // Oversized blocks are split into segments that each respect the wide
         // accumulators' headroom, swept through the tiled kernel as
@@ -375,7 +376,7 @@ where
                 let mut accumulations = 0usize;
                 for entry in rest {
                     let count = entry.coeffs().len();
-                    if take > 0 && accumulations + count > MAX_WIDE_SHIFT_ACCUMULATIONS {
+                    if take > 0 && accumulations + count > F::MAX_COMMIT_ACCUMULATIONS {
                         break;
                     }
                     accumulations += count;

@@ -24,7 +24,7 @@ use super::plans::{
 };
 use crate::{CommitInnerWitness, DecomposeFoldWitness};
 use akita_algebra::CyclotomicRing;
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{
     AdditiveGroup, AkitaError, CanonicalField, ExtField, FieldCore, FromPrimitiveInt, HalvingField,
 };
@@ -315,8 +315,8 @@ where
         plan: OneHotCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     {
         CpuBackend.onehot_commit_rows(prepared, plan)
     }
@@ -327,8 +327,8 @@ where
         plan: SparseRingCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     {
         CpuBackend.sparse_ring_commit_rows(prepared, plan)
     }

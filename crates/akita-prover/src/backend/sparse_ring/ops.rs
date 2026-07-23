@@ -1,6 +1,6 @@
 //! Source-typed views and `CpuBackend` kernels for [`super::SparseRingPoly`].
 
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{
     AdditiveGroup, AkitaError, CanonicalField, ExtField, FieldCore, FromPrimitiveInt,
     MulBaseUnreduced,
@@ -125,8 +125,8 @@ where
 
 impl<F, const D: usize> RootCommitKernel<SparseRingView<'_, F, D>, F, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn commit_inner(
         &self,
@@ -140,8 +140,8 @@ where
 
 impl<F, const D: usize> OpeningFoldKernel<SparseRingView<'_, F, D>, F, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn evaluate_and_fold(
         &self,
@@ -191,8 +191,8 @@ where
 
 impl<F, const D: usize> OpeningBatchKernel<SparseRingBatchView<'_, F, D>, F, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     fn decompose_fold_batch(
         &self,
@@ -223,8 +223,8 @@ where
 
 impl<F, E, const D: usize> TensorProjectionKernel<SparseRingView<'_, F, D>, F, E, D> for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     E: ExtField<F>,
 {
     fn column_partials(
@@ -267,8 +267,8 @@ where
 impl<F, E, const D: usize> TensorProjectionBatchKernel<SparseRingBatchView<'_, F, D>, F, E, D>
     for CpuBackend
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     E: ExtField<F>,
 {
     fn column_partials_batch(

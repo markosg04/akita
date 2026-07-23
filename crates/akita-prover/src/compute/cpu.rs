@@ -17,7 +17,7 @@ use crate::kernels::linear::{
     CrtI8CapacityProfile,
 };
 use akita_algebra::CyclotomicRing;
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{AdditiveGroup, AkitaError, CanonicalField, FieldCore, HalvingField};
 use akita_types::{
     dispatch_for_field, prepare_ntt_cache, AkitaExpandedSetup, NttCacheKey, NttCacheMode,
@@ -415,8 +415,8 @@ where
         plan: OneHotCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     {
         let active_a_cols = plan
             .num_positions_per_block
@@ -454,8 +454,8 @@ where
         plan: SparseRingCommitRowsPlan<'_>,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError>
     where
-        F: HasWide,
-        F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
     {
         let active_a_cols = plan
             .num_positions_per_block

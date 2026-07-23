@@ -8,7 +8,7 @@ use akita_algebra::ring::cyclotomic::WideCyclotomicRing;
 use akita_algebra::CyclotomicRing;
 use akita_challenges::{SparseChallenge, TensorChallenges as TensorChallengeSet};
 use akita_field::parallel::*;
-use akita_field::unreduced::{HasWide, ReduceTo};
+use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{AdditiveGroup, AkitaError, CanonicalField, FieldCore, FromPrimitiveInt};
 use akita_types::{embed_ring_subfield_vector, RingMatrixView};
 use std::collections::HashMap;
@@ -438,8 +438,8 @@ where
 
 impl<F> SparseRingPoly<F>
 where
-    F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + FromPrimitiveInt + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     pub(crate) fn fold_blocks<const D: usize>(
         &self,
@@ -781,11 +781,11 @@ pub(crate) fn column_sweep_sparse<F, const D: usize>(
     num_digits_inner: usize,
 ) -> Vec<Vec<CyclotomicRing<F, D>>>
 where
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let num_live_blocks = blocks.len();
-    let accum_bytes = n_a * D * std::mem::size_of::<F::Wide>();
+    let accum_bytes = n_a * D * std::mem::size_of::<F::CommitAccum>();
     let block_tile = L2_TILE_BUDGET
         .checked_div(accum_bytes)
         .map_or(num_live_blocks, |tile| tile.max(1));
@@ -814,7 +814,7 @@ where
             for tile_start in (0..my_count).step_by(block_tile) {
                 let tile_end = (tile_start + block_tile).min(my_count);
                 let tile_len = tile_end - tile_start;
-                let mut accums: Vec<Vec<WideCyclotomicRing<F::Wide, D>>> = (0..tile_len)
+                let mut accums: Vec<Vec<WideCyclotomicRing<F::CommitAccum, D>>> = (0..tile_len)
                     .map(|_| vec![WideCyclotomicRing::zero(); n_a])
                     .collect();
 

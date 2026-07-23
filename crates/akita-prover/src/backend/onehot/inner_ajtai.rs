@@ -21,11 +21,11 @@ pub(crate) fn inner_ajtai_wide_onehot<E, F, const D: usize>(
 ) -> Vec<CyclotomicRing<F, D>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let n_a = a_view.num_rows();
-    let mut t_wide = vec![WideCyclotomicRing::<F::Wide, D>::zero(); n_a];
+    let mut t_wide = vec![WideCyclotomicRing::<F::CommitAccum, D>::zero(); n_a];
 
     for entry in entries {
         let col = entry.commit_col(num_digits);
@@ -48,8 +48,8 @@ pub(crate) fn inner_ajtai_wide_single_chunk_tiled<F, const D: usize>(
     num_digits: usize,
 ) -> Vec<CyclotomicRing<F, D>>
 where
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let n_a = a_view.num_rows();
     let mut t = vec![CyclotomicRing::<F, D>::zero(); n_a];
@@ -75,11 +75,11 @@ pub(crate) fn inner_ajtai_wide_onehot_safe<E, F, const D: usize>(
 ) -> Vec<CyclotomicRing<F, D>>
 where
     E: OneHotEntry,
-    F: FieldCore + CanonicalField + HasWide,
-    F::Wide: AdditiveGroup + From<F> + ReduceTo<F>,
+    F: FieldCore + CanonicalField + HasCommitAccum,
+    F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
 {
     let n_a = a_view.num_rows();
-    let mut t_wide = vec![WideCyclotomicRing::<F::Wide, D>::zero(); n_a];
+    let mut t_wide = vec![WideCyclotomicRing::<F::CommitAccum, D>::zero(); n_a];
     let mut t: Option<Vec<CyclotomicRing<F, D>>> = None;
     let mut shift_accumulations = 0usize;
 
