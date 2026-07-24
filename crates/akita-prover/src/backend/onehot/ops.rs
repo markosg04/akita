@@ -147,6 +147,16 @@ where
     ) -> Result<CommitInnerWitness<F>, AkitaError> {
         source.poly.commit_inner::<_, D>(self, prepared, plan)
     }
+
+    fn commit_inner_group(
+        &self,
+        prepared: &Self::PreparedSetup,
+        sources: Vec<OneHotView<'_, F, D, I>>,
+        plan: CommitInnerPlan,
+    ) -> Result<Vec<CommitInnerWitness<F>>, AkitaError> {
+        let polys: Vec<&OneHotPoly<F, I>> = sources.iter().map(|source| source.poly).collect();
+        OneHotPoly::commit_inner_group::<_, D>(&polys, self, prepared, plan)
+    }
 }
 
 impl<F, const D: usize, I> OpeningFoldKernel<OneHotView<'_, F, D, I>, F, D> for CpuBackend
@@ -845,5 +855,42 @@ where
         )?;
 
         CommitInnerWitness::from_parts(t, decomposed_inner_rows)
+    }
+
+    /// Group commit: one fused A pass for every polynomial of the batch.
+    #[tracing::instrument(skip_all, name = "OneHotPoly::commit_inner_group")]
+    pub(crate) fn commit_inner_group<B, const D: usize>(
+        polys: &[&Self],
+        backend: &B,
+        prepared: &B::PreparedSetup,
+        plan: CommitInnerPlan,
+    ) -> Result<Vec<CommitInnerWitness<F>>, AkitaError>
+    where
+        B: CommitmentComputeBackend<F>,
+    {
+        let blocks: Vec<std::sync::Arc<OneHotBlocks>> = cfg_iter!(polys)
+            .map(|poly| poly.blocks_for(D, plan.num_positions_per_block))
+            .collect::<Result<_, _>>()?;
+        let plans = blocks
+            .iter()
+            .map(|blocks| OneHotCommitRowsPlan {
+                n_a: plan.n_a,
+                num_positions_per_block: plan.num_positions_per_block,
+                num_digits_inner: plan.num_digits_inner,
+                blocks: blocks.commit_plan_blocks(),
+            })
+            .collect();
+        let group_t = backend.onehot_commit_rows_multi::<D>(prepared, plans)?;
+        cfg_into_iter!(group_t)
+            .map(|t| {
+                let decomposed_inner_rows =
+                    crate::kernels::linear::decompose_commit_blocks_into::<F, D>(
+                        &t,
+                        plan.num_digits_outer,
+                        plan.log_basis_outer,
+                    )?;
+                CommitInnerWitness::from_parts(t, decomposed_inner_rows)
+            })
+            .collect()
     }
 }

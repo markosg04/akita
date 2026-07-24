@@ -321,6 +321,18 @@ where
         CpuBackend.onehot_commit_rows(prepared, plan)
     }
 
+    fn onehot_commit_rows_multi<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        plans: Vec<OneHotCommitRowsPlan<'_>>,
+    ) -> Result<Vec<Vec<Vec<CyclotomicRing<F, D>>>>, AkitaError>
+    where
+        F: HasCommitAccum,
+        F::CommitAccum: AdditiveGroup + From<F> + ReduceTo<F>,
+    {
+        CpuBackend.onehot_commit_rows_multi(prepared, plans)
+    }
+
     fn sparse_ring_commit_rows<const D: usize>(
         &self,
         prepared: &Self::PreparedSetup,
