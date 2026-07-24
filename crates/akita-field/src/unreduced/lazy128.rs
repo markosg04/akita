@@ -37,17 +37,20 @@ impl<const P: u128> Fp128Lazy<P> {
     /// value `< WRAP`, so the second correction cannot wrap a third time.
     #[inline(always)]
     fn lazy_add(a: u128, b: u128) -> u128 {
+        // Mask-select the corrections: `if carry { WRAP } else { 0 }` can
+        // compile to a branch, and carries are ~coin-flip mid-accumulation,
+        // so a branch mispredicts constantly in the sweep's hot loop.
         let (s, c1) = a.overflowing_add(b);
-        let (s, c2) = s.overflowing_add(if c1 { Self::WRAP } else { 0 });
-        s.wrapping_add(if c2 { Self::WRAP } else { 0 })
+        let (s, c2) = s.overflowing_add(Self::WRAP & (c1 as u128).wrapping_neg());
+        s.wrapping_add(Self::WRAP & (c2 as u128).wrapping_neg())
     }
 
     /// `a - b` over residues in `[0, 2^128)`; mirror of [`Self::lazy_add`].
     #[inline(always)]
     fn lazy_sub(a: u128, b: u128) -> u128 {
         let (s, b1) = a.overflowing_sub(b);
-        let (s, b2) = s.overflowing_sub(if b1 { Self::WRAP } else { 0 });
-        s.wrapping_sub(if b2 { Self::WRAP } else { 0 })
+        let (s, b2) = s.overflowing_sub(Self::WRAP & (b1 as u128).wrapping_neg());
+        s.wrapping_sub(Self::WRAP & (b2 as u128).wrapping_neg())
     }
 }
 

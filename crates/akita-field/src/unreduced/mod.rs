@@ -846,10 +846,13 @@ impl<const P: u64> HasCommitAccum for Fp64<P> {
 }
 
 impl<const P: u128> HasCommitAccum for Fp128<P> {
-    /// Full-width lazily-reduced residue: half the bytes of [`Fp128x8i32`]
-    /// and no accumulation cap.
-    type CommitAccum = Fp128Lazy<P>;
-    const MAX_COMMIT_ACCUMULATIONS: usize = usize::MAX;
+    /// Measured negative result: [`Fp128Lazy`] halves accumulator bytes but
+    /// loses ~1.9x to the NEON digit-limbed type in the commit sweep — the
+    /// row-pass tiles are already L1-resident, so the accumulate is ALU-bound
+    /// and scalar u128 carry-correction chains cannot match 8-lane i32 adds.
+    /// Keep the wide type; `Fp128Lazy` stays available for A/B probes.
+    type CommitAccum = Fp128x8i32;
+    const MAX_COMMIT_ACCUMULATIONS: usize = MAX_WIDE_LANE_ACCUMULATIONS;
 }
 
 #[cfg(test)]
