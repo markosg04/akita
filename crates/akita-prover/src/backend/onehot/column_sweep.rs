@@ -419,6 +419,9 @@ where
             let mut result: Vec<Vec<CyclotomicRing<F, D>>> = Vec::with_capacity(my_count);
             result.resize_with(my_count, || Vec::with_capacity(n_a));
 
+            let mut chunk_buf: Vec<WideCyclotomicRing<F::CommitAccum, D>> =
+                vec![WideCyclotomicRing::zero(); col_chunk];
+
             for tile_start in (0..my_count).step_by(block_tile) {
                 let tile_end = (tile_start + block_tile).min(my_count);
                 let tile_len = tile_end - tile_start;
@@ -457,6 +460,10 @@ where
                         if !live {
                             continue;
                         }
+                        for (buf, col) in chunk_buf.iter_mut().zip(chunk_start..chunk_end) {
+                            *buf = WideCyclotomicRing::from_ring(&a_row[col]);
+                        }
+
                         for (local_b, entries) in tile_blocks.iter().enumerate() {
                             let cur = &mut cursors[local_b];
                             while let Some(entry) = entries.get(*cur) {
@@ -468,7 +475,7 @@ where
                                     col >= chunk_start,
                                     "one-hot entries must be sorted by position within a block"
                                 );
-                                let a_ring = &a_row[col];
+                                let a_wide = &chunk_buf[col - chunk_start];
                                 let coeffs = entry.coeffs();
                                 if accum_counts[local_b] + coeffs.len()
                                     > F::MAX_COMMIT_ACCUMULATIONS
@@ -479,8 +486,7 @@ where
                                 }
                                 accum_counts[local_b] += coeffs.len();
                                 for &coefficient in coeffs {
-                                    WideCyclotomicRing::shift_accumulate_ring_into(
-                                        a_ring,
+                                    a_wide.shift_accumulate_into(
                                         &mut row_accums[local_b],
                                         usize::from(coefficient),
                                     );
@@ -553,18 +559,21 @@ where
                 })
                 .collect()
         } else {
-            // Wide tiles maximize how many blocks reuse each A column per
-            // pass (the widen now happens in-register per use, so nothing
-            // competes with the accumulators for cache). The kernel
-            // self-reduces at the accumulation cap, so oversized blocks need
-            // no splitting.
+            // Keep the accumulator tile plus the widened-column chunk inside
+            // L1: the accumulators are read-modify-written for every column
+            // chunk, so pushing them to L2 costs ~1.5x per accumulate. Extra
+            // tiles re-stream A, but the fused batch makes that negligible.
+            // The kernel self-reduces at the accumulation cap, so oversized
+            // blocks need no splitting.
+            let accum_bytes = D * std::mem::size_of::<F::CommitAccum>();
+            let merge_tile_budget = (accum_bytes * 32).min(L2_TILE_BUDGET);
             column_sweep_core_merge::<E, F, D>(
                 a_view,
                 &flat,
                 n_a,
                 active_a_cols,
                 num_digits_inner,
-                L2_TILE_BUDGET,
+                merge_tile_budget,
                 MERGE_COL_CHUNK,
             )
         };

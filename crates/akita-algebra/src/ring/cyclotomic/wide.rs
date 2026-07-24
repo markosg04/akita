@@ -42,35 +42,6 @@ impl<W: AdditiveGroup, const D: usize> WideCyclotomicRing<W, D> {
         }
     }
 
-    /// Fused widen + negacyclic shift + accumulate from a canonical ring:
-    /// `dst += ring * X^k`, widening each coefficient in-register.
-    ///
-    /// Equivalent to `Self::from_ring(ring).shift_accumulate_into(dst, k)`
-    /// without materializing the widened ring — the widen amortizes over
-    /// registers instead of a staging buffer, which matters when a column is
-    /// reused only a handful of times per pass.
-    #[inline]
-    pub fn shift_accumulate_ring_into<F: FieldCore>(
-        ring: &CyclotomicRing<F, D>,
-        dst: &mut Self,
-        k: usize,
-    ) where
-        W: From<F>,
-    {
-        debug_assert!(
-            k < D,
-            "fused method shift_accumulate_ring_into: k={k} must be < D={D}"
-        );
-        let (lo, hi) = dst.coeffs.split_at_mut(k);
-        let (src_lo, src_hi) = ring.coeffs.split_at(D - k);
-        for (d, s) in hi.iter_mut().zip(src_lo) {
-            *d += W::from(*s); // i + k < D
-        }
-        for (d, s) in lo.iter_mut().zip(src_hi) {
-            *d -= W::from(*s); // i + k >= D
-        }
-    }
-
     /// Fused negacyclic shift + accumulate: `dst += self * X^k`.
     ///
     /// Requires `k < D`.
