@@ -7,7 +7,7 @@ use super::*;
 /// Tiles the matrix columns to keep each tile in L2, eliminating the full `ntt_vec`
 /// materialization of the non-tiled path.
 /// Tile width is auto-computed from ring parameters and target L2 cache size.
-#[tracing::instrument(skip_all, name = "mat_vec_mul_ntt_single_i8")]
+#[tracing::instrument(skip_all, fields(num_rows, num_cols), name = "mat_vec_mul_ntt_single_i8")]
 pub fn mat_vec_mul_ntt_single_i8<F: FieldCore + CanonicalField, const D: usize>(
     slot: &PreparedNttCache<D>,
     num_rows: usize,
@@ -45,7 +45,7 @@ pub fn mat_vec_mul_ntt_single_i8<F: FieldCore + CanonicalField, const D: usize>(
 }
 
 /// Cyclic-domain variant of [`mat_vec_mul_ntt_single_i8`].
-#[tracing::instrument(skip_all, name = "mat_vec_mul_ntt_single_i8_cyclic")]
+#[tracing::instrument(skip_all, fields(num_rows, num_cols), name = "mat_vec_mul_ntt_single_i8_cyclic")]
 pub fn mat_vec_mul_ntt_single_i8_cyclic<F: FieldCore + CanonicalField, const D: usize>(
     slot: &PreparedNttCache<D>,
     num_rows: usize,

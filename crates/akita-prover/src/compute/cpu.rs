@@ -179,6 +179,12 @@ fn build_ntt_slot_for_key<F: FieldCore + CanonicalField>(
             .shared_matrix()
             .ring_view::<RING_D>(1, key.num_ring_elements)?;
         let cache = Arc::new(prepare_ntt_cache(view, NttCacheMode::BothTransforms)?);
+        tracing::info!(
+            ring_d = RING_D,
+            num_ring_elements = key.num_ring_elements,
+            cache_bytes = cache.cache_bytes(),
+            "built shared-matrix NTT slot"
+        );
         Ok(ErasedCpuNttCache {
             ring_d: RING_D,
             cache_bytes: cache.cache_bytes(),
