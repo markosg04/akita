@@ -178,8 +178,10 @@ where
                             let a_wide = WideCyclotomicRing::from_ring(&a_row[col]);
                             for &entry in &packed_entries[start..end] {
                                 let (local_block, coefficient) = unpack_col_entry(entry);
-                                a_wide
-                                    .shift_accumulate_into(&mut row_accums[local_block], coefficient);
+                                a_wide.shift_accumulate_into(
+                                    &mut row_accums[local_block],
+                                    coefficient,
+                                );
                             }
                         }
                         for (local_b, accum) in row_accums.iter().enumerate() {
@@ -267,7 +269,8 @@ where
                     for entry in blocks[block_start + tile_start + local_b] {
                         let col = entry.commit_col(num_digits_inner);
                         for &coefficient in entry.coeffs() {
-                            packed_entries[write_offsets[col]] = pack_col_entry(local_b, coefficient);
+                            packed_entries[write_offsets[col]] =
+                                pack_col_entry(local_b, coefficient);
                             write_offsets[col] += 1;
                         }
                     }
@@ -285,7 +288,10 @@ where
                         let a_wide = WideCyclotomicRing::from_ring(&a_row[col]);
                         for &entry in &packed_entries[start..end] {
                             let (local_block, coefficient) = unpack_col_entry(entry);
-                            a_wide.shift_accumulate_into(&mut accums[local_block][a_idx], coefficient);
+                            a_wide.shift_accumulate_into(
+                                &mut accums[local_block][a_idx],
+                                coefficient,
+                            );
                         }
                     }
                 }
@@ -322,10 +328,20 @@ where
 {
     match variant {
         "row_pass" => column_sweep_core_budgeted::<E, F, D>(
-            a_view, blocks, n_a, active_a_cols, num_digits_inner, tile_budget,
+            a_view,
+            blocks,
+            n_a,
+            active_a_cols,
+            num_digits_inner,
+            tile_budget,
         ),
         "row_outer" => column_sweep_core_row_outer_budgeted::<E, F, D>(
-            a_view, blocks, n_a, active_a_cols, num_digits_inner, tile_budget,
+            a_view,
+            blocks,
+            n_a,
+            active_a_cols,
+            num_digits_inner,
+            tile_budget,
         ),
         other => panic!("unknown sweep variant {other}"),
     }
@@ -621,8 +637,7 @@ where
         // per-block fallback walked entries in position order and re-streamed
         // `n_a` A rings per hot coefficient, which dominated trace-scale
         // commits (~2^18 hot coefficients per block at 2^26 cycles).
-        let (sub_blocks, parents) =
-            split_oversized_blocks(blocks, F::MAX_COMMIT_ACCUMULATIONS);
+        let (sub_blocks, parents) = split_oversized_blocks(blocks, F::MAX_COMMIT_ACCUMULATIONS);
         let sub_out =
             column_sweep_core::<E, F, D>(a_view, &sub_blocks, n_a, active_a_cols, num_digits_inner);
         let mut out: Vec<Vec<CyclotomicRing<F, D>>> = vec![Vec::new(); num_live_blocks];

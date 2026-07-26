@@ -1477,7 +1477,11 @@ fn merge_sweep_matches_bucketed_core_across_polys() {
         .collect();
     let polys_views: Vec<Vec<&[SingleChunkEntry]>> = polys_blocks
         .iter()
-        .map(|blocks| (0..blocks.num_live_blocks()).map(|i| blocks.block(i)).collect())
+        .map(|blocks| {
+            (0..blocks.num_live_blocks())
+                .map(|i| blocks.block(i))
+                .collect()
+        })
         .collect();
 
     // Direct core-vs-core equality over the concatenated batch.
@@ -1532,7 +1536,10 @@ fn merge_sweep_matches_bucketed_core_across_polys() {
         3 * D * std::mem::size_of::<<F as HasCommitAccum>::CommitAccum>(),
         5,
     );
-    assert_eq!(merge_tiny_tiles, bucketed, "merge sweep must be tile-size independent");
+    assert_eq!(
+        merge_tiny_tiles, bucketed,
+        "merge sweep must be tile-size independent"
+    );
 }
 
 #[test]
@@ -1563,8 +1570,9 @@ fn merge_sweep_self_reduces_oversized_blocks() {
         .map(|pos| SingleChunkEntry::new((pos * 11) as u32, (pos % D) as u16))
         .collect();
     let blocks = super::test_helpers::from_buckets(vec![big, small]);
-    let views: Vec<&[SingleChunkEntry]> =
-        (0..blocks.num_live_blocks()).map(|i| blocks.block(i)).collect();
+    let views: Vec<&[SingleChunkEntry]> = (0..blocks.num_live_blocks())
+        .map(|i| blocks.block(i))
+        .collect();
 
     let merge = column_sweep_core_merge::<SingleChunkEntry, F, D>(
         &a_view,
@@ -1576,14 +1584,12 @@ fn merge_sweep_self_reduces_oversized_blocks() {
         MERGE_COL_CHUNK,
     );
     // Reference: the splitting wrapper (overflow-safe by segmentation).
-    let wrapper = column_sweep_ajtai_onehot::<SingleChunkEntry, F, D>(
-        &a_view,
-        &views,
-        n_a,
-        active_a_cols,
-        1,
+    let wrapper =
+        column_sweep_ajtai_onehot::<SingleChunkEntry, F, D>(&a_view, &views, n_a, active_a_cols, 1);
+    assert_eq!(
+        merge, wrapper,
+        "self-reducing merge must match the splitting wrapper"
     );
-    assert_eq!(merge, wrapper, "self-reducing merge must match the splitting wrapper");
 }
 
 /// Merge-sweep tuning matrix: times the fused-batch kernel across
@@ -1622,8 +1628,9 @@ fn merge_sweep_bench() {
         })
         .collect();
     let blocks = super::test_helpers::from_buckets(buckets);
-    let views: Vec<&[SingleChunkEntry]> =
-        (0..blocks.num_live_blocks()).map(|i| blocks.block(i)).collect();
+    let views: Vec<&[SingleChunkEntry]> = (0..blocks.num_live_blocks())
+        .map(|i| blocks.block(i))
+        .collect();
     let total_accums: usize = views.iter().map(|v| v.len()).sum::<usize>() * n_a;
 
     let accum_bytes = D * std::mem::size_of::<<F as HasCommitAccum>::CommitAccum>();
@@ -1691,8 +1698,9 @@ fn merge_sweep_thread_probe() {
         })
         .collect();
     let blocks = super::test_helpers::from_buckets(buckets);
-    let views: Vec<&[SingleChunkEntry]> =
-        (0..blocks.num_live_blocks()).map(|i| blocks.block(i)).collect();
+    let views: Vec<&[SingleChunkEntry]> = (0..blocks.num_live_blocks())
+        .map(|i| blocks.block(i))
+        .collect();
     let total_accums: usize = views.iter().map(|v| v.len()).sum::<usize>() * n_a;
 
     let accum_bytes = D * std::mem::size_of::<<F as HasCommitAccum>::CommitAccum>();
@@ -1700,7 +1708,10 @@ fn merge_sweep_thread_probe() {
 
     let mut reference: Option<Vec<Vec<CyclotomicRing<F, D>>>> = None;
     for threads in [16usize, 12, 10, 8] {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
         for rep in 0..3 {
             let start = Instant::now();
             let out = pool.install(|| {
