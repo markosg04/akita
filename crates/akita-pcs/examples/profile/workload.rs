@@ -465,6 +465,7 @@ fn run_prove<
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -605,6 +606,7 @@ pub(crate) fn run_dense_for<FF, const D: usize, Cfg: CommitmentConfig<Field = FF
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -693,6 +695,7 @@ pub(crate) fn run_onehot<FF, const D: usize, Cfg: CommitmentConfig<Field = FF>>(
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -781,6 +784,7 @@ pub(crate) fn run_batched_onehot<FF, const D: usize, Cfg: CommitmentConfig<Field
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -989,6 +993,7 @@ pub(crate) fn run_recursive_multi_group_onehot<FF, const D: usize, Cfg>(
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -1042,6 +1047,7 @@ fn run_recursive_multi_group_onehot_with_proof_cfg<FF, const D: usize, Cfg, Proo
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid

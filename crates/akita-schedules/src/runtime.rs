@@ -163,12 +163,21 @@ pub(crate) const MAX_RECURSION_DEPTH: usize = 12;
 
 /// Validate runtime policy values used by schedule expansion and validation.
 pub(crate) fn validate_policy(policy: &PlannerPolicy) -> Result<(), AkitaError> {
-    let expected_selection_policy = if policy.recursive_setup_planning {
-        SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope
+    let selection_policy_ok = if policy.recursive_setup_planning {
+        matches!(
+            policy.selection_policy,
+            SelectionPolicyId::MinFirstDirectSetupThenPayloadWithinSupportedEnvelope
+        )
     } else {
-        SelectionPolicyId::MinEstimatedProofPayload
+        // Slack-based rank-aware selection is a refinement of the payload
+        // objective, so it is valid wherever the payload policy is.
+        matches!(
+            policy.selection_policy,
+            SelectionPolicyId::MinEstimatedProofPayload
+                | SelectionPolicyId::MinRootRankThenPayloadWithinSlack { .. }
+        )
     };
-    if policy.selection_policy != expected_selection_policy {
+    if !selection_policy_ok {
         return Err(AkitaError::InvalidSetup(
             "schedule selection policy disagrees with recursive setup capability".to_string(),
         ));

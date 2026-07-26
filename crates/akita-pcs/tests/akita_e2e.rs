@@ -173,6 +173,7 @@ where
         + 'static
         + HalvingField
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + Valid,
     Cfg::ExtField: FrobeniusExtField<FField> + HasUnreducedOps + HasOptimizedFold,
     <FField as HasWide>::Wide: From<FField> + ReduceTo<FField>,

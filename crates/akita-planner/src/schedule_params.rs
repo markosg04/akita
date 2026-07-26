@@ -550,8 +550,7 @@ fn find_schedule_inner(
                     &mut root_envelope,
                 )?;
                 let setup_envelope = root_envelope.max(suffix_fold.setup_envelope_ring_elements);
-                let is_streaming_best =
-                    best.as_ref().is_none_or(|best| total < best.total_bytes);
+                let is_streaming_best = best.as_ref().is_none_or(|best| total < best.total_bytes);
                 if is_streaming_best || slack_permille.is_some() {
                     let mut folds = Vec::with_capacity(1 + suffix_fold.folds.len());
                     folds.push(CandidateFoldStep {

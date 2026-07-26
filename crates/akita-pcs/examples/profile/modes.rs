@@ -60,6 +60,7 @@ fn run_dense_mode_for<FF, const D: usize, Cfg: CommitmentConfig<Field = FF>>(
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
@@ -97,6 +98,7 @@ fn run_onehot_mode_for<FF, const D: usize, Cfg: CommitmentConfig<Field = FF>>(
         + RandomSampling
         + FromPrimitiveInt
         + PseudoMersenneField
+        + akita_field::unreduced::HasCommitAccum
         + HalvingField
         + HasWide
         + Valid
