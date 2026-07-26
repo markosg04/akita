@@ -61,7 +61,7 @@ struct PendingRound<E: FieldCore> {
 
 /// Batched Stage-3 setup-product + carried-witness sumcheck prover.
 pub struct AkitaStage3Prover<'a, F: FieldCore, E: FieldCore> {
-    setup: BatchedStage3Term<RectangularSetupProductTerm<'a, F, E>, E>,
+    setup: BatchedStage3Term<RectangularSetupProductTerm<F, E>, E>,
     witness: BatchedStage3Term<WitnessClaimReductionTerm<'a, E>, E>,
     eta: E,
     geometry: BatchedStage3Geometry,
@@ -302,8 +302,8 @@ fn half<E: FieldCore + FromPrimitiveInt>(value: E) -> E {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_setup_product_term<'a, F, E, T>(
-    expanded: &'a AkitaExpandedSetup<F>,
+fn build_setup_product_term<F, E, T>(
+    expanded: &AkitaExpandedSetup<F>,
     prefix_slots: &SetupPrefixProverRegistry<F>,
     lp: &CommittedGroupParams,
     next_fold_level_params: &CommittedGroupParams,
@@ -312,7 +312,7 @@ fn build_setup_product_term<'a, F, E, T>(
     alpha: E,
     x_challenges: &[E],
     transcript: &mut T,
-) -> Result<RectangularSetupProductTerm<'a, F, E>, AkitaError>
+) -> Result<RectangularSetupProductTerm<F, E>, AkitaError>
 where
     F: FieldCore + CanonicalField,
     E: FpExtEncoding<F> + FromPrimitiveInt + LiftBase<F> + MulBaseUnreduced<F> + AkitaSerialize,
@@ -368,7 +368,9 @@ where
     // setup-prefix slot may have a padded evaluation domain larger than this
     // source: only `required` natural rows are read, and the table remainder is
     // explicit zero padding.
-    let setup_field = expanded.shared_matrix().as_field_slice();
+    // Cover only the `required` rows the product term reads — the padded
+    // view length would re-derive the full released matrix.
+    let setup_matrix = expanded.shared_matrix().covering_at_dyn(required, ring_d)?;
     if required > setup_eval_len {
         return Err(AkitaError::InvalidSetup(
             "setup product exceeds selected setup view".to_string(),
@@ -382,13 +384,16 @@ where
     let required_source_len = required
         .checked_mul(ring_d)
         .ok_or_else(|| AkitaError::InvalidSetup("setup product source length overflow".into()))?;
-    let setup_source = setup_field.get(..required_source_len).ok_or_else(|| {
-        AkitaError::InvalidSetup("setup source is shorter than product view".into())
-    })?;
+    if setup_matrix.as_field_slice().len() < required_source_len {
+        return Err(AkitaError::InvalidSetup(
+            "setup source is shorter than product view".into(),
+        ));
+    }
     drop(_source_span);
 
     RectangularSetupProductTerm::new(
-        setup_source,
+        setup_matrix,
+        required_source_len,
         required,
         setup_index_weight,
         alpha_pows.to_vec(),
