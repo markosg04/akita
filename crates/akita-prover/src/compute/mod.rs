@@ -33,6 +33,7 @@ mod plans;
 mod poly;
 mod stack;
 
+pub use crate::backend::onehot::LazyOneHotBlocks;
 pub use backend::{
     CommitmentComputeBackend, ComputeBackendSetup, CyclicRowsComputeBackend,
     DigitRowsComputeBackend, ProverComputeBackend, RingSwitchComputeBackend,
