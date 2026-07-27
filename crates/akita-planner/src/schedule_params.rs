@@ -531,19 +531,6 @@ fn find_schedule_inner(
                     Some(next_witness_binding),
                 )? + eor_bytes;
                 let total = root_proof_size + suffix_fold.total_bytes;
-                // PERF ITERATION SCAFFOLDING: dump every scored root candidate
-                // so time-vs-bytes corners can be compared offline. Remove
-                // before upstreaming.
-                if std::env::var_os("AKITA_PLANNER_DEBUG_CANDIDATES").is_some() {
-                    eprintln!(
-                        "root-candidate lb={candidate_log_basis} block_bits={block_index_bits} ppb={} live_blocks={} n_a={} n_b={} folds={} root_payload={root_proof_size} total_bytes={total}",
-                        candidate_params.num_positions_per_block,
-                        candidate_params.num_live_blocks,
-                        candidate_params.inner_commit_matrix.output_rank(),
-                        candidate_params.outer_commit_matrix.output_rank(),
-                        1 + suffix_fold.folds.len(),
-                    );
-                }
                 let mut root_envelope = akita_types::SetupMatrixEnvelope::minimum().max_setup_len;
                 akita_types::accumulate_matrix_envelope_for_level(
                     &candidate_params,

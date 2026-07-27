@@ -16,10 +16,8 @@ use crate::{AdditiveGroup, CanonicalField, FieldCore};
 use super::prime::{Fp128, Fp32, Fp64};
 
 mod accum;
-mod lazy128;
 mod native_algebra;
 pub use accum::*;
-pub use lazy128::Fp128Lazy;
 
 /// Wide unreduced accumulator for `Fp32`: 2 × i32 limbs (16-bit data each).
 #[cfg_attr(feature = "jolt-compat", derive(allocative::Allocative))]
@@ -846,11 +844,11 @@ impl<const P: u64> HasCommitAccum for Fp64<P> {
 }
 
 impl<const P: u128> HasCommitAccum for Fp128<P> {
-    /// Measured negative result: [`Fp128Lazy`] halves accumulator bytes but
-    /// loses ~1.9x to the NEON digit-limbed type in the commit sweep — the
-    /// row-pass tiles are already L1-resident, so the accumulate is ALU-bound
-    /// and scalar u128 carry-correction chains cannot match 8-lane i32 adds.
-    /// Keep the wide type; `Fp128Lazy` stays available for A/B probes.
+    /// Measured negative result: a lazily-reduced u128 accumulator halves
+    /// accumulator bytes but loses ~1.9x to the NEON digit-limbed type in
+    /// the commit sweep — the row-pass tiles are already L1-resident, so the
+    /// accumulate is ALU-bound and scalar u128 carry-correction chains
+    /// cannot match 8-lane i32 adds. Keep the wide type.
     type CommitAccum = Fp128x8i32;
     const MAX_COMMIT_ACCUMULATIONS: usize = MAX_WIDE_LANE_ACCUMULATIONS;
 }
