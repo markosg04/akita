@@ -20,6 +20,7 @@ use crate::kernels::linear::{
     mat_vec_mul_ntt_single_i8_cyclic, selected_crt_i8_capacity_profile, CrtI8CapacityProfile,
     StreamedASource,
 };
+use crate::validation::MAX_I8_LOG_BASIS;
 use akita_algebra::CyclotomicRing;
 use akita_field::unreduced::{HasCommitAccum, ReduceTo};
 use akita_field::{AdditiveGroup, AkitaError, CanonicalField, FieldCore, HalvingField};
@@ -65,6 +66,7 @@ pub const NTT_STREAM_THRESHOLD_RING_ELEMENTS: usize = 1 << 21;
 pub struct CpuPreparedSetup<F: FieldCore> {
     expanded: Arc<AkitaExpandedSetup<F>>,
     shared_ntt: Mutex<HashMap<NttCacheKey, Arc<NttSlotCell>>>,
+    shared_neg_ntt: Mutex<HashMap<NttCacheKey, Arc<NttSlotCell>>>,
     ntt_i8_capacity_by_ring_d: Mutex<HashMap<usize, CrtI8CapacityProfile>>,
     /// Keys promised at [`ComputeBackendSetup::prepare_setup`]; lazy builds outside
     /// this set emit a diagnostic warning.
@@ -204,6 +206,72 @@ impl<F: FieldCore + CanonicalField> CpuPreparedSetup<F> {
         f(typed)
     }
 
+    /// Run `f` against a negacyclic-only transformed-matrix slot.
+    ///
+    /// A built both-transform slot can satisfy this request. Otherwise this
+    /// uses a separate cache so cyclic consumers cannot mistake a
+    /// negacyclic-only slot for their stronger contract.
+    pub(crate) fn with_shared_negacyclic_ntt<const D: usize, R>(
+        &self,
+        extent_ring_elements: usize,
+        f: impl FnOnce(&PreparedNttCache<D>) -> Result<R, AkitaError>,
+    ) -> Result<R, AkitaError> {
+        let envelope = self.envelope_ntt_key::<D>()?;
+        let capped = extent_ring_elements.max(1).min(envelope.num_ring_elements);
+        let rounded = capped
+            .checked_next_power_of_two()
+            .map_or(envelope.num_ring_elements, |p| {
+                p.min(envelope.num_ring_elements)
+            });
+
+        let both_slot = {
+            let cache = self
+                .shared_ntt
+                .lock()
+                .map_err(|_| AkitaError::InvalidSetup("NTT cache lock poisoned".into()))?;
+            cache
+                .iter()
+                .filter(|(key, cell)| {
+                    key.ring_d == envelope.ring_d
+                        && key.num_ring_elements >= capped
+                        && cell.get().is_some_and(|result| result.is_ok())
+                })
+                .min_by_key(|(key, _)| key.num_ring_elements)
+                .and_then(|(_, cell)| cell.get())
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+        };
+        if let Some(slot) = both_slot {
+            return with_typed_ntt_slot::<D, _>(&slot, f);
+        }
+
+        let key = NttCacheKey {
+            ring_d: envelope.ring_d,
+            num_ring_elements: rounded,
+        };
+        let entry = {
+            let mut cache = self
+                .shared_neg_ntt
+                .lock()
+                .map_err(|_| AkitaError::InvalidSetup("NTT cache lock poisoned".into()))?;
+            Arc::clone(
+                cache
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        let slot = entry
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.ntt_slot_build_count.fetch_add(1, Ordering::Relaxed);
+                build_negacyclic_ntt_slot_for_key(self.expanded.as_ref(), key).map(Arc::new)
+            })
+            .as_ref()
+            .map_err(Clone::clone)?
+            .clone();
+        with_typed_ntt_slot::<D, _>(&slot, f)
+    }
+
     /// Release the setup matrix's backing store down to its first
     /// `keep_ring_elements` (generation dimension), returning bytes freed.
     /// The retained prefix serves slot rebuilds and small setup reads; wider
@@ -230,19 +298,7 @@ impl<F: FieldCore + CanonicalField> CpuPreparedSetup<F> {
     /// that raced ahead with the old cell finishes against it unaffected;
     /// the swap only redirects future lookups.
     pub fn drop_built_ntt_slots(&self) -> usize {
-        let mut freed = 0;
-        if let Ok(mut cache) = self.shared_ntt.lock() {
-            for cell in cache.values_mut() {
-                let built = cell
-                    .get()
-                    .and_then(|result| result.as_ref().ok())
-                    .map(|slot| slot.cache_bytes);
-                if let Some(bytes) = built {
-                    freed += bytes;
-                    *cell = Arc::new(OnceLock::new());
-                }
-            }
-        }
+        let freed = drop_built_slots(&self.shared_ntt) + drop_built_slots(&self.shared_neg_ntt);
         if freed > 0 {
             tracing::info!(freed_bytes = freed, "dropped built NTT slots");
         }
@@ -251,14 +307,7 @@ impl<F: FieldCore + CanonicalField> CpuPreparedSetup<F> {
 
     /// In-memory byte footprint of all shared setup NTT caches.
     pub fn shared_ntt_cache_bytes(&self) -> usize {
-        self.shared_ntt
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter_map(|entry| entry.get())
-            .filter_map(|result| result.as_ref().ok())
-            .map(|slot| slot.cache_bytes)
-            .sum()
+        built_slot_bytes(&self.shared_ntt) + built_slot_bytes(&self.shared_neg_ntt)
     }
 
     /// CRT/NTT profile and universal i8 capacity metadata for ring degree `D`.
@@ -277,6 +326,51 @@ impl<F: FieldCore + CanonicalField> CpuPreparedSetup<F> {
     }
 }
 
+fn with_typed_ntt_slot<const D: usize, R>(
+    slot: &ErasedCpuNttCache,
+    f: impl FnOnce(&PreparedNttCache<D>) -> Result<R, AkitaError>,
+) -> Result<R, AkitaError> {
+    if slot.ring_d != D {
+        return Err(AkitaError::InvalidSetup(format!(
+            "prepared CPU NTT ring_d mismatch: stored {}, requested {D}",
+            slot.ring_d
+        )));
+    }
+    let typed = slot
+        .cache
+        .downcast_ref::<PreparedNttCache<D>>()
+        .ok_or_else(|| AkitaError::InvalidSetup("prepared CPU NTT type mismatch".into()))?;
+    f(typed)
+}
+
+fn drop_built_slots(cache: &Mutex<HashMap<NttCacheKey, Arc<NttSlotCell>>>) -> usize {
+    let mut freed = 0;
+    if let Ok(mut cache) = cache.lock() {
+        for cell in cache.values_mut() {
+            let built = cell
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map(|slot| slot.cache_bytes);
+            if let Some(bytes) = built {
+                freed += bytes;
+                *cell = Arc::new(OnceLock::new());
+            }
+        }
+    }
+    freed
+}
+
+fn built_slot_bytes(cache: &Mutex<HashMap<NttCacheKey, Arc<NttSlotCell>>>) -> usize {
+    cache
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .filter_map(|entry| entry.get())
+        .filter_map(|result| result.as_ref().ok())
+        .map(|slot| slot.cache_bytes)
+        .sum()
+}
+
 fn build_ntt_slot_for_key<F: FieldCore + CanonicalField>(
     expanded: &AkitaExpandedSetup<F>,
     key: NttCacheKey,
@@ -292,6 +386,39 @@ fn build_ntt_slot_for_key<F: FieldCore + CanonicalField>(
             num_ring_elements = key.num_ring_elements,
             cache_bytes = cache.cache_bytes(),
             "built shared-matrix NTT slot"
+        );
+        Ok(ErasedCpuNttCache {
+            ring_d: RING_D,
+            cache_bytes: cache.cache_bytes(),
+            cache,
+        })
+    })
+}
+
+fn build_negacyclic_ntt_slot_for_key<F: FieldCore + CanonicalField>(
+    expanded: &AkitaExpandedSetup<F>,
+    key: NttCacheKey,
+) -> Result<ErasedCpuNttCache, AkitaError> {
+    dispatch_for_field!(ProtocolDispatchSlot::Ntt, F, key.ring_d, |RING_D| {
+        let matrix = expanded
+            .shared_matrix()
+            .covering_at_dyn(key.num_ring_elements, RING_D)?;
+        let view = matrix.ring_view::<RING_D>(1, key.num_ring_elements)?;
+        // `digit_rows` chunks its accumulation independently. Width one asks
+        // the exact-mode builder for only the base negacyclic transforms,
+        // without an unused full-slot i16 tail.
+        let cache = Arc::new(prepare_ntt_cache(
+            view,
+            NttCacheMode::ExactNegacyclic {
+                width: 1,
+                log_basis: MAX_I8_LOG_BASIS,
+            },
+        )?);
+        tracing::info!(
+            ring_d = RING_D,
+            num_ring_elements = key.num_ring_elements,
+            cache_bytes = cache.cache_bytes(),
+            "built shared-matrix negacyclic NTT slot"
         );
         Ok(ErasedCpuNttCache {
             ring_d: RING_D,
@@ -450,6 +577,7 @@ where
         Ok(CpuPreparedSetup {
             expanded,
             shared_ntt: Mutex::new(HashMap::new()),
+            shared_neg_ntt: Mutex::new(HashMap::new()),
             ntt_i8_capacity_by_ring_d: Mutex::new(HashMap::new()),
             setup_contract_ntt_keys: Mutex::new(HashSet::new()),
             #[cfg(test)]
@@ -897,7 +1025,7 @@ where
                 .shared_matrix
                 .total_ring_elements_at::<D>()?,
         )?;
-        prepared.with_shared_ntt::<D, _>(row_len.saturating_mul(digits.len()), |ntt| {
+        prepared.with_shared_negacyclic_ntt::<D, _>(row_len.saturating_mul(digits.len()), |ntt| {
             mat_vec_mul_ntt_single_i8(ntt, row_len, digits.len(), digits, log_basis)
         })
     }
@@ -1057,9 +1185,8 @@ mod tests {
     use crate::kernels::linear::{
         fused_split_eq_quotients, mat_vec_mul_ntt_single_i8, mat_vec_mul_ntt_single_i8_cyclic,
     };
-    use crate::validation::MAX_I8_LOG_BASIS;
     use crate::AkitaProverSetup;
-    use akita_field::Prime64Offset59;
+    use akita_field::{Prime128Offset275, Prime64Offset59};
     use akita_types::SetupMatrixEnvelope;
     use std::sync::Arc;
 
@@ -1247,6 +1374,92 @@ mod tests {
             })
             .expect("direct digit rows");
         assert_eq!(via_backend, direct);
+    }
+
+    #[test]
+    fn cpu_digit_rows_cache_omits_cyclic_transform() {
+        let prepared = prepared();
+        let digits = vec![[1i8; D], [-1i8; D], [2i8; D]];
+
+        CpuBackend
+            .digit_rows::<D>(&prepared, 2, &digits, 3)
+            .expect("digit rows");
+
+        let cache = prepared.shared_neg_ntt.lock().unwrap();
+        let (key, slot) = cache
+            .iter()
+            .find_map(|(key, cell)| cell.get().map(|slot| (key, slot)))
+            .expect("built negacyclic slot");
+        let slot = slot.as_ref().expect("valid negacyclic slot");
+        let typed = slot
+            .cache
+            .downcast_ref::<PreparedNttCache<D>>()
+            .expect("typed cache");
+        match typed {
+            PreparedNttCache::Q64 { cyc, .. } => assert!(cyc.is_none()),
+            _ => panic!("Prime64Offset59 must use Q64"),
+        }
+        assert_eq!(
+            slot.cache_bytes,
+            key.num_ring_elements * D * 3 * size_of::<i32>()
+        );
+    }
+
+    #[test]
+    fn cpu_q128_digit_rows_cache_is_one_transform_per_ring() {
+        let setup = AkitaProverSetup::<Prime128Offset275>::generate_with_capacity(
+            8,
+            1,
+            D,
+            setup_envelope(8 * D),
+        )
+        .unwrap();
+        let prepared = CpuBackend.prepare_setup(&setup).unwrap();
+        let digits = vec![[1i8; D], [-1i8; D], [2i8; D]];
+
+        CpuBackend
+            .digit_rows::<D>(&prepared, 2, &digits, 3)
+            .expect("digit rows");
+
+        let cache = prepared.shared_neg_ntt.lock().unwrap();
+        let (key, slot) = cache
+            .iter()
+            .find_map(|(key, cell)| cell.get().map(|slot| (key, slot)))
+            .expect("built negacyclic slot");
+        let slot = slot.as_ref().expect("valid negacyclic slot");
+        let typed = slot
+            .cache
+            .downcast_ref::<PreparedNttCache<D>>()
+            .expect("typed cache");
+        match typed {
+            PreparedNttCache::Q128 { cyc, tail, .. } => {
+                assert!(cyc.is_none());
+                assert!(tail.is_none());
+            }
+            _ => panic!("Prime128Offset275 must use Q128"),
+        }
+        assert_eq!(
+            slot.cache_bytes,
+            key.num_ring_elements * D * 5 * size_of::<i32>()
+        );
+    }
+
+    #[test]
+    fn cpu_digit_rows_reuses_both_transform_slot() {
+        let prepared = prepared();
+        let key = NttCacheKey::from_envelope(prepared.expanded.as_ref(), D).unwrap();
+        CpuBackend.ensure_ntt_slot(&prepared, key).unwrap();
+        let builds_before = prepared.ntt_slot_build_count.load(Ordering::Relaxed);
+
+        CpuBackend
+            .digit_rows::<D>(&prepared, 2, &[[1i8; D], [-1i8; D], [2i8; D]], 3)
+            .expect("digit rows");
+
+        assert!(prepared.shared_neg_ntt.lock().unwrap().is_empty());
+        assert_eq!(
+            prepared.ntt_slot_build_count.load(Ordering::Relaxed),
+            builds_before
+        );
     }
 
     #[test]
