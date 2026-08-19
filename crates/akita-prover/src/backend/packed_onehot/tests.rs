@@ -148,7 +148,9 @@ fn generated_storage_rejects_out_of_range_lanes() {
 
 #[test]
 fn streaming_storage_publishes_prefixes_and_finalizes_without_copying() {
-    let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
+    let buffer = PackedOneHotStreamBuffer::zeroed(16, 4, 3, 8).unwrap();
+    assert_eq!(buffer.num_vars(), 9);
+    let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::from_buffer(buffer);
     let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();
     let lanes_ptr = std::thread::scope(|scope| {
         let consumer = scope.spawn(move || {

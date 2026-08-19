@@ -175,6 +175,17 @@ pub struct StreamingPackedOneHotPoly<F: FieldCore> {
     inner: Arc<StreamingPackedOneHotInner<F>>,
 }
 
+/// Fully initialized aligned storage reserved before row generation begins.
+#[derive(Debug)]
+pub struct PackedOneHotStreamBuffer {
+    lanes: AlignedBytes,
+    num_rows: usize,
+    num_columns: usize,
+    column_capacity: usize,
+    onehot_k: usize,
+    num_vars: usize,
+}
+
 /// The unique sequential producer for a [`StreamingPackedOneHotPoly`].
 #[derive(Debug)]
 pub struct PackedOneHotStreamWriter<F: FieldCore> {
@@ -449,18 +460,46 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
         num_columns: usize,
         num_rows: usize,
     ) -> Result<(Self, PackedOneHotStreamWriter<F>), AkitaError> {
-        let lane_count = num_rows
-            .checked_mul(num_columns)
-            .ok_or_else(|| AkitaError::InvalidInput("packed one-hot lane count overflow".into()))?;
-        let (validated_rows, total_field_elems) =
-            validate_geometry_shape(onehot_k, column_capacity, num_columns, lane_count)?;
+        let (lane_count, validated_rows, total_field_elems) =
+            stream_geometry(onehot_k, column_capacity, num_columns, num_rows)?;
+        Ok(Self::from_storage(
+            AlignedBytes::uninit(lane_count)?,
+            onehot_k,
+            column_capacity,
+            num_columns,
+            validated_rows,
+            total_field_elems.trailing_zeros() as usize,
+        ))
+    }
+
+    /// Consume a prepared buffer and return its source and unique writer.
+    #[must_use]
+    pub fn from_buffer(buffer: PackedOneHotStreamBuffer) -> (Self, PackedOneHotStreamWriter<F>) {
+        Self::from_storage(
+            buffer.lanes,
+            buffer.onehot_k,
+            buffer.column_capacity,
+            buffer.num_columns,
+            buffer.num_rows,
+            buffer.num_vars,
+        )
+    }
+
+    fn from_storage(
+        lanes: AlignedBytes,
+        onehot_k: usize,
+        column_capacity: usize,
+        num_columns: usize,
+        num_rows: usize,
+        num_vars: usize,
+    ) -> (Self, PackedOneHotStreamWriter<F>) {
         let inner = Arc::new(StreamingPackedOneHotInner {
-            lanes: Arc::new(AlignedBytes::uninit(lane_count)?),
-            num_rows: validated_rows,
+            lanes: Arc::new(lanes),
+            num_rows,
             num_columns,
             column_capacity,
             onehot_k,
-            num_vars: total_field_elems.trailing_zeros() as usize,
+            num_vars,
             progress: Mutex::new(StreamingProgress {
                 completed_rows: 0,
                 hot_entries: 0,
@@ -470,7 +509,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             ready: Condvar::new(),
             marker: PhantomData,
         });
-        Ok((
+        (
             Self {
                 inner: inner.clone(),
             },
@@ -479,7 +518,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
                 next_row: 0,
                 closed: false,
             },
-        ))
+        )
     }
 
     #[must_use]
@@ -516,6 +555,66 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             marker: PhantomData,
         })
     }
+}
+
+impl PackedOneHotStreamBuffer {
+    /// Reserve and initialize aligned storage outside the row-generation path.
+    pub fn zeroed(
+        onehot_k: usize,
+        column_capacity: usize,
+        num_columns: usize,
+        num_rows: usize,
+    ) -> Result<Self, AkitaError> {
+        let (lane_count, validated_rows, total_field_elems) =
+            stream_geometry(onehot_k, column_capacity, num_columns, num_rows)?;
+        Ok(Self {
+            lanes: AlignedBytes::zeroed(lane_count)?,
+            num_rows: validated_rows,
+            num_columns,
+            column_capacity,
+            onehot_k,
+            num_vars: total_field_elems.trailing_zeros() as usize,
+        })
+    }
+
+    #[must_use]
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+
+    #[must_use]
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    #[must_use]
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    #[must_use]
+    pub fn column_capacity(&self) -> usize {
+        self.column_capacity
+    }
+
+    #[must_use]
+    pub fn onehot_k(&self) -> usize {
+        self.onehot_k
+    }
+}
+
+fn stream_geometry(
+    onehot_k: usize,
+    column_capacity: usize,
+    num_columns: usize,
+    num_rows: usize,
+) -> Result<(usize, usize, usize), AkitaError> {
+    let lane_count = num_rows
+        .checked_mul(num_columns)
+        .ok_or_else(|| AkitaError::InvalidInput("packed one-hot lane count overflow".into()))?;
+    let (validated_rows, total_field_elems) =
+        validate_geometry_shape(onehot_k, column_capacity, num_columns, lane_count)?;
+    Ok((lane_count, validated_rows, total_field_elems))
 }
 
 impl<F: FieldCore> PackedOneHotStreamWriter<F> {
