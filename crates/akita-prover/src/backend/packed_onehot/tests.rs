@@ -157,19 +157,13 @@ fn streaming_storage_publishes_prefixes_and_finalizes_without_copying() {
             prefix
         });
         writer
-            .fill_next_rows(4, |row, lanes| {
-                for (column, lane) in lanes.iter_mut().enumerate() {
-                    *lane = ((row + column) % 16) as u8;
-                }
-                Ok(())
+            .fill_next_rows(4, |row| {
+                Ok::<[u8; 3], String>(std::array::from_fn(|column| ((row + column) % 16) as u8))
             })
             .unwrap();
         writer
-            .fill_next_rows(4, |row, lanes| {
-                for (column, lane) in lanes.iter_mut().enumerate() {
-                    *lane = ((row + column) % 16) as u8;
-                }
-                Ok(())
+            .fill_next_rows(4, |row| {
+                Ok::<[u8; 3], String>(std::array::from_fn(|column| ((row + column) % 16) as u8))
             })
             .unwrap();
         writer.finish().unwrap();
@@ -186,11 +180,12 @@ fn streaming_storage_failure_wakes_consumers() {
     let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
     let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();
     let error = writer
-        .fill_next_rows(4, |row, lanes| {
+        .fill_next_rows(4, |row| {
+            let mut lanes = [0; 3];
             if row == 2 {
                 lanes[1] = 16;
             }
-            Ok(())
+            Ok(lanes)
         })
         .unwrap_err();
     assert!(error.to_string().contains("lane 16 at byte 7"));

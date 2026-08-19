@@ -493,11 +493,10 @@ mod tests {
             let producer = scope.spawn(move || {
                 for _ in 0..8 {
                     writer
-                        .fill_next_rows(ROWS / 8, |row, lanes| {
-                            for (column, output) in lanes.iter_mut().enumerate() {
-                                *output = lane(row, column);
-                            }
-                            Ok(())
+                        .fill_next_rows(ROWS / 8, |row| {
+                            Ok::<[u8; COLUMNS], String>(std::array::from_fn(|column| {
+                                lane(row, column)
+                            }))
                         })
                         .unwrap();
                 }
