@@ -12,6 +12,7 @@ use crate::compute::{RootCommitSource, RootPolyMeta, RootPolyShape};
 
 /// Alignment used by packed owners that can back a no-copy device buffer.
 pub const PACKED_ONEHOT_BUFFER_ALIGNMENT: usize = 16 * 1024;
+const PACKED_ONEHOT_META_RING_D: usize = 512;
 
 struct AlignedBytes {
     ptr: NonNull<u8>,
@@ -357,6 +358,10 @@ impl<'a, F: FieldCore, const D: usize> PackedOneHotView<'a, F, D> {
 }
 
 impl<F: FieldCore> RootPolyMeta<F> for PackedOneHotPoly<F> {
+    fn num_ring_elems(&self) -> usize {
+        (1usize << self.num_vars) / PACKED_ONEHOT_META_RING_D
+    }
+
     fn num_vars(&self) -> usize {
         self.num_vars
     }
@@ -399,14 +404,4 @@ impl<F: FieldCore, const D: usize> RootCommitSource<F, D> for PackedOneHotPoly<F
         })
     }
 
-    fn committed_centered_reach(
-        &self,
-        _modulus: u128,
-        _centering_threshold: u128,
-    ) -> Result<(u128, u128), AkitaError>
-    where
-        F: akita_field::CanonicalField,
-    {
-        Ok((0, 1))
-    }
 }

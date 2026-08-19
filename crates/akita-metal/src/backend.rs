@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use akita_algebra::CyclotomicRing;
-use akita_field::{AkitaError, ExtField, MulBaseUnreduced};
+use akita_field::{AkitaError, ExtField, FromPrimitiveInt, MulBaseUnreduced};
 use akita_prover::compute::{
     CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
     CyclicRowsComputeBackend, DigitRowsComputeBackend, TensorPackedWitness, TensorProjectionKernel,
 };
-use akita_prover::{CpuBackend, CpuPreparedSetup, NttCacheOwnerId};
-use akita_types::{AkitaExpandedSetup, NttCacheKey};
+use akita_prover::{CpuBackend, CpuPreparedSetup, NttCacheOwnerId, RootTensorProjectionPoly};
+use akita_types::{AkitaExpandedSetup, FpExtEncoding, NttCacheKey};
 use metal::Device;
 
 use crate::field::{MetalField, F};
@@ -411,6 +411,22 @@ where
         source: S,
     ) -> Result<TensorPackedWitness<E>, AkitaError> {
         <CpuBackend as TensorProjectionKernel<S, Field, E, D>>::packed_witness(
+            &self.cpu_backend(),
+            prepared.map(|value| &value.cpu),
+            source,
+        )
+    }
+
+    fn root_projection(
+        &self,
+        prepared: Option<&Self::PreparedSetup>,
+        source: S,
+    ) -> Result<RootTensorProjectionPoly<Field>, AkitaError>
+    where
+        Field: FromPrimitiveInt,
+        E: FpExtEncoding<Field>,
+    {
+        <CpuBackend as TensorProjectionKernel<S, Field, E, D>>::root_projection(
             &self.cpu_backend(),
             prepared.map(|value| &value.cpu),
             source,
