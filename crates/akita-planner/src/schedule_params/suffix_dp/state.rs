@@ -216,6 +216,7 @@ pub(crate) struct SuffixCtx<'a> {
     pub(crate) root_honest_fold_policy: Option<akita_types::sis::HonestFoldPolicySpec>,
     pub(crate) precommitted_honest_fold_policies: &'a [akita_types::sis::HonestFoldPolicySpec],
     pub(crate) level_zero_is_root: bool,
+    pub(crate) root_dimension_filter: Option<&'a [CommitmentRingDims]>,
 }
 
 #[derive(Clone, Copy)]

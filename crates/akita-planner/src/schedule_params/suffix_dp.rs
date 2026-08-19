@@ -353,6 +353,7 @@ pub(crate) fn derive_selected_suffix_schedule(
         root_honest_fold_policy,
         precommitted_honest_fold_policies,
         level_zero_is_root,
+        root_dimension_filter,
     } = *ctx;
     let SuffixState {
         level,
@@ -451,6 +452,12 @@ pub(crate) fn derive_selected_suffix_schedule(
         crate::policy::log_basis_search_range_at_level(policy, level);
     let mut dimension_work = Vec::new();
     for dimensions in dimension_candidates(policy, level, dimension_ceiling)? {
+        if level_zero_is_root
+            && level == 0
+            && root_dimension_filter.is_some_and(|allowed| !allowed.contains(&dimensions))
+        {
+            continue;
+        }
         let Some(eor_bytes) = try_extension_opening_reduction_level_bytes(
             policy.challenge_field_bits()?,
             policy.claim_ext_degree,

@@ -476,6 +476,50 @@ pub fn find_schedule(
     policy: &PlannerPolicy,
     ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
 ) -> Result<PlannedFoldSchedule, AkitaError> {
+    find_schedule_impl(
+        key,
+        final_honest_fold_policy,
+        precommitted_honest_fold_policies,
+        policy,
+        None,
+        ring_challenge_config,
+    )
+}
+
+/// Build the best schedule whose root uses one of `root_dimensions`.
+///
+/// Recursive levels retain the configuration's ordinary dimension search.
+pub fn find_schedule_with_root_dimensions(
+    key: &AkitaScheduleLookupKey,
+    final_honest_fold_policy: HonestFoldPolicySpec,
+    precommitted_honest_fold_policies: &[HonestFoldPolicySpec],
+    policy: &PlannerPolicy,
+    root_dimensions: &[CommitmentRingDims],
+    ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
+) -> Result<PlannedFoldSchedule, AkitaError> {
+    if root_dimensions.is_empty() {
+        return Err(AkitaError::InvalidSetup(
+            "root dimension filter must not be empty".into(),
+        ));
+    }
+    find_schedule_impl(
+        key,
+        final_honest_fold_policy,
+        precommitted_honest_fold_policies,
+        policy,
+        Some(root_dimensions),
+        ring_challenge_config,
+    )
+}
+
+fn find_schedule_impl(
+    key: &AkitaScheduleLookupKey,
+    final_honest_fold_policy: HonestFoldPolicySpec,
+    precommitted_honest_fold_policies: &[HonestFoldPolicySpec],
+    policy: &PlannerPolicy,
+    root_dimension_filter: Option<&[CommitmentRingDims]>,
+    ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
+) -> Result<PlannedFoldSchedule, AkitaError> {
     akita_schedules::planner_support::validate_policy(policy)?;
     key.validate(policy.decomposition.field_bits())?;
     if matches!(
@@ -523,6 +567,7 @@ pub fn find_schedule(
         root_honest_fold_policy: Some(final_honest_fold_policy),
         precommitted_honest_fold_policies,
         level_zero_is_root: true,
+        root_dimension_filter,
     };
     let mut memo = ScheduleMemo::new();
     let dimension_ceiling = match active_policy.ring_dimension_schedule_mode {
