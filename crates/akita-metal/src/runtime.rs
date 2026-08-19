@@ -4,8 +4,10 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use akita_field::AkitaError;
 use akita_prover::{
-    InitializedPackedOneHotStorage, StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+    InitializedPackedOneHotStorage, PackedOneHotStreamBuffer, StreamingPackedOneHotView,
+    PACKED_ONEHOT_BUFFER_ALIGNMENT,
 };
 use metal::objc::rc::autoreleasepool;
 use metal::objc::{runtime::Sel, Message};
@@ -270,6 +272,70 @@ impl MetalRuntime {
                 .block_batched_pipeline
                 .static_threadgroup_memory_length(),
         }
+    }
+
+    pub(crate) fn prepare_packed_fp128_d512_stream_buffer(
+        &self,
+        onehot_k: usize,
+        column_capacity: usize,
+        num_columns: usize,
+        num_rows: usize,
+        positions_per_block: usize,
+    ) -> Result<PackedOneHotStreamBuffer, AkitaError> {
+        if onehot_k != 256
+            || column_capacity != 32
+            || num_columns == 0
+            || num_columns > column_capacity
+            || positions_per_block == 0
+            || !positions_per_block.is_multiple_of(4)
+            || !(positions_per_block / 4).is_multiple_of(4)
+        {
+            return Err(MetalCommitError::UnsupportedShape(
+                "fp128 D512 stream preparation requires K256/nonempty-C<=32-cap32 and four integral partials"
+                    .into(),
+            )
+            .into_akita());
+        }
+        let lane_count = num_rows
+            .checked_mul(num_columns)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("packed lane count").into_akita())?;
+        self.validate_buffer_length(lane_count)
+            .map_err(MetalCommitError::into_akita)?;
+        let rows_per_block = positions_per_block
+            .checked_mul(2)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("packed rows per block").into_akita())?;
+        if rows_per_block == 0 || !num_rows.is_multiple_of(rows_per_block) {
+            return Err(MetalCommitError::UnsupportedShape(
+                "packed stream rows must contain integral commitment blocks".into(),
+            )
+            .into_akita());
+        }
+        let blocks_per_column = num_rows / rows_per_block;
+        if !matches!(blocks_per_column, 32 | 64 | 128 | 256) {
+            return Err(MetalCommitError::UnsupportedShape(
+                "fp128 D512 stream preparation requires 32, 64, 128, or 256 blocks per column"
+                    .into(),
+            )
+            .into_akita());
+        }
+        let work_units = num_columns
+            .checked_mul(blocks_per_column)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("packed work units").into_akita())?;
+        let first_command_tasks = work_units.min(
+            FP128_D512_TASKS_PER_STREAM
+                .checked_mul(FP128_D512_STREAMS_PER_COMMAND)
+                .ok_or_else(|| {
+                    MetalCommitError::ShapeOverflow("packed first command tasks").into_akita()
+                })?,
+        );
+        let first_ready_blocks = first_command_tasks.div_ceil(num_columns);
+        let first_ready_rows = first_ready_blocks
+            .checked_mul(rows_per_block)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("packed ready rows").into_akita())?;
+        let mut buffer =
+            PackedOneHotStreamBuffer::zeroed(onehot_k, column_capacity, num_columns, num_rows)?;
+        buffer.prefault_prefix_rows(first_ready_rows)?;
+        Ok(buffer)
     }
 
     pub(crate) fn supports_packed_fp128_d512_panels(&self) -> bool {
