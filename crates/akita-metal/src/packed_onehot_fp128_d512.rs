@@ -35,7 +35,7 @@ pub(crate) fn validate_shape<const D: usize>(
     if D != RING_D
         || source.onehot_k() != ONEHOT_K
         || source.column_capacity() != COLUMN_CAPACITY
-        || !matches!(source.num_columns(), 25 | 28 | 32)
+        || !(1..=COLUMN_CAPACITY).contains(&source.num_columns())
         || plan.n_a != INNER_RANK
         || plan.num_digits_inner != 1
         || plan.num_positions_per_block == 0
@@ -44,7 +44,7 @@ pub(crate) fn validate_shape<const D: usize>(
             .is_multiple_of(POSITION_PARTIALS)
     {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 Metal D512 commit requires K256/C25|28|32-cap32/rank1 and four integral partials"
+            "fp128 Metal D512 commit requires K256/nonempty-C<=32-cap32/rank1 and four integral partials"
                 .into(),
         )
         .into_akita());
@@ -300,7 +300,6 @@ mod tests {
     #[test]
     fn exact_fp128_d512_panels_match_cpu_on_sparse_boundaries() {
         const ROWS: usize = 1_024;
-        const COLUMNS: usize = 25;
         const CAPACITY: usize = 32;
         const POSITIONS_PER_BLOCK: usize = 16;
         let plan = CommitInnerPlan {
@@ -322,21 +321,17 @@ mod tests {
         let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
 
-        let patterns = [
-            vec![0; ROWS * COLUMNS],
-            vec![1; ROWS * COLUMNS],
-            vec![255; ROWS * COLUMNS],
-            (0..ROWS * COLUMNS)
-                .map(|index| match (index / COLUMNS, index % COLUMNS) {
-                    (0 | 31 | 32 | 1_023, 0 | 24) => 255,
+        for columns in 25..=CAPACITY {
+            let lanes = (0..ROWS * columns)
+                .map(|index| match (index / columns, index % columns) {
+                    (0 | 31 | 32 | 1_023, 0) => 255,
+                    (row, column) if column + 1 == columns => (row % 256) as u8,
                     (row, column) if (row + column).is_multiple_of(4) => 0,
                     (row, column) => ((row * 73 + column * 19) % 255 + 1) as u8,
                 })
-                .collect(),
-        ];
-        for lanes in patterns {
+                .collect();
             let poly =
-                PackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, COLUMNS, lanes).unwrap();
+                PackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, columns, lanes).unwrap();
             assert_eq!(RootPolyMeta::<F>::num_vars(&poly), 23);
             let cpu_output = cpu
                 .commit_inner_group(
@@ -356,7 +351,7 @@ mod tests {
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
             assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
             assert_eq!(metrics.cpu_work_units, 0);
-            assert_eq!(metrics.metal_work_units, COLUMNS * 32);
+            assert_eq!(metrics.metal_work_units, columns * 32);
         }
     }
 }

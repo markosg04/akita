@@ -372,7 +372,8 @@ impl MetalRuntime {
                 || params.ring_d != 512
                 || params.onehot_k != 256
                 || params.column_capacity != 32
-                || !matches!(params.num_columns, 25 | 28 | 32)
+                || params.num_columns == 0
+                || params.num_columns > params.column_capacity
                 || params.lane_stride != params.num_columns
                 || params.n_a != 1
                 || params.num_digits_inner != 1
