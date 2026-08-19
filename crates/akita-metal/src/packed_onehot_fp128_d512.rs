@@ -444,10 +444,10 @@ mod tests {
 
     #[test]
     fn streaming_fp128_d512_panels_match_resident_input() {
-        const ROWS: usize = 1_024;
+        const ROWS: usize = 16_384;
         const COLUMNS: usize = 29;
         const CAPACITY: usize = 32;
-        const POSITIONS_PER_BLOCK: usize = 16;
+        const POSITIONS_PER_BLOCK: usize = 32;
         let lane = |row: usize, column: usize| {
             if (row + column).is_multiple_of(5) {
                 0
@@ -518,6 +518,13 @@ mod tests {
         assert_eq!(
             resident_output[0].inner_rows,
             streaming_output[0].inner_rows
+        );
+        assert!(
+            metal
+                .last_commit_metrics()
+                .unwrap()
+                .unwrap()
+                .input_zero_copy
         );
         assert_eq!(stream.finalize().unwrap().lanes(), resident.lanes());
     }

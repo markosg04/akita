@@ -4,8 +4,9 @@ mod commit;
 mod poly;
 
 pub use poly::{
-    PackedOneHotPoly, PackedOneHotStreamBuffer, PackedOneHotStreamWriter, PackedOneHotView,
-    StreamingPackedOneHotPoly, StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+    InitializedPackedOneHotStorage, PackedOneHotPoly, PackedOneHotStreamBuffer,
+    PackedOneHotStreamWriter, PackedOneHotView, StreamingPackedOneHotPoly,
+    StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
 };
 
 #[cfg(test)]

@@ -4,7 +4,9 @@ use std::mem::size_of;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use akita_prover::{StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT};
+use akita_prover::{
+    InitializedPackedOneHotStorage, StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+};
 use metal::objc::rc::autoreleasepool;
 use metal::objc::{runtime::Sel, Message};
 use metal::{
@@ -111,8 +113,31 @@ const _: [(); 168] = [(); size_of::<PackedOneHotCommitParams>()];
 trait PackedLaneSource {
     fn lane_count(&self) -> usize;
 
+    fn initialized_storage(&self) -> Option<PackedLaneStorage<'_>>;
+
     fn wait_lanes(&self, rows: Range<usize>, lane_stride: usize)
         -> Result<&[u8], MetalCommitError>;
+}
+
+enum PackedLaneStorage<'a> {
+    Borrowed(&'a [u8]),
+    Owned(InitializedPackedOneHotStorage),
+}
+
+impl PackedLaneStorage<'_> {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Borrowed(lanes) => lanes.as_ptr(),
+            Self::Owned(storage) => storage.as_ptr(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(lanes) => lanes.len(),
+            Self::Owned(storage) => storage.len(),
+        }
+    }
 }
 
 struct ResidentPackedLanes<'a> {
@@ -122,6 +147,10 @@ struct ResidentPackedLanes<'a> {
 impl PackedLaneSource for ResidentPackedLanes<'_> {
     fn lane_count(&self) -> usize {
         self.lanes.len()
+    }
+
+    fn initialized_storage(&self) -> Option<PackedLaneStorage<'_>> {
+        Some(PackedLaneStorage::Borrowed(self.lanes))
     }
 
     fn wait_lanes(
@@ -146,6 +175,10 @@ impl PackedLaneSource for ResidentPackedLanes<'_> {
 impl<const D: usize> PackedLaneSource for StreamingPackedOneHotView<F, D> {
     fn lane_count(&self) -> usize {
         StreamingPackedOneHotView::lane_count(self)
+    }
+
+    fn initialized_storage(&self) -> Option<PackedLaneStorage<'_>> {
+        StreamingPackedOneHotView::initialized_storage(self).map(PackedLaneStorage::Owned)
     }
 
     fn wait_lanes(
@@ -287,26 +320,33 @@ impl MetalRuntime {
         &self,
         lanes: &'a [u8],
     ) -> Result<PackedLaneBuffer<'a>, MetalCommitError> {
-        let bytes = lanes.len();
+        self.packed_lane_buffer_raw(lanes, lanes.as_ptr(), lanes.len())
+    }
+
+    fn packed_lane_buffer_raw<'a, O: ?Sized>(
+        &self,
+        _owner: &'a O,
+        ptr: *const u8,
+        bytes: usize,
+    ) -> Result<PackedLaneBuffer<'a>, MetalCommitError> {
         self.validate_buffer_length(bytes)?;
         if bytes == 0 {
             return Err(MetalCommitError::UnsupportedShape(
                 "zero-length Metal input buffer".into(),
             ));
         }
-        let zero_copy = lanes
-            .as_ptr()
-            .addr()
-            .is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT)
-            && bytes.is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT);
+        let zero_copy = Self::packed_lane_region_is_zero_copy(ptr, bytes);
         let buffer = if zero_copy {
             self.device.new_buffer_with_bytes_no_copy(
-                lanes.as_ptr().cast::<c_void>(),
+                ptr.cast::<c_void>(),
                 bytes as u64,
                 MTLResourceOptions::StorageModeShared,
                 None,
             )
         } else {
+            // SAFETY: `_owner` keeps this initialized region alive for the
+            // returned buffer, and the caller supplied its exact byte length.
+            let lanes = unsafe { std::slice::from_raw_parts(ptr, bytes) };
             self.shared_buffer_from_slice(lanes)?
         };
         Ok(PackedLaneBuffer {
@@ -314,6 +354,11 @@ impl MetalRuntime {
             zero_copy,
             marker: PhantomData,
         })
+    }
+
+    fn packed_lane_region_is_zero_copy(ptr: *const u8, bytes: usize) -> bool {
+        ptr.addr().is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT)
+            && bytes.is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT)
     }
 
     fn shared_buffer(&self, bytes: usize) -> Result<Buffer, MetalCommitError> {
@@ -533,12 +578,28 @@ impl MetalRuntime {
             let partials = self.private_buffer(scratch_bytes)?;
             let mut buffer_setup = buffer_start.elapsed();
 
+            let initialized_storage = source.initialized_storage();
+            let full_lane_buffer = if let Some(storage) =
+                initialized_storage.as_ref().filter(|storage| {
+                    Self::packed_lane_region_is_zero_copy(storage.as_ptr(), storage.len())
+                }) {
+                let start = Instant::now();
+                let buffer =
+                    self.packed_lane_buffer_raw(storage, storage.as_ptr(), storage.len())?;
+                buffer_setup += start.elapsed();
+                Some(buffer)
+            } else {
+                None
+            };
+
             let command_start = Instant::now();
             let command_count =
                 base_streams.div_ceil(FP128_D512_STREAMS_PER_COMMAND as u64) as usize;
             let mut commands = Vec::with_capacity(command_count);
             let mut lane_buffers = Vec::with_capacity(command_count);
-            let mut input_zero_copy = true;
+            let mut input_zero_copy = full_lane_buffer
+                .as_ref()
+                .is_none_or(|buffer| buffer.zero_copy);
             for first_stream in (0..base_streams).step_by(FP128_D512_STREAMS_PER_COMMAND) {
                 let stream_count =
                     (base_streams - first_stream).min(FP128_D512_STREAMS_PER_COMMAND as u64);
@@ -561,11 +622,23 @@ impl MetalRuntime {
                 let lane_stride = usize::try_from(params.lane_stride)
                     .map_err(|_| MetalCommitError::ShapeOverflow("packed lane stride"))?;
                 let command_lanes = source.wait_lanes(first_row..final_row, lane_stride)?;
-                let lane_buffer_start = Instant::now();
-                let lane_buffer = self.packed_lane_buffer(command_lanes)?;
-                buffer_setup += lane_buffer_start.elapsed();
-                input_zero_copy &= lane_buffer.zero_copy;
-                dispatch_params.lane_row_offset = first_row as u64;
+                let lane_buffer = if let Some(buffer) = &full_lane_buffer {
+                    dispatch_params.lane_row_offset = 0;
+                    &buffer.buffer
+                } else {
+                    let lane_buffer_start = Instant::now();
+                    let buffer = self.packed_lane_buffer(command_lanes)?;
+                    buffer_setup += lane_buffer_start.elapsed();
+                    input_zero_copy &= buffer.zero_copy;
+                    lane_buffers.push(buffer);
+                    dispatch_params.lane_row_offset = first_row as u64;
+                    &lane_buffers
+                        .last()
+                        .ok_or(MetalCommitError::ShapeOverflow(
+                            "packed command lane buffer",
+                        ))?
+                        .buffer
+                };
                 let command_threadgroups = dispatch_params
                     .n_a
                     .checked_mul(dispatch_params.position_partials_per_block)
@@ -581,7 +654,7 @@ impl MetalRuntime {
                 encoder.set_label("Akita packed fp128 D512 coefficient bands");
                 encoder.set_compute_pipeline_state(&self.packed_fp128_d512_pipeline);
                 encoder.set_buffer(0, Some(matrix), 0);
-                encoder.set_buffer(1, Some(&lane_buffer.buffer), 0);
+                encoder.set_buffer(1, Some(lane_buffer), 0);
                 encoder.set_buffer(2, Some(&partials), 0);
                 set_inline_bytes(encoder, 3, &dispatch_params);
                 encoder.dispatch_thread_groups(
@@ -591,7 +664,6 @@ impl MetalRuntime {
                 encoder.end_encoding();
                 command.commit();
                 commands.push(command);
-                lane_buffers.push(lane_buffer);
             }
 
             let reduction_command = self.queue.new_command_buffer();
