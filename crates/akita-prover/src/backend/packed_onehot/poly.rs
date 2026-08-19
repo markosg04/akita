@@ -158,7 +158,6 @@ struct StreamingProgress {
 #[derive(Debug)]
 struct StreamingPackedOneHotInner<F: FieldCore> {
     lanes: Arc<AlignedBytes>,
-    storage_initialized: bool,
     num_rows: usize,
     num_columns: usize,
     column_capacity: usize,
@@ -187,34 +186,12 @@ pub struct PackedOneHotStreamBuffer {
     num_vars: usize,
 }
 
-/// Owned handle to fully initialized streaming storage for device interop.
-#[derive(Debug, Clone)]
-pub struct InitializedPackedOneHotStorage {
-    lanes: Arc<AlignedBytes>,
-}
-
-impl InitializedPackedOneHotStorage {
-    #[must_use]
-    pub fn as_ptr(&self) -> *const u8 {
-        self.lanes.ptr.as_ptr().cast_const()
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.lanes.len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.lanes.len == 0
-    }
-}
-
 /// The unique sequential producer for a [`StreamingPackedOneHotPoly`].
 #[derive(Debug)]
 pub struct PackedOneHotStreamWriter<F: FieldCore> {
     inner: Arc<StreamingPackedOneHotInner<F>>,
     next_row: usize,
+    initialized: bool,
     closed: bool,
 }
 
@@ -522,7 +499,6 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
     ) -> (Self, PackedOneHotStreamWriter<F>) {
         let inner = Arc::new(StreamingPackedOneHotInner {
             lanes: Arc::new(lanes),
-            storage_initialized: initialized,
             num_rows,
             num_columns,
             column_capacity,
@@ -544,6 +520,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             PackedOneHotStreamWriter {
                 inner,
                 next_row: 0,
+                initialized,
                 closed: false,
             },
         )
@@ -686,7 +663,7 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
     where
         G: Fn(usize, &mut [u8]) -> Result<(), String> + Sync,
     {
-        if !self.inner.storage_initialized {
+        if !self.initialized {
             return Err(AkitaError::InvalidInput(
                 "in-place packed row generation requires a prepared initialized buffer".into(),
             ));
@@ -902,18 +879,6 @@ impl<F: FieldCore, const D: usize> StreamingPackedOneHotView<F, D> {
     #[must_use]
     pub fn lane_count(&self) -> usize {
         self.inner.lanes.len
-    }
-
-    /// Clone an owner for the initialized backing allocation used by device views.
-    ///
-    /// Device reads must remain within row ranges synchronized by [`Self::wait_lanes`].
-    #[must_use]
-    pub fn initialized_storage(&self) -> Option<InitializedPackedOneHotStorage> {
-        self.inner
-            .storage_initialized
-            .then(|| InitializedPackedOneHotStorage {
-                lanes: self.inner.lanes.clone(),
-            })
     }
 
     /// Wait until `rows` is immutable, then borrow its contiguous lane bytes.

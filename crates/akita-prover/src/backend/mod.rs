@@ -23,9 +23,8 @@ pub use multilinear_polynomial::{
 };
 pub use onehot::{OneHotBatchView, OneHotIndex, OneHotPoly, OneHotView};
 pub use packed_onehot::{
-    InitializedPackedOneHotStorage, PackedOneHotPoly, PackedOneHotStreamBuffer,
-    PackedOneHotStreamWriter, PackedOneHotView, StreamingPackedOneHotPoly,
-    StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+    PackedOneHotPoly, PackedOneHotStreamBuffer, PackedOneHotStreamWriter, PackedOneHotView,
+    StreamingPackedOneHotPoly, StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
 };
 pub use recursive::{
     RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView, SuffixWitnessView,
