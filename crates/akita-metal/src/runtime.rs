@@ -23,7 +23,7 @@ const PACKED_PARTIAL_REDUCTION_KERNEL_NAME: &str = "akita_packed_onehot_reduce_p
 const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const FP128_D512_TASKS_PER_STREAM: usize = 32;
-const FP128_D512_STREAMS_PER_COMMAND: usize = 4;
+const FP128_D512_STREAMS_PER_COMMAND: usize = 1;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
     FP128_D512_TILE_FIELD_ELEMENTS * size_of::<Fp128Limbs>();
