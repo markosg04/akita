@@ -323,8 +323,8 @@ mod tests {
 
     use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
     use akita_prover::{
-        AkitaProverSetup, ComputeBackendSetup, CpuBackend, PackedOneHotPoly, RootCommitSource,
-        RootPolyMeta, StreamingPackedOneHotPoly,
+        AkitaProverSetup, ComputeBackendSetup, CpuBackend, PackedOneHotPoly,
+        PackedOneHotStreamBuffer, RootCommitSource, RootPolyMeta, StreamingPackedOneHotPoly,
     };
     use akita_types::SetupMatrixCapacity;
 
@@ -464,16 +464,8 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
-        let buffer = metal
-            .prepare_packed_fp128_d512_stream_buffer(
-                super::ONEHOT_K,
-                CAPACITY,
-                COLUMNS,
-                ROWS,
-                POSITIONS_PER_BLOCK,
-            )
-            .unwrap();
+        let buffer =
+            PackedOneHotStreamBuffer::zeroed(super::ONEHOT_K, CAPACITY, COLUMNS, ROWS).unwrap();
         let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::from_buffer(buffer);
         let plan = CommitInnerPlan {
             n_a: 1,
@@ -489,6 +481,7 @@ mod tests {
             },
         )
         .unwrap();
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let prepared = metal.prepare_setup(&setup).unwrap();
         let resident_output = metal
             .commit_inner_group(

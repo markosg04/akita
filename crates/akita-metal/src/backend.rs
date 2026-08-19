@@ -11,8 +11,7 @@ use akita_prover::compute::{
     TensorProjectionKernel,
 };
 use akita_prover::{
-    CommitInnerWitness, CpuBackend, CpuPreparedSetup, NttCacheOwnerId, PackedOneHotStreamBuffer,
-    RootTensorProjectionPoly,
+    CommitInnerWitness, CpuBackend, CpuPreparedSetup, NttCacheOwnerId, RootTensorProjectionPoly,
 };
 use akita_types::{AkitaExpandedSetup, FpExtEncoding, NttCacheKey};
 use metal::Device;
@@ -285,26 +284,6 @@ impl MetalCommitBackend<F> {
             cache_hit: matrix.cache_hit,
             prepare_time: matrix.prepare_time,
         })
-    }
-
-    /// Allocate a stream buffer and prefault the first Metal command's rows.
-    pub fn prepare_packed_fp128_d512_stream_buffer(
-        &self,
-        onehot_k: usize,
-        column_capacity: usize,
-        num_columns: usize,
-        num_rows: usize,
-        positions_per_block: usize,
-    ) -> Result<PackedOneHotStreamBuffer, AkitaError> {
-        self.runtime()
-            .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?
-            .prepare_packed_fp128_d512_stream_buffer(
-                onehot_k,
-                column_capacity,
-                num_columns,
-                num_rows,
-                positions_per_block,
-            )
     }
 }
 

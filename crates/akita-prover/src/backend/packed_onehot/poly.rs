@@ -605,22 +605,6 @@ impl PackedOneHotStreamBuffer {
         })
     }
 
-    /// Touch the page-backed prefix needed before a streaming consumer starts.
-    pub fn prefault_prefix_rows(&mut self, row_count: usize) -> Result<(), AkitaError> {
-        if row_count > self.num_rows {
-            return Err(AkitaError::InvalidInput(format!(
-                "packed one-hot prefault prefix {row_count} exceeds {} rows",
-                self.num_rows
-            )));
-        }
-        let lane_count = row_count.checked_mul(self.num_columns).ok_or_else(|| {
-            AkitaError::InvalidInput("packed prefault lane count overflow".into())
-        })?;
-        cfg_chunks_mut!(&mut self.lanes.as_mut_slice()[..lane_count], 1 << 20)
-            .for_each(|chunk| chunk.fill(0));
-        Ok(())
-    }
-
     #[must_use]
     pub fn num_vars(&self) -> usize {
         self.num_vars
