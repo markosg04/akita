@@ -323,8 +323,8 @@ mod tests {
 
     use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
     use akita_prover::{
-        AkitaProverSetup, ComputeBackendSetup, CpuBackend, PackedOneHotPoly, RootCommitSource,
-        RootPolyMeta, StreamingPackedOneHotPoly,
+        AkitaProverSetup, ComputeBackendSetup, CpuBackend, PackedOneHotPoly,
+        PackedOneHotStreamBuffer, RootCommitSource, RootPolyMeta, StreamingPackedOneHotPoly,
     };
     use akita_types::SetupMatrixCapacity;
 
@@ -464,8 +464,9 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let (stream, mut writer) =
-            StreamingPackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, COLUMNS, ROWS).unwrap();
+        let buffer =
+            PackedOneHotStreamBuffer::zeroed(super::ONEHOT_K, CAPACITY, COLUMNS, ROWS).unwrap();
+        let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::from_buffer(buffer);
         let plan = CommitInnerPlan {
             n_a: 1,
             num_positions_per_block: POSITIONS_PER_BLOCK,
@@ -493,10 +494,12 @@ mod tests {
             let producer = scope.spawn(move || {
                 for _ in 0..8 {
                     writer
-                        .fill_next_rows(ROWS / 8, |row| {
-                            Ok::<[u8; COLUMNS], String>(std::array::from_fn(|column| {
-                                lane(row, column)
-                            }))
+                        .fill_next_rows_in_place(ROWS / 8, |row, output| {
+                            output
+                                .iter_mut()
+                                .enumerate()
+                                .for_each(|(column, value)| *value = lane(row, column));
+                            Ok(())
                         })
                         .unwrap();
                 }

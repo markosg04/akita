@@ -159,13 +159,21 @@ fn streaming_storage_publishes_prefixes_and_finalizes_without_copying() {
             prefix
         });
         writer
-            .fill_next_rows(4, |row| {
-                Ok::<[u8; 3], String>(std::array::from_fn(|column| ((row + column) % 16) as u8))
+            .fill_next_rows_in_place(4, |row, output| {
+                output
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(column, value)| *value = ((row + column) % 16) as u8);
+                Ok(())
             })
             .unwrap();
         writer
-            .fill_next_rows(4, |row| {
-                Ok::<[u8; 3], String>(std::array::from_fn(|column| ((row + column) % 16) as u8))
+            .fill_next_rows_in_place(4, |row, output| {
+                output
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(column, value)| *value = ((row + column) % 16) as u8);
+                Ok(())
             })
             .unwrap();
         writer.finish().unwrap();
@@ -193,6 +201,17 @@ fn streaming_storage_failure_wakes_consumers() {
     assert!(error.to_string().contains("lane 16 at byte 7"));
     assert!(view.wait_lanes(0..4).is_err());
     assert!(stream.finalize().is_err());
+}
+
+#[test]
+fn streaming_uninitialized_storage_rejects_in_place_generation() {
+    let (_stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
+    let error = writer
+        .fill_next_rows_in_place(4, |_row, _output| Ok(()))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires a prepared initialized buffer"));
 }
 
 #[test]

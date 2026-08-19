@@ -191,6 +191,7 @@ pub struct PackedOneHotStreamBuffer {
 pub struct PackedOneHotStreamWriter<F: FieldCore> {
     inner: Arc<StreamingPackedOneHotInner<F>>,
     next_row: usize,
+    initialized: bool,
     closed: bool,
 }
 
@@ -469,6 +470,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             num_columns,
             validated_rows,
             total_field_elems.trailing_zeros() as usize,
+            false,
         ))
     }
 
@@ -482,6 +484,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             buffer.num_columns,
             buffer.num_rows,
             buffer.num_vars,
+            true,
         )
     }
 
@@ -492,6 +495,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
         num_columns: usize,
         num_rows: usize,
         num_vars: usize,
+        initialized: bool,
     ) -> (Self, PackedOneHotStreamWriter<F>) {
         let inner = Arc::new(StreamingPackedOneHotInner {
             lanes: Arc::new(lanes),
@@ -516,6 +520,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             PackedOneHotStreamWriter {
                 inner,
                 next_row: 0,
+                initialized,
                 closed: false,
             },
         )
@@ -630,6 +635,53 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
     where
         G: Fn(usize) -> Result<[u8; N], String> + Sync,
     {
+        if N < self.inner.num_columns {
+            return Err(AkitaError::InvalidInput(format!(
+                "packed one-hot row output width {N} is smaller than {} live columns",
+                self.inner.num_columns
+            )));
+        }
+        let num_columns = self.inner.num_columns;
+        self.fill_next_rows_with(row_count, |row, output| {
+            let values = fill_row(row)?;
+            output
+                .iter_mut()
+                .zip(values[..num_columns].iter().copied())
+                .for_each(|(lane, value)| {
+                    lane.write(value);
+                });
+            Ok(())
+        })
+    }
+
+    /// Fill initialized unpublished rows in place and publish the completed range.
+    pub fn fill_next_rows_in_place<G>(
+        &mut self,
+        row_count: usize,
+        fill_row: G,
+    ) -> Result<(), AkitaError>
+    where
+        G: Fn(usize, &mut [u8]) -> Result<(), String> + Sync,
+    {
+        if !self.initialized {
+            return Err(AkitaError::InvalidInput(
+                "in-place packed row generation requires a prepared initialized buffer".into(),
+            ));
+        }
+        self.fill_next_rows_with(row_count, |row, output| {
+            // SAFETY: `from_buffer` supplied initialized storage, and the
+            // writer has exclusive access to this unpublished row range.
+            let initialized = unsafe {
+                slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), output.len())
+            };
+            fill_row(row, initialized)
+        })
+    }
+
+    fn fill_next_rows_with<G>(&mut self, row_count: usize, fill_row: G) -> Result<(), AkitaError>
+    where
+        G: Fn(usize, &mut [MaybeUninit<u8>]) -> Result<(), String> + Sync,
+    {
         if self.closed {
             return Err(AkitaError::InvalidInput(
                 "packed one-hot stream writer is already closed".into(),
@@ -639,12 +691,6 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
             return Err(AkitaError::InvalidInput(
                 "packed one-hot stream row batch must be nonempty".into(),
             ));
-        }
-        if N < self.inner.num_columns {
-            return Err(AkitaError::InvalidInput(format!(
-                "packed one-hot row output width {N} is smaller than {} live columns",
-                self.inner.num_columns
-            )));
         }
         let row_end = self
             .next_row
@@ -679,9 +725,8 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
         let final_lane = row_end
             .checked_mul(self.inner.num_columns)
             .ok_or_else(|| AkitaError::InvalidInput("packed final lane overflow".into()))?;
-        // SAFETY: `MaybeUninit<u8>` may represent the unpublished allocation.
-        // This unique writer owns this suffix, and publication advances only
-        // after every row below has been initialized.
+        // SAFETY: the unique writer owns this unpublished suffix. It is exposed
+        // as initialized bytes only by the guarded in-place entry point.
         let lanes: &mut [MaybeUninit<u8>] = unsafe {
             slice::from_raw_parts_mut(
                 self.inner
@@ -699,32 +744,30 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
             .enumerate()
             .map(|(row_offset, row_lanes)| {
                 let row = self.next_row + row_offset;
-                let values = match fill_row(row) {
-                    Ok(values) => values,
-                    Err(message) => {
-                        let mut failure = fill_failure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if failure
-                            .as_ref()
-                            .is_none_or(|(failed_row, _)| row < *failed_row)
-                        {
-                            *failure = Some((row, message));
-                        }
-                        return 0;
+                if let Err(message) = fill_row(row, row_lanes) {
+                    let mut failure = fill_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if failure
+                        .as_ref()
+                        .is_none_or(|(failed_row, _)| row < *failed_row)
+                    {
+                        *failure = Some((row, message));
                     }
-                };
-                values[..self.inner.num_columns]
+                    return 0;
+                }
+                row_lanes
                     .iter()
                     .enumerate()
-                    .map(|(column, &value)| {
+                    .map(|(column, lane)| {
+                        // SAFETY: a successful row fill initialized every lane.
+                        let value = unsafe { *lane.assume_init_ref() };
                         if usize::from(value) >= self.inner.onehot_k {
                             invalid_position.fetch_min(
                                 row * self.inner.num_columns + column,
                                 Ordering::Relaxed,
                             );
                         }
-                        row_lanes[column].write(value);
                         usize::from(value != 0)
                     })
                     .sum::<usize>()
