@@ -6,6 +6,7 @@ mod field_reduction;
 pub(crate) mod flat_blocks;
 mod multilinear_polynomial;
 pub(crate) mod onehot;
+mod packed_onehot;
 #[doc(hidden)]
 #[allow(missing_docs)]
 pub mod poly_helpers;
@@ -19,6 +20,7 @@ pub use multilinear_polynomial::{
     MultilinearPolynomial, MultilinearPolynomialBatchView, MultilinearPolynomialView,
 };
 pub use onehot::{OneHotBatchView, OneHotIndex, OneHotPoly, OneHotView};
+pub use packed_onehot::{PackedOneHotPoly, PackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT};
 pub use recursive::{
     RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView, SuffixWitnessView,
 };
