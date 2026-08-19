@@ -403,5 +403,4 @@ impl<F: FieldCore, const D: usize> RootCommitSource<F, D> for PackedOneHotPoly<F
             marker: PhantomData,
         })
     }
-
 }

@@ -385,8 +385,7 @@ where
 }
 
 impl<Field: MetalField, const D: usize>
-    RootCommitKernel<RootTensorProjectionView<'_, Field, D>, Field, D>
-    for MetalCommitBackend<Field>
+    RootCommitKernel<RootTensorProjectionView<'_, Field, D>, Field, D> for MetalCommitBackend<Field>
 where
     CpuBackend: ComputeBackendSetup<Field, PreparedSetup = CpuPreparedSetup<Field>>,
     for<'a> CpuBackend: RootCommitKernel<RootTensorProjectionView<'a, Field, D>, Field, D>,
