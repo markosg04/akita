@@ -131,6 +131,23 @@ fn row_generated_storage_matches_vec_constructor() {
 }
 
 #[test]
+fn generated_storage_rejects_out_of_range_lanes() {
+    let lane_error = PackedOneHotPoly::<F>::from_lane_fn(16, 4, 3, 8, |index| {
+        if index == 7 { 16 } else { 0 }
+    })
+    .unwrap_err();
+    assert!(lane_error.to_string().contains("lane 16 at byte 7"));
+
+    let row_error = PackedOneHotPoly::<F>::from_row_fn(16, 4, 3, 8, |row, output| {
+        if row == 2 {
+            output[1] = 16;
+        }
+    })
+    .unwrap_err();
+    assert!(row_error.to_string().contains("lane 16 at byte 7"));
+}
+
+#[test]
 fn packed_commit_matches_cared_geometries_and_sentinels() {
     for (onehot_k, rows, columns, capacity, positions) in [(16, 16, 3, 4, 4), (256, 8, 3, 4, 4)] {
         let patterns = [

@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::{copy_nonoverlapping, NonNull};
 use std::slice;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use akita_field::{parallel::*, AkitaError, FieldCore};
@@ -178,6 +179,13 @@ fn validate_lanes(onehot_k: usize, lanes: &[u8]) -> Result<usize, AkitaError> {
     Ok(hot_entries)
 }
 
+fn invalid_lane_error(onehot_k: usize, lanes: &[u8], position: usize) -> AkitaError {
+    AkitaError::InvalidInput(format!(
+        "packed one-hot lane {} at byte {position} is outside K={onehot_k}",
+        lanes[position]
+    ))
+}
+
 fn validate_geometry(
     onehot_k: usize,
     column_capacity: usize,
@@ -257,10 +265,21 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
         let (validated_rows, total_field_elems) =
             validate_geometry_shape(onehot_k, column_capacity, num_columns, lane_count)?;
         let mut lanes = AlignedBytes::zeroed(lane_count)?;
-        cfg_iter_mut!(lanes.as_mut_slice())
+        let invalid_position = AtomicUsize::new(usize::MAX);
+        let hot_entries = cfg_iter_mut!(lanes.as_mut_slice())
             .enumerate()
-            .for_each(|(index, value)| *value = lane(index));
-        let hot_entries = validate_lanes(onehot_k, &lanes)?;
+            .map(|(index, value)| {
+                *value = lane(index);
+                if usize::from(*value) >= onehot_k {
+                    invalid_position.fetch_min(index, Ordering::Relaxed);
+                }
+                usize::from(*value != 0)
+            })
+            .sum();
+        let invalid_position = invalid_position.load(Ordering::Relaxed);
+        if invalid_position != usize::MAX {
+            return Err(invalid_lane_error(onehot_k, &lanes, invalid_position));
+        }
         Ok(Self {
             lanes: Arc::new(lanes),
             num_rows: validated_rows,
@@ -290,10 +309,28 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
         let (validated_rows, total_field_elems) =
             validate_geometry_shape(onehot_k, column_capacity, num_columns, lane_count)?;
         let mut lanes = AlignedBytes::zeroed(lane_count)?;
-        cfg_chunks_mut!(lanes.as_mut_slice(), num_columns)
+        let invalid_position = AtomicUsize::new(usize::MAX);
+        let hot_entries = cfg_chunks_mut!(lanes.as_mut_slice(), num_columns)
             .enumerate()
-            .for_each(|(row, lanes)| fill_row(row, lanes));
-        let hot_entries = validate_lanes(onehot_k, &lanes)?;
+            .map(|(row, row_lanes)| {
+                fill_row(row, row_lanes);
+                row_lanes
+                    .iter()
+                    .enumerate()
+                    .map(|(column, &value)| {
+                        if usize::from(value) >= onehot_k {
+                            invalid_position
+                                .fetch_min(row * num_columns + column, Ordering::Relaxed);
+                        }
+                        usize::from(value != 0)
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let invalid_position = invalid_position.load(Ordering::Relaxed);
+        if invalid_position != usize::MAX {
+            return Err(invalid_lane_error(onehot_k, &lanes, invalid_position));
+        }
         Ok(Self {
             lanes: Arc::new(lanes),
             num_rows: validated_rows,
