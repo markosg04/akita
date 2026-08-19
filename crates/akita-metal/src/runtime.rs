@@ -212,6 +212,22 @@ impl MetalRuntime {
         ))
     }
 
+    pub(crate) fn private_buffer_from_slice<T>(
+        &self,
+        values: &[T],
+    ) -> Result<Buffer, MetalCommitError> {
+        let bytes = size_of_val(values);
+        let staging = self.shared_buffer_from_slice(values)?;
+        let buffer = self.private_buffer(bytes)?;
+        let command = self.queue.new_command_buffer();
+        command.set_label("Akita immutable setup upload");
+        let encoder = command.new_blit_command_encoder();
+        encoder.copy_from_buffer(&staging, 0, &buffer, 0, bytes as u64);
+        encoder.end_encoding();
+        let _ = complete_command(command)?;
+        Ok(buffer)
+    }
+
     fn packed_lane_buffer<'a>(
         &self,
         lanes: &'a [u8],

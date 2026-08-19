@@ -103,7 +103,7 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
             .collect::<Vec<_>>();
         let bytes = size_of_val(packed.as_slice());
         let buffer = runtime
-            .shared_buffer_from_slice(&packed)
+            .private_buffer_from_slice(&packed)
             .map_err(MetalCommitError::into_akita)?;
         let buffer = Arc::new(buffer);
         let prepare_time = start.elapsed();
