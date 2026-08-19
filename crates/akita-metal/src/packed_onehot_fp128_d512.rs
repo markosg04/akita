@@ -10,13 +10,15 @@ use metal::Buffer;
 use crate::backend::{MetalCommitBackend, MetalCommitMetrics};
 use crate::field::{Fp128Limbs, MetalField, F};
 use crate::prepared::MetalPreparedSetup;
-use crate::runtime::{DispatchOutcome, MetalRuntime, PackedOneHotCommitParams};
+use crate::runtime::{
+    DispatchOutcome, MetalRuntime, PackedOneHotCommitParams, FP128_D512_POSITION_PARTIALS,
+};
 use crate::MetalCommitError;
 
 const RING_D: usize = 512;
 const ONEHOT_K: usize = 256;
 const COLUMN_CAPACITY: usize = 32;
-const POSITION_PARTIALS: usize = 4;
+const POSITION_PARTIALS: usize = FP128_D512_POSITION_PARTIALS;
 const INNER_RANK: usize = 1;
 #[cfg(test)]
 const TASKS_PER_STREAM: usize = 32;
@@ -130,7 +132,7 @@ pub(crate) fn validate_shape<const D: usize>(
             .is_multiple_of(POSITION_PARTIALS)
     {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 Metal D512 commit requires K256/nonempty-C<=32-cap32/rank1 and four integral partials"
+            "fp128 Metal D512 commit requires K256/nonempty-C<=32-cap32/rank1 and integral position partials"
                 .into(),
         )
         .into_akita());
@@ -386,9 +388,9 @@ mod tests {
 
     #[test]
     fn exact_fp128_d512_panels_match_cpu_on_sparse_boundaries() {
-        const ROWS: usize = 1_024;
+        const ROWS: usize = 4_096;
         const CAPACITY: usize = 32;
-        const POSITIONS_PER_BLOCK: usize = 16;
+        const POSITIONS_PER_BLOCK: usize = 64;
         let plan = CommitInnerPlan {
             n_a: 1,
             num_positions_per_block: POSITIONS_PER_BLOCK,
@@ -396,7 +398,7 @@ mod tests {
             log_basis_inner: 3,
         };
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
-            23,
+            25,
             1,
             SetupMatrixCapacity {
                 num_field_elements: POSITIONS_PER_BLOCK * super::RING_D,
@@ -419,7 +421,7 @@ mod tests {
                 .collect();
             let poly =
                 PackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, columns, lanes).unwrap();
-            assert_eq!(RootPolyMeta::<F>::num_vars(&poly), 23);
+            assert_eq!(RootPolyMeta::<F>::num_vars(&poly), 25);
             let cpu_output = cpu
                 .commit_inner_group(
                     &cpu_prepared,
@@ -444,10 +446,10 @@ mod tests {
 
     #[test]
     fn streaming_fp128_d512_panels_match_resident_input() {
-        const ROWS: usize = 1_024;
+        const ROWS: usize = 4_096;
         const COLUMNS: usize = 29;
         const CAPACITY: usize = 32;
-        const POSITIONS_PER_BLOCK: usize = 16;
+        const POSITIONS_PER_BLOCK: usize = 64;
         let lane = |row: usize, column: usize| {
             if (row + column).is_multiple_of(5) {
                 0
@@ -474,7 +476,7 @@ mod tests {
             log_basis_inner: 3,
         };
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
-            23,
+            25,
             1,
             SetupMatrixCapacity {
                 num_field_elements: POSITIONS_PER_BLOCK * super::RING_D,

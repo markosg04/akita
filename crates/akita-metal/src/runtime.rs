@@ -24,6 +24,7 @@ const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const FP128_D512_TASKS_PER_STREAM: usize = 32;
 const FP128_D512_STREAMS_PER_COMMAND: usize = 1;
+pub(crate) const FP128_D512_POSITION_PARTIALS: usize = 16;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
     FP128_D512_TILE_FIELD_ELEMENTS * size_of::<Fp128Limbs>();
@@ -466,7 +467,7 @@ impl MetalRuntime {
                 || params.lane_stride != params.num_columns
                 || params.n_a != 1
                 || params.num_digits_inner != 1
-                || params.position_partials_per_block != 4
+                || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
                 || !params.positions_per_partial.is_multiple_of(4)
                 || !matches!(params.blocks_per_column, 32 | 64 | 128 | 256)
                 || params.full_blocks_per_column != params.blocks_per_column
