@@ -353,7 +353,7 @@ pub(crate) fn derive_selected_suffix_schedule(
         root_honest_fold_policy,
         precommitted_honest_fold_policies,
         level_zero_is_root,
-        root_dimension_filter,
+        root_candidate_constraint,
     } = *ctx;
     let SuffixState {
         level,
@@ -454,7 +454,8 @@ pub(crate) fn derive_selected_suffix_schedule(
     for dimensions in dimension_candidates(policy, level, dimension_ceiling)? {
         if level_zero_is_root
             && level == 0
-            && root_dimension_filter.is_some_and(|allowed| !allowed.contains(&dimensions))
+            && root_candidate_constraint
+                .is_some_and(|constraint| !constraint.dimensions.contains(&dimensions))
         {
             continue;
         }
@@ -526,6 +527,10 @@ pub(crate) fn derive_selected_suffix_schedule(
                     candidates.extend(
                         dimension_candidates
                             .into_iter()
+                            .filter(|(params, _)| {
+                                root_candidate_constraint
+                                    .is_none_or(|constraint| constraint.admits(params))
+                            })
                             .map(|(params, next_witness_len)| {
                                 (params, next_witness_len, eor_bytes)
                             }),
