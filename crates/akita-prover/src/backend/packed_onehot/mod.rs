@@ -3,7 +3,10 @@
 mod commit;
 mod poly;
 
-pub use poly::{PackedOneHotPoly, PackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT};
+pub use poly::{
+    PackedOneHotPoly, PackedOneHotStreamWriter, PackedOneHotView, StreamingPackedOneHotPoly,
+    StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+};
 
 #[cfg(test)]
 mod tests;

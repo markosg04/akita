@@ -62,6 +62,9 @@ struct PackedOneHotCommitParams {
     ulong full_blocks_per_column;
     ulong boundary_columns;
     ulong num_blocks;
+    ulong task_offset;
+    ulong dispatch_tasks;
+    ulong lane_row_offset;
     ulong output_coefficients;
     ulong columns_per_threadgroup;
     ulong position_partials_per_block;
@@ -377,7 +380,7 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     constexpr uint positions_per_tile = 4u;
     constexpr uint rows_per_tile = 8u;
     uint live_columns = (uint)params.num_columns;
-    uint num_tasks = (uint)params.num_blocks;
+    uint num_tasks = (uint)params.dispatch_tasks;
     uint blocks_per_column = (uint)params.blocks_per_column;
     uint streams = (num_tasks + tasks_per_stream - 1u) / tasks_per_stream;
     uint simd_lane = thread_index & 31u;
@@ -395,8 +398,9 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     uint rows_per_partial = positions_per_partial * 2u;
     uint rows_per_block = (uint)params.positions_per_block * 2u;
     uint output_coefficients = (uint)params.output_coefficients;
-    uint global_task = stream * tasks_per_stream + simdgroup;
-    bool simdgroup_active = global_task < num_tasks;
+    uint dispatch_task = stream * tasks_per_stream + simdgroup;
+    bool simdgroup_active = dispatch_task < num_tasks;
+    uint global_task = (uint)params.task_offset + dispatch_task;
     uint task_block = global_task / live_columns;
     uint task_column = global_task % live_columns;
     ulong matrix_cursor =
@@ -430,7 +434,8 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
                 + (ulong)tile * (ulong)rows_per_tile
                 + (ulong)simd_lane;
             local_hot = (uint)lanes[
-                trace_row * params.lane_stride + (ulong)task_column];
+                (trace_row - params.lane_row_offset) * params.lane_stride
+                    + (ulong)task_column];
         }
         uint selected = uint(
             simd_ballot(local_hot != 0u).operator unsigned long());

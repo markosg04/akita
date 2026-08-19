@@ -132,10 +132,9 @@ fn row_generated_storage_matches_vec_constructor() {
 
 #[test]
 fn generated_storage_rejects_out_of_range_lanes() {
-    let lane_error = PackedOneHotPoly::<F>::from_lane_fn(16, 4, 3, 8, |index| {
-        if index == 7 { 16 } else { 0 }
-    })
-    .unwrap_err();
+    let lane_error =
+        PackedOneHotPoly::<F>::from_lane_fn(16, 4, 3, 8, |index| if index == 7 { 16 } else { 0 })
+            .unwrap_err();
     assert!(lane_error.to_string().contains("lane 16 at byte 7"));
 
     let row_error = PackedOneHotPoly::<F>::from_row_fn(16, 4, 3, 8, |row, output| {
@@ -145,6 +144,58 @@ fn generated_storage_rejects_out_of_range_lanes() {
     })
     .unwrap_err();
     assert!(row_error.to_string().contains("lane 16 at byte 7"));
+}
+
+#[test]
+fn streaming_storage_publishes_prefixes_and_finalizes_without_copying() {
+    let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
+    let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();
+    let lanes_ptr = std::thread::scope(|scope| {
+        let consumer = scope.spawn(move || {
+            let prefix = view.wait_lanes(0..4).unwrap().to_vec();
+            assert_eq!(view.wait_hot_entries().unwrap(), 23);
+            prefix
+        });
+        writer
+            .fill_next_rows(4, |row, lanes| {
+                for (column, lane) in lanes.iter_mut().enumerate() {
+                    *lane = ((row + column) % 16) as u8;
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer
+            .fill_next_rows(4, |row, lanes| {
+                for (column, lane) in lanes.iter_mut().enumerate() {
+                    *lane = ((row + column) % 16) as u8;
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer.finish().unwrap();
+        assert_eq!(consumer.join().unwrap().len(), 12);
+        stream.finalize().unwrap().lanes().as_ptr()
+    });
+    let packed = stream.finalize().unwrap();
+    assert_eq!(packed.lanes().as_ptr(), lanes_ptr);
+    assert_eq!(packed.hot_entries(), 23);
+}
+
+#[test]
+fn streaming_storage_failure_wakes_consumers() {
+    let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
+    let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();
+    let error = writer
+        .fill_next_rows(4, |row, lanes| {
+            if row == 2 {
+                lanes[1] = 16;
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("lane 16 at byte 7"));
+    assert!(view.wait_lanes(0..4).is_err());
+    assert!(stream.finalize().is_err());
 }
 
 #[test]

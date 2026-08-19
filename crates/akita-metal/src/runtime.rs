@@ -1,9 +1,10 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use akita_prover::PACKED_ONEHOT_BUFFER_ALIGNMENT;
+use akita_prover::{StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT};
 use metal::objc::rc::autoreleasepool;
 use metal::objc::{runtime::Sel, Message};
 use metal::{
@@ -12,7 +13,7 @@ use metal::{
 };
 
 use crate::error::metal_status::CommandStatus;
-use crate::field::Fp128Limbs;
+use crate::field::{Fp128Limbs, F};
 use crate::MetalCommitError;
 
 const DIRECT_KERNEL_NAME: &str = "akita_onehot_commit_gather";
@@ -22,6 +23,7 @@ const PACKED_PARTIAL_REDUCTION_KERNEL_NAME: &str = "akita_packed_onehot_reduce_p
 const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const FP128_D512_TASKS_PER_STREAM: usize = 32;
+const FP128_D512_STREAMS_PER_COMMAND: usize = 4;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
     FP128_D512_TILE_FIELD_ELEMENTS * size_of::<Fp128Limbs>();
@@ -94,6 +96,9 @@ pub(crate) struct PackedOneHotCommitParams {
     pub(crate) full_blocks_per_column: u64,
     pub(crate) boundary_columns: u64,
     pub(crate) num_blocks: u64,
+    pub(crate) task_offset: u64,
+    pub(crate) dispatch_tasks: u64,
+    pub(crate) lane_row_offset: u64,
     pub(crate) output_coefficients: u64,
     pub(crate) columns_per_threadgroup: u64,
     pub(crate) position_partials_per_block: u64,
@@ -101,7 +106,57 @@ pub(crate) struct PackedOneHotCommitParams {
     pub(crate) log_ring_d: u64,
 }
 
-const _: [(); 144] = [(); size_of::<PackedOneHotCommitParams>()];
+const _: [(); 168] = [(); size_of::<PackedOneHotCommitParams>()];
+
+trait PackedLaneSource {
+    fn lane_count(&self) -> usize;
+
+    fn wait_lanes(&self, rows: Range<usize>, lane_stride: usize)
+        -> Result<&[u8], MetalCommitError>;
+}
+
+struct ResidentPackedLanes<'a> {
+    lanes: &'a [u8],
+}
+
+impl PackedLaneSource for ResidentPackedLanes<'_> {
+    fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    fn wait_lanes(
+        &self,
+        rows: Range<usize>,
+        lane_stride: usize,
+    ) -> Result<&[u8], MetalCommitError> {
+        let first = rows
+            .start
+            .checked_mul(lane_stride)
+            .ok_or(MetalCommitError::ShapeOverflow("packed first lane"))?;
+        let final_lane = rows
+            .end
+            .checked_mul(lane_stride)
+            .ok_or(MetalCommitError::ShapeOverflow("packed final lane"))?;
+        self.lanes
+            .get(first..final_lane)
+            .ok_or(MetalCommitError::ShapeOverflow("packed command lane range"))
+    }
+}
+
+impl<const D: usize> PackedLaneSource for StreamingPackedOneHotView<F, D> {
+    fn lane_count(&self) -> usize {
+        StreamingPackedOneHotView::lane_count(self)
+    }
+
+    fn wait_lanes(
+        &self,
+        rows: Range<usize>,
+        _lane_stride: usize,
+    ) -> Result<&[u8], MetalCommitError> {
+        StreamingPackedOneHotView::wait_lanes(self, rows)
+            .map_err(|error| MetalCommitError::InputStream(error.to_string()))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DispatchTimings {
@@ -367,6 +422,24 @@ impl MetalRuntime {
         &self,
         matrix: &Buffer,
         lanes: &[u8],
+        params: PackedOneHotCommitParams,
+    ) -> Result<DispatchOutcome, MetalCommitError> {
+        self.dispatch_packed_onehot_source(matrix, &ResidentPackedLanes { lanes }, params)
+    }
+
+    pub(crate) fn dispatch_streaming_packed_onehot<const D: usize>(
+        &self,
+        matrix: &Buffer,
+        source: &StreamingPackedOneHotView<F, D>,
+        params: PackedOneHotCommitParams,
+    ) -> Result<DispatchOutcome, MetalCommitError> {
+        self.dispatch_packed_onehot_source(matrix, source, params)
+    }
+
+    fn dispatch_packed_onehot_source<S: PackedLaneSource>(
+        &self,
+        matrix: &Buffer,
+        source: &S,
         mut params: PackedOneHotCommitParams,
     ) -> Result<DispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
@@ -384,7 +457,7 @@ impl MetalRuntime {
                 .and_then(|count| count.checked_mul(params.n_a))
                 .and_then(|count| count.checked_mul(params.ring_d))
                 .ok_or(MetalCommitError::ShapeOverflow("packed output"))?;
-            if lane_count != lanes.len() as u64
+            if lane_count != source.lane_count() as u64
                 || params.ring_d != 512
                 || params.onehot_k != 256
                 || params.column_capacity != 32
@@ -399,6 +472,9 @@ impl MetalRuntime {
                 || params.full_blocks_per_column != params.blocks_per_column
                 || params.boundary_columns != 0
                 || params.num_blocks != expected_tasks
+                || params.task_offset != 0
+                || params.dispatch_tasks != params.num_blocks
+                || params.lane_row_offset != 0
                 || params.output_coefficients != expected_output
             {
                 return Err(MetalCommitError::UnsupportedShape(
@@ -442,7 +518,6 @@ impl MetalRuntime {
             }
 
             let buffer_start = Instant::now();
-            let lanes = self.packed_lane_buffer(lanes)?;
             let output_count = usize::try_from(params.output_coefficients)
                 .map_err(|_| MetalCommitError::ShapeOverflow("output coefficients"))?;
             let output_bytes = output_count
@@ -456,24 +531,72 @@ impl MetalRuntime {
                 .checked_mul(size_of::<Fp128Limbs>())
                 .ok_or(MetalCommitError::ShapeOverflow("partial bytes"))?;
             let partials = self.private_buffer(scratch_bytes)?;
-            let buffer_setup = buffer_start.elapsed();
+            let mut buffer_setup = buffer_start.elapsed();
 
-            let command = self.queue.new_command_buffer();
-            command.set_label("Akita packed fp128 D512 root commitment");
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_label("Akita packed fp128 D512 coefficient bands");
-            encoder.set_compute_pipeline_state(&self.packed_fp128_d512_pipeline);
-            encoder.set_buffer(0, Some(matrix), 0);
-            encoder.set_buffer(1, Some(&lanes.buffer), 0);
-            encoder.set_buffer(2, Some(&partials), 0);
-            set_inline_bytes(encoder, 3, &params);
-            encoder.dispatch_thread_groups(
-                MTLSize::new(threadgroups, 1, 1),
-                MTLSize::new(FP128_D512_THREADS as u64, 1, 1),
-            );
-            encoder.end_encoding();
+            let command_start = Instant::now();
+            let command_count =
+                base_streams.div_ceil(FP128_D512_STREAMS_PER_COMMAND as u64) as usize;
+            let mut commands = Vec::with_capacity(command_count);
+            let mut lane_buffers = Vec::with_capacity(command_count);
+            let mut input_zero_copy = true;
+            for first_stream in (0..base_streams).step_by(FP128_D512_STREAMS_PER_COMMAND) {
+                let stream_count =
+                    (base_streams - first_stream).min(FP128_D512_STREAMS_PER_COMMAND as u64);
+                let task_offset = first_stream * FP128_D512_TASKS_PER_STREAM as u64;
+                let mut dispatch_params = params;
+                dispatch_params.task_offset = task_offset;
+                dispatch_params.dispatch_tasks = (stream_count
+                    * FP128_D512_TASKS_PER_STREAM as u64)
+                    .min(params.num_blocks - task_offset);
+                let final_task = task_offset + dispatch_params.dispatch_tasks - 1;
+                let first_block = task_offset / params.num_columns;
+                let final_block = final_task / params.num_columns;
+                let rows_per_block = params.positions_per_block * 2;
+                let first_row = first_block * rows_per_block;
+                let final_row = (final_block + 1) * rows_per_block;
+                let first_row = usize::try_from(first_row)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed first row"))?;
+                let final_row = usize::try_from(final_row)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed final row"))?;
+                let lane_stride = usize::try_from(params.lane_stride)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed lane stride"))?;
+                let command_lanes = source.wait_lanes(first_row..final_row, lane_stride)?;
+                let lane_buffer_start = Instant::now();
+                let lane_buffer = self.packed_lane_buffer(command_lanes)?;
+                buffer_setup += lane_buffer_start.elapsed();
+                input_zero_copy &= lane_buffer.zero_copy;
+                dispatch_params.lane_row_offset = first_row as u64;
+                let command_threadgroups = dispatch_params
+                    .n_a
+                    .checked_mul(dispatch_params.position_partials_per_block)
+                    .and_then(|count| {
+                        count.checked_mul(stream_count * FP128_D512_COEFFICIENT_BANDS as u64)
+                    })
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "packed command threadgroups",
+                    ))?;
+                let command = self.queue.new_command_buffer();
+                command.set_label("Akita packed fp128 D512 root commitment");
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita packed fp128 D512 coefficient bands");
+                encoder.set_compute_pipeline_state(&self.packed_fp128_d512_pipeline);
+                encoder.set_buffer(0, Some(matrix), 0);
+                encoder.set_buffer(1, Some(&lane_buffer.buffer), 0);
+                encoder.set_buffer(2, Some(&partials), 0);
+                set_inline_bytes(encoder, 3, &dispatch_params);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(command_threadgroups, 1, 1),
+                    MTLSize::new(FP128_D512_THREADS as u64, 1, 1),
+                );
+                encoder.end_encoding();
+                command.commit();
+                commands.push(command);
+                lane_buffers.push(lane_buffer);
+            }
 
-            let reduction = command.new_compute_command_encoder();
+            let reduction_command = self.queue.new_command_buffer();
+            reduction_command.set_label("Akita packed fp128 D512 partial reduction");
+            let reduction = reduction_command.new_compute_command_encoder();
             reduction.set_label("Akita packed fp128 D512 partial reduction");
             reduction.set_compute_pipeline_state(&self.packed_partial_reduction_pipeline);
             reduction.set_buffer(0, Some(&partials), 0);
@@ -492,7 +615,16 @@ impl MetalRuntime {
                 MTLSize::new(reduction_width, 1, 1),
             );
             reduction.end_encoding();
-            let (command_wall, gpu) = complete_command(command)?;
+            reduction_command.commit();
+            reduction_command.wait_until_completed();
+            let command_wall = command_start.elapsed();
+            for command in &commands {
+                validate_completed_command(command)?;
+            }
+            validate_completed_command(reduction_command)?;
+            let gpu = commands
+                .first()
+                .and_then(|first| completed_commands_gpu_span(first, reduction_command));
 
             let readback_start = Instant::now();
             // SAFETY: `output` is live shared storage for exactly `output_count`
@@ -514,7 +646,7 @@ impl MetalRuntime {
                 columns_per_threadgroup: 1,
                 matrix_block_streams: matrix_block_streams as usize,
                 scratch_bytes,
-                input_zero_copy: lanes.zero_copy,
+                input_zero_copy,
             })
         })
     }
@@ -645,6 +777,18 @@ fn command_buffer_timestamp(command: &CommandBufferRef, name: &'static str) -> O
 fn completed_command_gpu_time(command: &CommandBufferRef) -> Option<Duration> {
     let start = command_buffer_timestamp(command, "GPUStartTime")?;
     let end = command_buffer_timestamp(command, "GPUEndTime")?;
+    if !start.is_finite() || !end.is_finite() || start <= 0.0 || end < start {
+        return None;
+    }
+    Some(Duration::from_secs_f64(end - start))
+}
+
+fn completed_commands_gpu_span(
+    first: &CommandBufferRef,
+    last: &CommandBufferRef,
+) -> Option<Duration> {
+    let start = command_buffer_timestamp(first, "GPUStartTime")?;
+    let end = command_buffer_timestamp(last, "GPUEndTime")?;
     if !start.is_finite() || !end.is_finite() || start <= 0.0 || end < start {
         return None;
     }

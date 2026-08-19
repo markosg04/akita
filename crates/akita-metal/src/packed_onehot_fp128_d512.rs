@@ -3,13 +3,14 @@ use std::time::Instant;
 
 use akita_field::AkitaError;
 use akita_prover::compute::CommitInnerPlan;
-use akita_prover::{CommitInnerWitness, PackedOneHotView};
+use akita_prover::{CommitInnerWitness, PackedOneHotView, StreamingPackedOneHotView};
 use akita_types::RingVec;
+use metal::Buffer;
 
 use crate::backend::{MetalCommitBackend, MetalCommitMetrics};
 use crate::field::{Fp128Limbs, MetalField, F};
 use crate::prepared::MetalPreparedSetup;
-use crate::runtime::{MetalRuntime, PackedOneHotCommitParams};
+use crate::runtime::{DispatchOutcome, MetalRuntime, PackedOneHotCommitParams};
 use crate::MetalCommitError;
 
 const RING_D: usize = 512;
@@ -28,8 +29,93 @@ pub(crate) struct ValidatedShape {
     live_columns: usize,
 }
 
+pub(crate) trait PackedCommitInput {
+    fn num_rows(&self) -> usize;
+    fn num_columns(&self) -> usize;
+    fn column_capacity(&self) -> usize;
+    fn onehot_k(&self) -> usize;
+    fn lane_count(&self) -> usize;
+    fn hot_entries(&self) -> Result<usize, AkitaError>;
+    fn dispatch(
+        &self,
+        runtime: &MetalRuntime,
+        matrix: &Buffer,
+        params: PackedOneHotCommitParams,
+    ) -> Result<DispatchOutcome, MetalCommitError>;
+}
+
+impl<const D: usize> PackedCommitInput for PackedOneHotView<'_, F, D> {
+    fn num_rows(&self) -> usize {
+        (*self).num_rows()
+    }
+
+    fn num_columns(&self) -> usize {
+        (*self).num_columns()
+    }
+
+    fn column_capacity(&self) -> usize {
+        (*self).column_capacity()
+    }
+
+    fn onehot_k(&self) -> usize {
+        (*self).onehot_k()
+    }
+
+    fn lane_count(&self) -> usize {
+        (*self).lanes().len()
+    }
+
+    fn hot_entries(&self) -> Result<usize, AkitaError> {
+        Ok((*self).hot_entries())
+    }
+
+    fn dispatch(
+        &self,
+        runtime: &MetalRuntime,
+        matrix: &Buffer,
+        params: PackedOneHotCommitParams,
+    ) -> Result<DispatchOutcome, MetalCommitError> {
+        runtime.dispatch_packed_onehot(matrix, (*self).lanes(), params)
+    }
+}
+
+impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
+    fn num_rows(&self) -> usize {
+        StreamingPackedOneHotView::num_rows(self)
+    }
+
+    fn num_columns(&self) -> usize {
+        StreamingPackedOneHotView::num_columns(self)
+    }
+
+    fn column_capacity(&self) -> usize {
+        StreamingPackedOneHotView::column_capacity(self)
+    }
+
+    fn onehot_k(&self) -> usize {
+        StreamingPackedOneHotView::onehot_k(self)
+    }
+
+    fn lane_count(&self) -> usize {
+        StreamingPackedOneHotView::lane_count(self)
+    }
+
+    fn hot_entries(&self) -> Result<usize, AkitaError> {
+        StreamingPackedOneHotView::wait_hot_entries(self)
+    }
+
+    fn dispatch(
+        &self,
+        runtime: &MetalRuntime,
+        matrix: &Buffer,
+        params: PackedOneHotCommitParams,
+    ) -> Result<DispatchOutcome, MetalCommitError> {
+        runtime.dispatch_streaming_packed_onehot(matrix, self, params)
+    }
+}
+
 pub(crate) fn validate_shape<const D: usize>(
-    source: PackedOneHotView<'_, F, D>,
+    source: &impl PackedCommitInput,
     plan: CommitInnerPlan,
 ) -> Result<ValidatedShape, AkitaError> {
     if D != RING_D
@@ -91,7 +177,7 @@ pub(crate) fn commit_validated<const D: usize>(
     backend: &MetalCommitBackend<F>,
     prepared: &MetalPreparedSetup<F>,
     runtime: &MetalRuntime,
-    source: PackedOneHotView<'_, F, D>,
+    source: &impl PackedCommitInput,
     plan: CommitInnerPlan,
     shape: ValidatedShape,
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
@@ -115,6 +201,9 @@ pub(crate) fn commit_validated<const D: usize>(
         full_blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 full blocks")?,
         boundary_columns: 0,
         num_blocks: to_u64(work_units, "fp128 D512 work units")?,
+        task_offset: 0,
+        dispatch_tasks: to_u64(work_units, "fp128 D512 dispatch work units")?,
+        lane_row_offset: 0,
         output_coefficients: to_u64(shape.output_coefficients, "fp128 D512 output")?,
         columns_per_threadgroup: 1,
         position_partials_per_block: POSITION_PARTIALS as u64,
@@ -124,8 +213,8 @@ pub(crate) fn commit_validated<const D: usize>(
         )?,
         log_ring_d: 9,
     };
-    let outcome = runtime
-        .dispatch_packed_onehot(matrix.buffer.as_ref(), source.lanes(), params)
+    let outcome = source
+        .dispatch(runtime, matrix.buffer.as_ref(), params)
         .map_err(MetalCommitError::into_akita)?;
     let output_reconstruction_start = Instant::now();
     let coefficients = outcome
@@ -140,8 +229,8 @@ pub(crate) fn commit_validated<const D: usize>(
     };
     let output_reconstruction_time = output_reconstruction_start.elapsed();
 
-    let field_additions = source
-        .hot_entries()
+    let hot_entries = source.hot_entries()?;
+    let field_additions = hot_entries
         .checked_mul(INNER_RANK)
         .and_then(|count| count.checked_mul(D))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 additions").into_akita())?;
@@ -161,13 +250,11 @@ pub(crate) fn commit_validated<const D: usize>(
             MetalCommitError::ShapeOverflow("fp128 D512 modeled matrix bytes").into_akita()
         })?;
     let task_row_probes = source
-        .lanes()
-        .len()
+        .lane_count()
         .checked_mul(INNER_RANK)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 probes").into_akita())?;
-    let selected_lane_broadcasts = source
-        .hot_entries()
+    let selected_lane_broadcasts = hot_entries
         .checked_mul(INNER_RANK)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 broadcasts").into_akita())?;
@@ -187,7 +274,7 @@ pub(crate) fn commit_validated<const D: usize>(
             cpu_rank_rows: 0,
             metal_rank_rows: INNER_RANK,
             num_sources: 1,
-            hot_entries: source.hot_entries(),
+            hot_entries,
             lane_scan_ballots: to_u64(task_row_probes / 8, "fp128 D512 ballots")?,
             selected_lane_broadcasts: to_u64(selected_lane_broadcasts, "fp128 D512 broadcasts")?,
             field_additions: to_u64(field_additions, "fp128 D512 additions")?,
@@ -201,7 +288,7 @@ pub(crate) fn commit_validated<const D: usize>(
                 "fp128 D512 modeled matrix bytes",
             )?,
             modeled_lane_read_bytes: to_u64(task_row_probes, "fp128 D512 modeled lane bytes")?,
-            index_bytes: source.lanes().len(),
+            index_bytes: source.lane_count(),
             input_zero_copy: outcome.input_zero_copy,
             output_bytes: shape.output_coefficients * size_of::<Fp128Limbs>(),
             scratch_bytes: outcome.scratch_bytes,
@@ -237,7 +324,7 @@ mod tests {
     use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
     use akita_prover::{
         AkitaProverSetup, ComputeBackendSetup, CpuBackend, PackedOneHotPoly, RootCommitSource,
-        RootPolyMeta,
+        RootPolyMeta, StreamingPackedOneHotPoly,
     };
     use akita_types::SetupMatrixCapacity;
 
@@ -353,5 +440,83 @@ mod tests {
             assert_eq!(metrics.cpu_work_units, 0);
             assert_eq!(metrics.metal_work_units, columns * 32);
         }
+    }
+
+    #[test]
+    fn streaming_fp128_d512_panels_match_resident_input() {
+        const ROWS: usize = 1_024;
+        const COLUMNS: usize = 29;
+        const CAPACITY: usize = 32;
+        const POSITIONS_PER_BLOCK: usize = 16;
+        let lane = |row: usize, column: usize| {
+            if (row + column).is_multiple_of(5) {
+                0
+            } else {
+                ((row * 73 + column * 19) % 255 + 1) as u8
+            }
+        };
+        let resident = PackedOneHotPoly::<F>::new(
+            super::ONEHOT_K,
+            CAPACITY,
+            COLUMNS,
+            (0..ROWS)
+                .flat_map(|row| (0..COLUMNS).map(move |column| lane(row, column)))
+                .collect(),
+        )
+        .unwrap();
+        let (stream, mut writer) =
+            StreamingPackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, COLUMNS, ROWS).unwrap();
+        let plan = CommitInnerPlan {
+            n_a: 1,
+            num_positions_per_block: POSITIONS_PER_BLOCK,
+            num_digits_inner: 1,
+            log_basis_inner: 3,
+        };
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            23,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: POSITIONS_PER_BLOCK * super::RING_D,
+            },
+        )
+        .unwrap();
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let prepared = metal.prepare_setup(&setup).unwrap();
+        let resident_output = metal
+            .commit_inner_group(
+                &prepared,
+                vec![RootCommitSource::<F, 512>::commit_view(&resident).unwrap()],
+                plan,
+            )
+            .unwrap();
+        let streaming_output = std::thread::scope(|scope| {
+            let producer = scope.spawn(move || {
+                for _ in 0..8 {
+                    writer
+                        .fill_next_rows(ROWS / 8, |row, lanes| {
+                            for (column, output) in lanes.iter_mut().enumerate() {
+                                *output = lane(row, column);
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                writer.finish().unwrap();
+            });
+            let output = metal
+                .commit_inner_group(
+                    &prepared,
+                    vec![RootCommitSource::<F, 512>::commit_view(&stream).unwrap()],
+                    plan,
+                )
+                .unwrap();
+            producer.join().unwrap();
+            output
+        });
+        assert_eq!(
+            resident_output[0].inner_rows,
+            streaming_output[0].inner_rows
+        );
+        assert_eq!(stream.finalize().unwrap().lanes(), resident.lanes());
     }
 }

@@ -22,7 +22,10 @@ pub use multilinear_polynomial::{
     MultilinearPolynomial, MultilinearPolynomialBatchView, MultilinearPolynomialView,
 };
 pub use onehot::{OneHotBatchView, OneHotIndex, OneHotPoly, OneHotView};
-pub use packed_onehot::{PackedOneHotPoly, PackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT};
+pub use packed_onehot::{
+    PackedOneHotPoly, PackedOneHotStreamWriter, PackedOneHotView, StreamingPackedOneHotPoly,
+    StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
+};
 pub use recursive::{
     RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView, SuffixWitnessView,
 };

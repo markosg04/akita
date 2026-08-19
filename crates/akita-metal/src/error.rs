@@ -42,6 +42,9 @@ pub enum MetalCommitError {
     /// The operation is outside the first backend's support envelope.
     #[error("unsupported Metal commitment shape: {0}")]
     UnsupportedShape(String),
+    /// A concurrently generated packed source failed before its rows were ready.
+    #[error("packed Metal input stream failed: {0}")]
+    InputStream(String),
     /// A backend mutex was poisoned.
     #[error("Metal commitment state lock was poisoned")]
     PoisonedLock,
