@@ -4,11 +4,15 @@ use std::time::{Duration, Instant};
 
 use akita_algebra::CyclotomicRing;
 use akita_field::{AkitaError, ExtField, FromPrimitiveInt, MulBaseUnreduced};
+use akita_prover::backend::RootTensorProjectionView;
 use akita_prover::compute::{
-    CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
-    CyclicRowsComputeBackend, DigitRowsComputeBackend, TensorPackedWitness, TensorProjectionKernel,
+    CommitInnerPlan, CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
+    CyclicRowsComputeBackend, DigitRowsComputeBackend, RootCommitKernel, TensorPackedWitness,
+    TensorProjectionKernel,
 };
-use akita_prover::{CpuBackend, CpuPreparedSetup, NttCacheOwnerId, RootTensorProjectionPoly};
+use akita_prover::{
+    CommitInnerWitness, CpuBackend, CpuPreparedSetup, NttCacheOwnerId, RootTensorProjectionPoly,
+};
 use akita_types::{AkitaExpandedSetup, FpExtEncoding, NttCacheKey};
 use metal::Device;
 
@@ -377,6 +381,24 @@ where
     ) -> Result<Vec<CyclotomicRing<Field, D>>, AkitaError> {
         self.cpu_backend()
             .cyclic_digit_rows(&prepared.cpu, row_len, digits, log_basis)
+    }
+}
+
+impl<Field: MetalField, const D: usize>
+    RootCommitKernel<RootTensorProjectionView<'_, Field, D>, Field, D>
+    for MetalCommitBackend<Field>
+where
+    CpuBackend: ComputeBackendSetup<Field, PreparedSetup = CpuPreparedSetup<Field>>,
+    for<'a> CpuBackend: RootCommitKernel<RootTensorProjectionView<'a, Field, D>, Field, D>,
+{
+    fn commit_inner_group(
+        &self,
+        prepared: &Self::PreparedSetup,
+        sources: Vec<RootTensorProjectionView<'_, Field, D>>,
+        plan: CommitInnerPlan,
+    ) -> Result<Vec<CommitInnerWitness<Field>>, AkitaError> {
+        self.cpu_backend()
+            .commit_inner_group(&prepared.cpu, sources, plan)
     }
 }
 

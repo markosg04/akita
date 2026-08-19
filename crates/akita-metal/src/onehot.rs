@@ -405,8 +405,8 @@ mod tests {
         first[0] = Some(0);
         first[1] = Some((D - 1).min(onehot_k - 1) as u16);
         let polys = [
-            OneHotPoly::<F, u16>::new(onehot_k, first).unwrap(),
-            OneHotPoly::<F, u16>::new(onehot_k, make_indices(5)).unwrap(),
+            OneHotPoly::<F, u16>::new(onehot_k, D, first).unwrap(),
+            OneHotPoly::<F, u16>::new(onehot_k, D, make_indices(5)).unwrap(),
         ];
         let matrix_fields = plan.n_a * plan.num_positions_per_block * plan.num_digits_inner * D;
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
@@ -533,7 +533,7 @@ mod tests {
         let indices = (0..chunks)
             .map(|chunk| Some((chunk.wrapping_mul(37) % 256) as u8))
             .collect();
-        let polys = [OneHotPoly::<F, u8>::new(256, indices).unwrap()];
+        let polys = [OneHotPoly::<F, u8>::new(256, Cfg::D, indices).unwrap()];
         let mut matrix_fields = 0;
         accumulate_matrix_field_elements_for_level(&params, &mut matrix_fields).unwrap();
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
