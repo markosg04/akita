@@ -255,7 +255,7 @@ mod tests {
                 for simdgroup in 0..super::TASKS_PER_STREAM {
                     let task = stream * super::TASKS_PER_STREAM + simdgroup;
                     if task < tasks {
-                        assert!(task_map.insert((task % blocks, task / blocks)));
+                        assert!(task_map.insert((task / columns, task % columns)));
                     }
                 }
             }

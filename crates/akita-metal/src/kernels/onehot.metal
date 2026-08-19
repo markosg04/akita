@@ -397,8 +397,8 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     uint output_coefficients = (uint)params.output_coefficients;
     uint global_task = stream * tasks_per_stream + simdgroup;
     bool simdgroup_active = global_task < num_tasks;
-    uint task_column = global_task / blocks_per_column;
-    uint task_block = global_task % blocks_per_column;
+    uint task_block = global_task / live_columns;
+    uint task_column = global_task % live_columns;
     ulong matrix_cursor =
         ((ulong)a_row * params.positions_per_block + (ulong)partial_start) * 512ul;
 
