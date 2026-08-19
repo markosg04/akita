@@ -250,7 +250,55 @@ mod implementation {
         );
     }
 
-    fn run_workload(workload: Workload, samples: usize) {
+    fn report_metal_only(
+        workload: Workload,
+        backend_setup_time: Duration,
+        matrix_prepare_time: Duration,
+        metal_times: &[Duration],
+        poly: &PackedOneHotPoly<F>,
+        metal: &MetalCommitBackend,
+    ) {
+        let metal_mean = mean(metal_times);
+        let metrics = metal.last_commit_metrics().unwrap().unwrap();
+        let gpu_ms = metrics
+            .gpu_time
+            .map(milliseconds)
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "unavailable".into());
+        println!(
+            "AKITA_F128_METAL_RESULT workload={} samples={} backend_setup_ms={:.6} matrix_prepare_ms={:.6} metal_mean_ms={:.6} gpu_ms={} inner_total_ms={:.6} digit_rows_ms={:.6} compression_ms={:.6} matrix_bytes={} matrix_read_bytes={} lane_bytes={} lane_read_bytes={} output_bytes={} scratch_bytes={} hot_entries={} input_zero_copy={} matrix_cache_hit={} cpu_work_units={} metal_work_units={}",
+            workload.name,
+            metal_times.len(),
+            milliseconds(backend_setup_time),
+            milliseconds(matrix_prepare_time),
+            milliseconds(metal_mean),
+            gpu_ms,
+            milliseconds(metrics.total_time),
+            milliseconds(metrics.digit_rows_time),
+            milliseconds(metrics.compression_time),
+            metrics.matrix_bytes,
+            metrics.modeled_matrix_read_bytes,
+            poly.lanes().len(),
+            metrics.modeled_lane_read_bytes,
+            metrics.output_bytes,
+            metrics.scratch_bytes,
+            metrics.hot_entries,
+            metrics.input_zero_copy,
+            metrics.matrix_cache_hit,
+            metrics.cpu_work_units,
+            metrics.metal_work_units,
+        );
+        println!(
+            "AKITA_F128_METAL_RAW workload={} metal_ns={:?}",
+            workload.name,
+            metal_times
+                .iter()
+                .map(Duration::as_nanos)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    fn run_workload(workload: Workload, samples: usize, metal_only: bool) {
         let poly = make_poly(workload);
         let params = full_commit_params(workload);
         let backend_setup_start = Instant::now();
@@ -264,6 +312,48 @@ mod implementation {
             },
         )
         .unwrap();
+        if metal_only {
+            assert!(samples > 0, "metal-only mode needs at least one sample");
+            let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+            let metal_prepared = metal.prepare_setup(&setup).unwrap();
+            let metal_stack =
+                UniformProverStack::uniform(&metal, &metal_prepared, setup.expanded.as_ref())
+                    .unwrap();
+            let backend_setup_time = backend_setup_start.elapsed();
+            let polys = [poly];
+            let context = GroupContext::explicit_without_precommitted_groups(&params);
+            let metal_commit = || {
+                akita_prover::commit::<Cfg, PackedOneHotPoly<F>, MetalCommitBackend>(
+                    &polys,
+                    setup.expanded.as_ref(),
+                    &metal_stack,
+                    context,
+                )
+                .unwrap()
+            };
+            let warm = metal_commit();
+            let first_metrics = metal.last_commit_metrics().unwrap().unwrap();
+            assert!(!first_metrics.matrix_cache_hit);
+            let matrix_prepare_time = first_metrics.matrix_prepare_time;
+            let mut metal_times = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let start = Instant::now();
+                let result = black_box(metal_commit());
+                metal_times.push(start.elapsed());
+                assert_eq!(warm.committed_group, result.committed_group);
+                assert_eq!(warm.hint, result.hint);
+            }
+            validate_dispatch(workload, &polys[0], &metal);
+            report_metal_only(
+                workload,
+                backend_setup_time,
+                matrix_prepare_time,
+                &metal_times,
+                &polys[0],
+                &metal,
+            );
+            return;
+        }
         let cpu = CpuBackend::DEFAULT;
         let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
         let cpu_stack =
@@ -358,7 +448,12 @@ mod implementation {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(15);
-        run_workload(workload, samples);
+        let mode = std::env::var("AKITA_PACKED_MODE").unwrap_or_else(|_| "paired".into());
+        match mode.as_str() {
+            "paired" => run_workload(workload, samples, false),
+            "metal-only" => run_workload(workload, samples, true),
+            _ => panic!("unknown AKITA_PACKED_MODE {mode}"),
+        }
     }
 }
 
