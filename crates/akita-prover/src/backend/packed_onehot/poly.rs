@@ -273,6 +273,39 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
         })
     }
 
+    /// Construct directly in aligned storage from a row-major fill function.
+    pub fn from_row_fn<G>(
+        onehot_k: usize,
+        column_capacity: usize,
+        num_columns: usize,
+        num_rows: usize,
+        fill_row: G,
+    ) -> Result<Self, AkitaError>
+    where
+        G: Fn(usize, &mut [u8]) + Sync,
+    {
+        let lane_count = num_rows
+            .checked_mul(num_columns)
+            .ok_or_else(|| AkitaError::InvalidInput("packed one-hot lane count overflow".into()))?;
+        let (validated_rows, total_field_elems) =
+            validate_geometry_shape(onehot_k, column_capacity, num_columns, lane_count)?;
+        let mut lanes = AlignedBytes::zeroed(lane_count)?;
+        cfg_chunks_mut!(lanes.as_mut_slice(), num_columns)
+            .enumerate()
+            .for_each(|(row, lanes)| fill_row(row, lanes));
+        let hot_entries = validate_lanes(onehot_k, &lanes)?;
+        Ok(Self {
+            lanes: Arc::new(lanes),
+            num_rows: validated_rows,
+            num_columns,
+            column_capacity,
+            onehot_k,
+            hot_entries,
+            num_vars: total_field_elems.trailing_zeros() as usize,
+            marker: PhantomData,
+        })
+    }
+
     #[must_use]
     pub fn lanes(&self) -> &[u8] {
         &self.lanes

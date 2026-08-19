@@ -18,7 +18,7 @@ fn assert_commit_parity<const D: usize>(
     lanes: Vec<u8>,
 ) {
     let packed = PackedOneHotPoly::<F>::new(onehot_k, capacity, columns, lanes.clone()).unwrap();
-    let indices = (0..capacity)
+    let indices: Vec<Option<u8>> = (0..capacity)
         .flat_map(|column| {
             let lanes = &lanes;
             (0..rows).map(move |row| {
@@ -31,7 +31,7 @@ fn assert_commit_parity<const D: usize>(
             })
         })
         .collect();
-    let generic = OneHotPoly::<F, u8>::new(onehot_k, indices).unwrap();
+    let generic = OneHotPoly::<F, u8>::new(onehot_k, D, indices).unwrap();
     let plan = CommitInnerPlan {
         n_a: 3,
         num_positions_per_block: positions_per_block,
@@ -104,6 +104,24 @@ fn generated_storage_matches_vec_constructor() {
     };
     let expected = PackedOneHotPoly::<F>::new(16, 4, 3, (0..24).map(lane).collect()).unwrap();
     let generated = PackedOneHotPoly::<F>::from_lane_fn(16, 4, 3, 8, lane).unwrap();
+    assert_eq!(generated.lanes(), expected.lanes());
+    assert_eq!(generated.hot_entries(), expected.hot_entries());
+    assert_eq!(
+        generated.lanes().as_ptr().addr() % PACKED_ONEHOT_BUFFER_ALIGNMENT,
+        0
+    );
+}
+
+#[test]
+fn row_generated_storage_matches_vec_constructor() {
+    let lanes = (0..24)
+        .map(|index| ((index * 5 + 3) % 16) as u8)
+        .collect::<Vec<_>>();
+    let expected = PackedOneHotPoly::<F>::new(16, 4, 3, lanes.clone()).unwrap();
+    let generated = PackedOneHotPoly::<F>::from_row_fn(16, 4, 3, 8, |row, output| {
+        output.copy_from_slice(&lanes[row * 3..row * 3 + 3]);
+    })
+    .unwrap();
     assert_eq!(generated.lanes(), expected.lanes());
     assert_eq!(generated.hot_entries(), expected.hot_entries());
     assert_eq!(
