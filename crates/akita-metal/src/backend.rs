@@ -114,6 +114,17 @@ pub struct MetalCommitMetrics {
     pub compression_time: Duration,
 }
 
+/// Residency result for an explicit packed fp128 D512 matrix prewarm.
+#[derive(Clone, Copy, Debug)]
+pub struct MetalMatrixPrewarmMetrics {
+    /// Exact resident matrix bytes.
+    pub matrix_bytes: usize,
+    /// Whether the requested prefix was already resident.
+    pub cache_hit: bool,
+    /// Packing and allocation time on a miss.
+    pub prepare_time: Duration,
+}
+
 struct BackendInner {
     runtime: Option<Arc<MetalRuntime>>,
     policy: MetalExecutionPolicy,
@@ -254,6 +265,25 @@ impl<Field> MetalCommitBackend<Field> {
             update(metrics);
         }
         Ok(())
+    }
+}
+
+impl MetalCommitBackend<F> {
+    /// Make the rank-one D512 A prefix resident before a packed trace commit.
+    pub fn prewarm_packed_fp128_d512_matrix(
+        &self,
+        prepared: &MetalPreparedSetup<F>,
+        active_a_cols: usize,
+    ) -> Result<MetalMatrixPrewarmMetrics, AkitaError> {
+        let runtime = self
+            .runtime()
+            .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
+        let matrix = prepared.matrix(runtime, 512, 1, active_a_cols)?;
+        Ok(MetalMatrixPrewarmMetrics {
+            matrix_bytes: matrix.bytes,
+            cache_hit: matrix.cache_hit,
+            prepare_time: matrix.prepare_time,
+        })
     }
 }
 

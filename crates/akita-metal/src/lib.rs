@@ -32,7 +32,7 @@ mod prepared;
 mod runtime;
 
 #[cfg(target_os = "macos")]
-pub use backend::{MetalCommitBackend, MetalCommitMetrics};
+pub use backend::{MetalCommitBackend, MetalCommitMetrics, MetalMatrixPrewarmMetrics};
 #[cfg(target_os = "macos")]
 pub use prepared::MetalPreparedSetup;
 #[cfg(target_os = "macos")]
