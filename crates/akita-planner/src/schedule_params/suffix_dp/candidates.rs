@@ -146,7 +146,8 @@ fn opening_work_domain(
         if root_level_key.is_some()
             && ctx
                 .root_candidate_constraint
-                .is_some_and(|constraint| !constraint.dimensions.contains(&dimensions))
+                .and_then(|constraint| constraint.dimensions)
+                .is_some_and(|allowed| !allowed.contains(&dimensions))
         {
             continue;
         }

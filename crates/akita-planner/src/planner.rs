@@ -10,8 +10,8 @@ use akita_types::sis::{
 };
 use akita_types::{
     AkitaScheduleLookupKey, CommitmentRingDims, CommittedGroupParams, CommittedGroupProfile,
-    DecompositionParams, OpeningClaimsLayout, PlannedFoldSchedule, PolynomialGroupLayout,
-    PrecommittedGroupAdmissionPolicy, PrecommittedLevelParams,
+    DecompositionParams, OpeningClaimsLayout, OpeningMethod, PlannedFoldSchedule,
+    PolynomialGroupLayout, PrecommittedGroupAdmissionPolicy, PrecommittedLevelParams,
 };
 
 use akita_schedules::planner_support::projected_collision_role_price;
@@ -512,25 +512,31 @@ pub fn find_schedule(
 }
 
 /// Optional restrictions applied only to root-level candidates.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RootCandidateConstraint<'a> {
-    /// Admitted `(A, B, D)` ring-dimension triples.
-    pub dimensions: &'a [CommitmentRingDims],
+    /// Admitted `(A, B, D)` ring-dimension triples, or any triple when absent.
+    pub dimensions: Option<&'a [CommitmentRingDims]>,
     /// Exact source positions per block, or any value when absent.
     pub num_positions_per_block: Option<usize>,
     /// Exact inner commitment output rank, or any value when absent.
     pub inner_output_rank: Option<usize>,
+    /// Exact root opening method, or any method when absent.
+    pub opening_method: Option<OpeningMethod>,
 }
 
 impl RootCandidateConstraint<'_> {
     pub(crate) fn admits(&self, params: &CommittedGroupParams) -> bool {
-        self.dimensions.contains(&params.role_dims())
+        self.dimensions
+            .is_none_or(|dimensions| dimensions.contains(&params.role_dims()))
             && self
                 .num_positions_per_block
                 .is_none_or(|positions| positions == params.num_positions_per_block)
             && self
                 .inner_output_rank
                 .is_none_or(|rank| rank == params.inner_commit_matrix.output_rank())
+            && self
+                .opening_method
+                .is_none_or(|method| method == params.opening_method)
     }
 }
 
@@ -545,7 +551,10 @@ pub fn find_schedule_with_root_constraint(
     root_constraint: RootCandidateConstraint<'_>,
     ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
 ) -> Result<PlannedFoldSchedule, AkitaError> {
-    if root_constraint.dimensions.is_empty() {
+    if root_constraint
+        .dimensions
+        .is_some_and(<[CommitmentRingDims]>::is_empty)
+    {
         return Err(AkitaError::InvalidSetup(
             "root dimension filter must not be empty".into(),
         ));
