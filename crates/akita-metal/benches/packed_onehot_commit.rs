@@ -120,6 +120,15 @@ mod implementation {
         duration.as_secs_f64() * 1e3
     }
 
+    fn hybrid_cpu_tail_blocks(populated_blocks: usize) -> usize {
+        let target = populated_blocks / 12;
+        if target == 0 {
+            0
+        } else {
+            1usize << target.ilog2()
+        }
+    }
+
     fn paired_bootstrap_ratio_lcb(cpu: &[Duration], metal: &[Duration]) -> f64 {
         assert_eq!(cpu.len(), metal.len());
         let mut rng = SplitMix64(0xbb67_ae85_84ca_a73b);
@@ -146,30 +155,32 @@ mod implementation {
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
         let blocks_per_column =
             (1usize << workload.log_t) * ONEHOT_K / RING_D / POSITIONS_PER_BLOCK;
-        let work_units = workload.columns * blocks_per_column;
+        let cpu_blocks = hybrid_cpu_tail_blocks(blocks_per_column);
+        let metal_blocks = blocks_per_column - cpu_blocks;
+        let cpu_work_units = workload.columns * cpu_blocks;
+        let metal_work_units = workload.columns * metal_blocks;
         let output_coefficients = COLUMN_CAPACITY * blocks_per_column * INNER_RANK * RING_D;
         let output_bytes = output_coefficients * size_of::<F>();
         let scratch_bytes = output_bytes * POSITION_PARTIALS;
         let matrix_bytes = INNER_RANK * POSITIONS_PER_BLOCK * RING_D * size_of::<F>();
-        let matrix_streams = work_units.div_ceil(32) * 2;
+        let matrix_streams = metal_work_units.div_ceil(32) * 2;
         let hot_entries = poly.lanes().iter().filter(|&&lane| lane != 0).count();
 
         assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
         assert!(metrics.input_zero_copy);
         assert!(metrics.matrix_cache_hit);
-        assert_eq!(metrics.cpu_blocks, 0);
-        assert_eq!(metrics.cpu_columns, 0);
-        assert_eq!(metrics.cpu_work_units, 0);
-        assert_eq!(metrics.cpu_rank_rows, 0);
-        assert_eq!(metrics.cpu_time, Duration::ZERO);
-        assert_eq!(metrics.merge_time, Duration::ZERO);
+        assert_eq!(metrics.cpu_blocks, cpu_blocks);
+        assert_eq!(metrics.cpu_columns, workload.columns);
+        assert_eq!(metrics.cpu_work_units, cpu_work_units);
+        assert_eq!(metrics.cpu_rank_rows, INNER_RANK);
+        assert_ne!(metrics.cpu_time, Duration::ZERO);
         assert_eq!(metrics.blocks_per_threadgroup, 32);
         assert_eq!(metrics.columns_per_threadgroup, 1);
-        assert_eq!(metrics.metal_blocks, blocks_per_column);
-        assert_eq!(metrics.metal_full_blocks, blocks_per_column);
+        assert_eq!(metrics.metal_blocks, metal_blocks);
+        assert_eq!(metrics.metal_full_blocks, metal_blocks);
         assert_eq!(metrics.metal_boundary_columns, 0);
         assert_eq!(metrics.metal_columns, workload.columns);
-        assert_eq!(metrics.metal_work_units, work_units);
+        assert_eq!(metrics.metal_work_units, metal_work_units);
         assert_eq!(metrics.metal_rank_rows, INNER_RANK);
         assert_eq!(metrics.matrix_bytes, matrix_bytes);
         assert_eq!(
@@ -178,7 +189,7 @@ mod implementation {
         );
         assert_eq!(
             metrics.modeled_lane_read_bytes,
-            (poly.lanes().len() * 2) as u64
+            (metal_work_units * POSITIONS_PER_BLOCK * 4) as u64
         );
         assert_eq!(metrics.index_bytes, poly.lanes().len());
         assert_eq!(metrics.output_bytes, output_bytes);
@@ -187,7 +198,7 @@ mod implementation {
         assert_eq!(metrics.field_additions, (hot_entries * RING_D) as u64);
         assert_eq!(
             metrics.reduction_field_additions,
-            (work_units * RING_D * (POSITION_PARTIALS - 1)) as u64
+            (metal_work_units * RING_D * (POSITION_PARTIALS - 1)) as u64
         );
         assert_ne!(metrics.digit_rows_calls, 0);
         assert_eq!(metrics.digit_rows_metal_calls, metrics.digit_rows_calls);
@@ -299,23 +310,39 @@ mod implementation {
             .unwrap()
         };
 
+        let cpu_warm_start = Instant::now();
         let cpu_warm = cpu_commit();
+        let cpu_warm_time = cpu_warm_start.elapsed();
         let metal_warm = metal_commit();
         let first_metal_metrics = metal.last_commit_metrics().unwrap().unwrap();
         assert!(!first_metal_metrics.matrix_cache_hit);
         let matrix_prepare_time = first_metal_metrics.matrix_prepare_time;
         assert_eq!(cpu_warm.committed_group, metal_warm.committed_group);
         assert_eq!(cpu_warm.hint, metal_warm.hint);
+        let second_metal_start = Instant::now();
         let second_metal = metal_commit();
+        let second_metal_time = second_metal_start.elapsed();
         assert_eq!(cpu_warm.committed_group, second_metal.committed_group);
         assert_eq!(cpu_warm.hint, second_metal.hint);
         validate_dispatch(workload, &polys[0], &metal);
         if samples == 0 {
+            let metrics = metal.last_commit_metrics().unwrap().unwrap();
             println!(
-                "AKITA_F128_COMMIT_PARITY workload={} backend_setup_ms={:.6} matrix_prepare_ms={:.6}",
+                "AKITA_F128_COMMIT_PARITY workload={} backend_setup_ms={:.6} matrix_prepare_ms={:.6} cpu_ms={:.6} metal_ms={:.6} ratio={:.6} inner_ms={:.6} cpu_leg_ms={:.6} command_ms={:.6} gpu_ms={}",
                 workload.name,
                 milliseconds(backend_setup_time),
                 milliseconds(matrix_prepare_time),
+                milliseconds(cpu_warm_time),
+                milliseconds(second_metal_time),
+                cpu_warm_time.as_secs_f64() / second_metal_time.as_secs_f64(),
+                milliseconds(metrics.total_time),
+                milliseconds(metrics.cpu_time),
+                milliseconds(metrics.command_wall_time),
+                metrics
+                    .gpu_time
+                    .map(milliseconds)
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_else(|| "unavailable".into()),
             );
             return;
         }

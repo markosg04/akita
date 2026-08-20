@@ -1,9 +1,12 @@
 use std::mem::size_of;
+use std::ops::Range;
 use std::time::Instant;
 
 use akita_field::AkitaError;
-use akita_prover::compute::CommitInnerPlan;
-use akita_prover::{CommitInnerWitness, PackedOneHotView, StreamingPackedOneHotView};
+use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
+use akita_prover::{
+    CommitInnerWitness, CpuBackend, CpuPreparedSetup, PackedOneHotView, StreamingPackedOneHotView,
+};
 use akita_types::RingVec;
 use metal::Buffer;
 
@@ -20,6 +23,7 @@ const ONEHOT_K: usize = 256;
 const COLUMN_CAPACITY: usize = 32;
 const POSITION_PARTIALS: usize = FP128_D512_POSITION_PARTIALS;
 const INNER_RANK: usize = 1;
+const HYBRID_CPU_RATE_DIVISOR: usize = 12;
 #[cfg(test)]
 const TASKS_PER_STREAM: usize = 32;
 
@@ -32,7 +36,7 @@ pub(crate) struct ValidatedShape {
     live_columns: usize,
 }
 
-pub(crate) trait PackedCommitInput {
+pub(crate) trait PackedCommitInput: Sync {
     fn num_rows(&self) -> usize;
     fn populated_rows(&self) -> usize;
     fn num_columns(&self) -> usize;
@@ -40,6 +44,7 @@ pub(crate) trait PackedCommitInput {
     fn onehot_k(&self) -> usize;
     fn lane_count(&self) -> usize;
     fn hot_entries(&self) -> Result<usize, AkitaError>;
+    fn wait_lanes(&self, rows: Range<usize>) -> Result<&[u8], AkitaError>;
     fn dispatch(
         &self,
         runtime: &MetalRuntime,
@@ -75,6 +80,20 @@ impl<const D: usize> PackedCommitInput for PackedOneHotView<'_, F, D> {
 
     fn hot_entries(&self) -> Result<usize, AkitaError> {
         Ok((*self).hot_entries())
+    }
+
+    fn wait_lanes(&self, rows: Range<usize>) -> Result<&[u8], AkitaError> {
+        let first = rows
+            .start
+            .checked_mul(self.num_columns())
+            .ok_or_else(|| AkitaError::InvalidInput("packed first lane overflow".into()))?;
+        let end = rows
+            .end
+            .checked_mul(self.num_columns())
+            .ok_or_else(|| AkitaError::InvalidInput("packed final lane overflow".into()))?;
+        self.lanes().get(first..end).ok_or_else(|| {
+            AkitaError::InvalidInput("packed lane range exceeds the commit source".into())
+        })
     }
 
     fn dispatch(
@@ -116,6 +135,10 @@ impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
         StreamingPackedOneHotView::wait_hot_entries(self)
     }
 
+    fn wait_lanes(&self, rows: Range<usize>) -> Result<&[u8], AkitaError> {
+        StreamingPackedOneHotView::wait_lanes(self, rows)
+    }
+
     fn dispatch(
         &self,
         runtime: &MetalRuntime,
@@ -124,6 +147,62 @@ impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
     ) -> Result<DispatchOutcome, MetalCommitError> {
         runtime.dispatch_streaming_packed_onehot(matrix, self, params)
     }
+}
+
+fn hybrid_cpu_tail_blocks(populated_blocks: usize) -> usize {
+    let target = populated_blocks / HYBRID_CPU_RATE_DIVISOR;
+    if target == 0 {
+        0
+    } else {
+        1usize << target.ilog2()
+    }
+}
+
+struct CpuTailCommit {
+    witness: CommitInnerWitness<F>,
+    hot_entries: usize,
+    elapsed: std::time::Duration,
+}
+
+fn commit_cpu_tail<const D: usize>(
+    backend: CpuBackend,
+    prepared: &CpuPreparedSetup<F>,
+    source: &impl PackedCommitInput,
+    plan: CommitInnerPlan,
+    first_block: usize,
+    block_count: usize,
+) -> Result<CpuTailCommit, AkitaError> {
+    let start = Instant::now();
+    let rows_per_block = plan
+        .num_positions_per_block
+        .checked_mul(2)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 rows per block").into_akita())?;
+    let first_row = first_block
+        .checked_mul(rows_per_block)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid CPU first row").into_akita())?;
+    let final_row = first_block
+        .checked_add(block_count)
+        .and_then(|block| block.checked_mul(rows_per_block))
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid CPU final row").into_akita())?;
+    let lanes = source.wait_lanes(first_row..final_row)?;
+    let view = PackedOneHotView::<F, D>::new(
+        source.onehot_k(),
+        source.column_capacity(),
+        source.num_columns(),
+        lanes,
+    )?;
+    let hot_entries = view.hot_entries();
+    let mut witnesses = backend.commit_inner_group(prepared, vec![view], plan)?;
+    if witnesses.len() != 1 {
+        return Err(AkitaError::InvalidSetup(
+            "hybrid CPU root commit returned an invalid witness count".into(),
+        ));
+    }
+    Ok(CpuTailCommit {
+        witness: witnesses.remove(0),
+        hot_entries,
+        elapsed: start.elapsed(),
+    })
 }
 
 pub(crate) fn validate_shape<const D: usize>(
@@ -199,10 +278,19 @@ pub(crate) fn commit_validated<const D: usize>(
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
     let total_start = Instant::now();
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
-    let work_units = shape
+    let cpu_blocks = hybrid_cpu_tail_blocks(shape.populated_blocks_per_column);
+    let metal_blocks = shape
+        .populated_blocks_per_column
+        .checked_sub(cpu_blocks)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid Metal blocks").into_akita())?;
+    let metal_work_units = shape
         .live_columns
-        .checked_mul(shape.populated_blocks_per_column)
+        .checked_mul(metal_blocks)
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 work units").into_akita())?;
+    let cpu_work_units = shape
+        .live_columns
+        .checked_mul(cpu_blocks)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid CPU work units").into_akita())?;
     let params = PackedOneHotCommitParams {
         num_rows: to_u64(source.num_rows(), "fp128 D512 row count")?,
         num_columns: to_u64(shape.live_columns, "fp128 D512 column count")?,
@@ -214,14 +302,11 @@ pub(crate) fn commit_validated<const D: usize>(
         positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
         num_digits_inner: 1,
         blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 block count")?,
-        full_blocks_per_column: to_u64(
-            shape.populated_blocks_per_column,
-            "fp128 D512 populated blocks",
-        )?,
+        full_blocks_per_column: to_u64(metal_blocks, "fp128 D512 Metal blocks")?,
         boundary_columns: 0,
-        num_blocks: to_u64(work_units, "fp128 D512 work units")?,
+        num_blocks: to_u64(metal_work_units, "fp128 D512 work units")?,
         task_offset: 0,
-        dispatch_tasks: to_u64(work_units, "fp128 D512 dispatch work units")?,
+        dispatch_tasks: to_u64(metal_work_units, "fp128 D512 dispatch work units")?,
         lane_row_offset: 0,
         output_coefficients: to_u64(shape.output_coefficients, "fp128 D512 output")?,
         columns_per_threadgroup: 1,
@@ -232,17 +317,64 @@ pub(crate) fn commit_validated<const D: usize>(
         )?,
         log_ring_d: 9,
     };
-    let outcome = source
-        .dispatch(runtime, matrix.buffer.as_ref(), params)
-        .map_err(MetalCommitError::into_akita)?;
+    let cpu_backend = backend.cpu_backend();
+    let (metal_result, cpu_result) = std::thread::scope(|scope| {
+        let cpu_worker = (cpu_blocks != 0).then(|| {
+            scope.spawn(|| {
+                commit_cpu_tail::<D>(
+                    cpu_backend,
+                    &prepared.cpu,
+                    source,
+                    plan,
+                    metal_blocks,
+                    cpu_blocks,
+                )
+            })
+        });
+        let metal_result = source.dispatch(runtime, matrix.buffer.as_ref(), params);
+        let cpu_result = cpu_worker.map(|worker| {
+            worker.join().map_err(|_| {
+                AkitaError::InvalidSetup("hybrid CPU root commit worker panicked".into())
+            })?
+        });
+        Ok::<_, AkitaError>((metal_result, cpu_result))
+    })?;
+    let outcome = metal_result.map_err(MetalCommitError::into_akita)?;
+    let cpu_commit = cpu_result.transpose()?;
     let output_reconstruction_start = Instant::now();
-    let coefficients = outcome
+    let mut coefficients = outcome
         .coefficients
         .into_iter()
         .enumerate()
         .map(|(index, value)| F::from_device(value, index))
         .collect::<Result<Vec<_>, _>>()
         .map_err(MetalCommitError::into_akita)?;
+    let merge_start = Instant::now();
+    if let Some(cpu_commit) = &cpu_commit {
+        let cpu_coefficients = cpu_commit.witness.inner_rows.coeffs();
+        let cpu_column_width = cpu_blocks
+            .checked_mul(D)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid CPU column").into_akita())?;
+        let output_column_width = shape
+            .blocks_per_column
+            .checked_mul(D)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid output column").into_akita())?;
+        let expected_cpu_coefficients = COLUMN_CAPACITY
+            .checked_mul(cpu_column_width)
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("hybrid CPU output").into_akita())?;
+        if cpu_coefficients.len() != expected_cpu_coefficients {
+            return Err(AkitaError::InvalidSetup(
+                "hybrid CPU root commit returned an invalid output shape".into(),
+            ));
+        }
+        for column in 0..COLUMN_CAPACITY {
+            let source_start = column * cpu_column_width;
+            let output_start = column * output_column_width + metal_blocks * D;
+            coefficients[output_start..output_start + cpu_column_width]
+                .copy_from_slice(&cpu_coefficients[source_start..source_start + cpu_column_width]);
+        }
+    }
+    let merge_time = merge_start.elapsed();
     let witness = CommitInnerWitness {
         inner_rows: RingVec::from_coeffs_with_ring_dim(coefficients, D)?,
     };
@@ -255,7 +387,7 @@ pub(crate) fn commit_validated<const D: usize>(
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 additions").into_akita())?;
     let reduction_field_additions = shape
         .live_columns
-        .checked_mul(shape.populated_blocks_per_column)
+        .checked_mul(metal_blocks)
         .and_then(|count| count.checked_mul(INNER_RANK))
         .and_then(|count| count.checked_mul(D))
         .and_then(|count| count.checked_mul(POSITION_PARTIALS - 1))
@@ -271,15 +403,18 @@ pub(crate) fn commit_validated<const D: usize>(
         .ok_or_else(|| {
             MetalCommitError::ShapeOverflow("fp128 D512 modeled matrix bytes").into_akita()
         })?;
-    let task_row_probes = shape
-        .populated_blocks_per_column
+    let task_row_probes = metal_blocks
         .checked_mul(plan.num_positions_per_block)
         .and_then(|count| count.checked_mul(2))
         .and_then(|count| count.checked_mul(shape.live_columns))
         .and_then(|count| count.checked_mul(INNER_RANK))
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 probes").into_akita())?;
-    let selected_lane_broadcasts = hot_entries
+    let cpu_hot_entries = cpu_commit.as_ref().map_or(0, |commit| commit.hot_entries);
+    let metal_hot_entries = hot_entries.checked_sub(cpu_hot_entries).ok_or_else(|| {
+        AkitaError::InvalidSetup("hybrid CPU hot-entry count exceeds the source total".into())
+    })?;
+    let selected_lane_broadcasts = metal_hot_entries
         .checked_mul(INNER_RANK)
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 broadcasts").into_akita())?;
@@ -288,15 +423,15 @@ pub(crate) fn commit_validated<const D: usize>(
             kernel: outcome.kernel,
             blocks_per_threadgroup: outcome.blocks_per_threadgroup,
             columns_per_threadgroup: outcome.columns_per_threadgroup,
-            cpu_blocks: 0,
-            metal_blocks: shape.populated_blocks_per_column,
-            metal_full_blocks: shape.populated_blocks_per_column,
+            cpu_blocks,
+            metal_blocks,
+            metal_full_blocks: metal_blocks,
             metal_boundary_columns: 0,
-            cpu_columns: 0,
+            cpu_columns: shape.live_columns * usize::from(cpu_blocks != 0),
             metal_columns: shape.live_columns,
-            cpu_work_units: 0,
-            metal_work_units: work_units,
-            cpu_rank_rows: 0,
+            cpu_work_units,
+            metal_work_units,
+            cpu_rank_rows: INNER_RANK * usize::from(cpu_blocks != 0),
             metal_rank_rows: INNER_RANK,
             num_sources: 1,
             hot_entries,
@@ -324,10 +459,12 @@ pub(crate) fn commit_validated<const D: usize>(
             buffer_setup_time: outcome.timings.buffer_setup,
             command_wall_time: outcome.timings.command_wall,
             gpu_time: outcome.timings.gpu,
-            cpu_time: std::time::Duration::ZERO,
+            cpu_time: cpu_commit
+                .as_ref()
+                .map_or(std::time::Duration::ZERO, |commit| commit.elapsed),
             readback_copy_time: outcome.timings.readback_copy,
             output_reconstruction_time,
-            merge_time: std::time::Duration::ZERO,
+            merge_time,
             total_time: total_start.elapsed(),
             digit_rows_calls: 0,
             digit_rows_metal_calls: 0,
@@ -358,6 +495,18 @@ mod tests {
     use crate::{MetalCommitBackend, MetalExecutionPolicy, MetalOneHotKernel};
 
     use super::F;
+
+    #[test]
+    fn hybrid_tail_uses_a_power_of_two_near_the_rate_balanced_split() {
+        assert_eq!(super::hybrid_cpu_tail_blocks(1), 0);
+        assert_eq!(super::hybrid_cpu_tail_blocks(5), 0);
+        assert_eq!(super::hybrid_cpu_tail_blocks(11), 0);
+        assert_eq!(super::hybrid_cpu_tail_blocks(12), 1);
+        assert_eq!(super::hybrid_cpu_tail_blocks(27), 2);
+        assert_eq!(super::hybrid_cpu_tail_blocks(32), 2);
+        assert_eq!(super::hybrid_cpu_tail_blocks(216), 16);
+        assert_eq!(super::hybrid_cpu_tail_blocks(256), 16);
+    }
 
     #[test]
     fn task_and_partial_grids_are_bijective() {
@@ -464,8 +613,8 @@ mod tests {
             assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
             assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
-            assert_eq!(metrics.cpu_work_units, 0);
-            assert_eq!(metrics.metal_work_units, columns * 32);
+            assert_eq!(metrics.cpu_work_units, columns * 2);
+            assert_eq!(metrics.metal_work_units, columns * 30);
         }
     }
 
@@ -554,9 +703,12 @@ mod tests {
         );
         assert_eq!(stream.finalize().unwrap().lanes(), resident.lanes());
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
+        let populated_blocks = POPULATED_ROWS.div_ceil(POSITIONS_PER_BLOCK * 2);
+        let cpu_blocks = super::hybrid_cpu_tail_blocks(populated_blocks);
+        assert_eq!(metrics.cpu_work_units, COLUMNS * cpu_blocks);
         assert_eq!(
             metrics.metal_work_units,
-            COLUMNS * POPULATED_ROWS.div_ceil(POSITIONS_PER_BLOCK * 2)
+            COLUMNS * (populated_blocks - cpu_blocks)
         );
     }
 }
