@@ -120,15 +120,6 @@ mod implementation {
         duration.as_secs_f64() * 1e3
     }
 
-    fn hybrid_cpu_tail_blocks(populated_blocks: usize) -> usize {
-        let target = populated_blocks / 12;
-        if target == 0 {
-            0
-        } else {
-            1usize << target.ilog2()
-        }
-    }
-
     fn paired_bootstrap_ratio_lcb(cpu: &[Duration], metal: &[Duration]) -> f64 {
         assert_eq!(cpu.len(), metal.len());
         let mut rng = SplitMix64(0xbb67_ae85_84ca_a73b);
@@ -155,7 +146,7 @@ mod implementation {
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
         let blocks_per_column =
             (1usize << workload.log_t) * ONEHOT_K / RING_D / POSITIONS_PER_BLOCK;
-        let cpu_blocks = hybrid_cpu_tail_blocks(blocks_per_column);
+        let cpu_blocks = metrics.cpu_blocks;
         let metal_blocks = blocks_per_column - cpu_blocks;
         let cpu_work_units = workload.columns * cpu_blocks;
         let metal_work_units = workload.columns * metal_blocks;
@@ -169,6 +160,7 @@ mod implementation {
         assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
         assert!(metrics.input_zero_copy);
         assert!(metrics.matrix_cache_hit);
+        assert!(cpu_blocks.is_power_of_two() && cpu_blocks <= 8);
         assert_eq!(metrics.cpu_blocks, cpu_blocks);
         assert_eq!(metrics.cpu_columns, workload.columns);
         assert_eq!(metrics.cpu_work_units, cpu_work_units);

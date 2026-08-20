@@ -282,6 +282,64 @@ impl MetalRuntime {
                 == FP128_D512_THREADGROUP_BYTES as u64
     }
 
+    pub(crate) fn supports_fp128_d64_digit_rows<const D: usize>(
+        &self,
+        num_vectors: usize,
+        num_rows: usize,
+        num_cols: usize,
+    ) -> bool {
+        let Ok(num_vectors) = u64::try_from(num_vectors) else {
+            return false;
+        };
+        let Ok(num_rows) = u64::try_from(num_rows) else {
+            return false;
+        };
+        let Ok(num_cols) = u64::try_from(num_cols) else {
+            return false;
+        };
+        if D != 64
+            || num_vectors == 0
+            || num_rows == 0
+            || num_cols == 0
+            || num_cols > u64::from(u32::MAX)
+        {
+            return false;
+        }
+        let column_partials = num_cols.div_ceil(FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64);
+        let output_coefficients = num_vectors
+            .checked_mul(num_rows)
+            .and_then(|count| count.checked_mul(D as u64));
+        let threadgroups = num_vectors
+            .checked_mul(num_rows)
+            .and_then(|count| count.checked_mul(column_partials));
+        let matrix_bytes = num_rows
+            .checked_mul(num_cols)
+            .and_then(|count| count.checked_mul(D as u64))
+            .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
+        let digit_bytes = num_vectors
+            .checked_mul(num_cols)
+            .and_then(|count| count.checked_mul(D as u64));
+        let partial_bytes = threadgroups
+            .and_then(|count| count.checked_mul(D as u64))
+            .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
+        let output_bytes =
+            output_coefficients.and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
+        let maximum = self.device.max_buffer_length();
+        output_coefficients.is_some_and(|count| count <= u64::from(u32::MAX))
+            && threadgroups.is_some_and(|count| count <= u64::from(u32::MAX))
+            && [matrix_bytes, digit_bytes, partial_bytes, output_bytes]
+                .into_iter()
+                .all(|bytes| bytes.is_some_and(|bytes| bytes != 0 && bytes <= maximum))
+            && self
+                .fp128_d64_digit_rows_partials_pipeline
+                .max_total_threads_per_threadgroup()
+                >= FP128_D64_DIGIT_ROWS_PARTIAL_THREADS as u64
+            && self
+                .fp128_d64_digit_rows_reduce_pipeline
+                .max_total_threads_per_threadgroup()
+                >= FP128_D64_DIGIT_ROWS_THREADS as u64
+    }
+
     pub(crate) fn shared_buffer_from_slice<T>(
         &self,
         values: &[T],
@@ -490,6 +548,8 @@ impl MetalRuntime {
                 .map_err(|_| MetalCommitError::ShapeOverflow("digit-row column count"))?;
             let expected_vector_count = usize::try_from(params.num_vectors)
                 .map_err(|_| MetalCommitError::ShapeOverflow("digit-row vector count"))?;
+            let expected_row_count = usize::try_from(params.num_rows)
+                .map_err(|_| MetalCommitError::ShapeOverflow("digit-row row count"))?;
             let expected_column_partials = params
                 .num_cols
                 .div_ceil(FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64);
@@ -513,7 +573,6 @@ impl MetalRuntime {
                 || digit_vectors
                     .iter()
                     .any(|digits| digits.len() != expected_vector_width)
-                || params.num_cols > 524_288
                 || params.output_coefficients != expected_output
                 || params.columns_per_partial != FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64
                 || params.column_partials != expected_column_partials
@@ -524,18 +583,14 @@ impl MetalRuntime {
                     .and_then(|count| count.checked_mul(params.column_partials))
                     .is_none_or(|count| count > u64::from(u32::MAX))
                 || matrix.length() < expected_matrix_bytes
-                || self
-                    .fp128_d64_digit_rows_partials_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < FP128_D64_DIGIT_ROWS_PARTIAL_THREADS as u64
-                || self
-                    .fp128_d64_digit_rows_reduce_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < FP128_D64_DIGIT_ROWS_THREADS as u64
+                || !self.supports_fp128_d64_digit_rows::<D>(
+                    expected_vector_count,
+                    expected_row_count,
+                    expected_vector_width,
+                )
             {
                 return Err(MetalCommitError::UnsupportedShape(
-                    "fp128 D64 digit rows require nonempty rows, at most 524288 columns, and a sufficient matrix prefix"
-                        .into(),
+                    "fp128 D64 digit rows exceed the kernel's index or device-buffer limits".into(),
                 ));
             }
 

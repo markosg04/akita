@@ -23,7 +23,11 @@ const ONEHOT_K: usize = 256;
 const COLUMN_CAPACITY: usize = 32;
 const POSITION_PARTIALS: usize = FP128_D512_POSITION_PARTIALS;
 const INNER_RANK: usize = 1;
-const HYBRID_CPU_RATE_DIVISOR: usize = 12;
+const HYBRID_CPU_SPARSE_RATE_DIVISOR: usize = 12;
+const HYBRID_CPU_DENSE_RATE_DIVISOR: usize = 24;
+const HYBRID_CPU_MAX_BLOCKS: usize = 8;
+const HYBRID_CPU_MIN_WORKLOAD_BLOCKS: usize = 12;
+const HYBRID_SPARSE_PERCENT: usize = 30;
 #[cfg(test)]
 const TASKS_PER_STREAM: usize = 32;
 
@@ -149,13 +153,32 @@ impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
     }
 }
 
-fn hybrid_cpu_tail_blocks(populated_blocks: usize) -> usize {
-    let target = populated_blocks / HYBRID_CPU_RATE_DIVISOR;
-    if target == 0 {
-        0
-    } else {
-        1usize << target.ilog2()
+fn hybrid_cpu_tail_blocks(
+    populated_blocks: usize,
+    sample_hot_entries: usize,
+    sample_lanes: usize,
+) -> usize {
+    if populated_blocks < HYBRID_CPU_MIN_WORKLOAD_BLOCKS || sample_lanes == 0 {
+        return 0;
     }
+    let sparse = (sample_hot_entries as u128) * 100
+        <= (sample_lanes as u128) * (HYBRID_SPARSE_PERCENT as u128);
+    let divisor = if sparse {
+        HYBRID_CPU_SPARSE_RATE_DIVISOR
+    } else {
+        HYBRID_CPU_DENSE_RATE_DIVISOR
+    };
+    let target = (populated_blocks / divisor).max(1);
+    (1usize << target.ilog2()).min(HYBRID_CPU_MAX_BLOCKS)
+}
+
+fn hybrid_sample(
+    source: &impl PackedCommitInput,
+    rows_per_block: usize,
+) -> Result<(usize, usize), AkitaError> {
+    let sample_rows = rows_per_block.min(source.populated_rows());
+    let lanes = source.wait_lanes(0..sample_rows)?;
+    Ok((lanes.iter().filter(|&&lane| lane != 0).count(), lanes.len()))
 }
 
 struct CpuTailCommit {
@@ -278,7 +301,16 @@ pub(crate) fn commit_validated<const D: usize>(
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
     let total_start = Instant::now();
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
-    let cpu_blocks = hybrid_cpu_tail_blocks(shape.populated_blocks_per_column);
+    let rows_per_block = plan
+        .num_positions_per_block
+        .checked_mul(2)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 rows per block").into_akita())?;
+    let (sample_hot_entries, sample_lanes) = hybrid_sample(source, rows_per_block)?;
+    let cpu_blocks = hybrid_cpu_tail_blocks(
+        shape.populated_blocks_per_column,
+        sample_hot_entries,
+        sample_lanes,
+    );
     let metal_blocks = shape
         .populated_blocks_per_column
         .checked_sub(cpu_blocks)
@@ -468,6 +500,9 @@ pub(crate) fn commit_validated<const D: usize>(
             total_time: total_start.elapsed(),
             digit_rows_calls: 0,
             digit_rows_metal_calls: 0,
+            digit_rows_max_rows: 0,
+            digit_rows_max_columns: 0,
+            digit_rows_max_batch: 0,
             digit_rows_time: std::time::Duration::ZERO,
             digit_rows_gpu_time: std::time::Duration::ZERO,
             compression_calls: 0,
@@ -497,15 +532,17 @@ mod tests {
     use super::F;
 
     #[test]
-    fn hybrid_tail_uses_a_power_of_two_near_the_rate_balanced_split() {
-        assert_eq!(super::hybrid_cpu_tail_blocks(1), 0);
-        assert_eq!(super::hybrid_cpu_tail_blocks(5), 0);
-        assert_eq!(super::hybrid_cpu_tail_blocks(11), 0);
-        assert_eq!(super::hybrid_cpu_tail_blocks(12), 1);
-        assert_eq!(super::hybrid_cpu_tail_blocks(27), 2);
-        assert_eq!(super::hybrid_cpu_tail_blocks(32), 2);
-        assert_eq!(super::hybrid_cpu_tail_blocks(216), 16);
-        assert_eq!(super::hybrid_cpu_tail_blocks(256), 16);
+    fn hybrid_tail_tracks_density_and_caps_unified_memory_contention() {
+        let sparse = |blocks| super::hybrid_cpu_tail_blocks(blocks, 3, 10);
+        let dense = |blocks| super::hybrid_cpu_tail_blocks(blocks, 4, 10);
+        assert_eq!(sparse(1), 0);
+        assert_eq!(sparse(11), 0);
+        assert_eq!(sparse(12), 1);
+        assert_eq!(sparse(27), 2);
+        assert_eq!(dense(27), 1);
+        assert_eq!(sparse(216), 8);
+        assert_eq!(dense(216), 8);
+        assert_eq!(sparse(256), 8);
     }
 
     #[test]
@@ -613,8 +650,8 @@ mod tests {
             assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
             assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
-            assert_eq!(metrics.cpu_work_units, columns * 2);
-            assert_eq!(metrics.metal_work_units, columns * 30);
+            assert_eq!(metrics.cpu_work_units, columns);
+            assert_eq!(metrics.metal_work_units, columns * 31);
         }
     }
 
@@ -704,7 +741,13 @@ mod tests {
         assert_eq!(stream.finalize().unwrap().lanes(), resident.lanes());
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
         let populated_blocks = POPULATED_ROWS.div_ceil(POSITIONS_PER_BLOCK * 2);
-        let cpu_blocks = super::hybrid_cpu_tail_blocks(populated_blocks);
+        let sample_rows = POSITIONS_PER_BLOCK * 2;
+        let sample_lanes = &resident.lanes()[..sample_rows * COLUMNS];
+        let cpu_blocks = super::hybrid_cpu_tail_blocks(
+            populated_blocks,
+            sample_lanes.iter().filter(|&&lane| lane != 0).count(),
+            sample_lanes.len(),
+        );
         assert_eq!(metrics.cpu_work_units, COLUMNS * cpu_blocks);
         assert_eq!(
             metrics.metal_work_units,

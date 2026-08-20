@@ -109,6 +109,12 @@ pub struct MetalCommitMetrics {
     pub digit_rows_calls: usize,
     /// Delegated B-row calls executed by Metal.
     pub digit_rows_metal_calls: usize,
+    /// Largest row count seen by a delegated B-row call.
+    pub digit_rows_max_rows: usize,
+    /// Largest column count seen by a delegated B-row call.
+    pub digit_rows_max_columns: usize,
+    /// Largest number of vectors fused into one delegated B-row dispatch.
+    pub digit_rows_max_batch: usize,
     /// Cumulative wall time in delegated B-row calls.
     pub digit_rows_time: Duration,
     /// Cumulative GPU timestamp interval for delegated B-row calls.
@@ -392,7 +398,6 @@ impl MetalCommitBackend<F> {
         let use_metal = D == 64
             && row_len != 0
             && num_cols != 0
-            && num_cols <= 524_288
             && log_basis == 3
             && digit_vectors.iter().all(|digits| digits.len() == num_cols)
             && digit_vectors.iter().all(|digits| {
@@ -400,6 +405,9 @@ impl MetalCommitBackend<F> {
                     .iter()
                     .flatten()
                     .all(|&digit| (-4..=3).contains(&digit))
+            })
+            && self.runtime().is_some_and(|runtime| {
+                runtime.supports_fp128_d64_digit_rows::<D>(digit_vectors.len(), row_len, num_cols)
             });
         let (row_batches, used_metal, metal_gpu_time) = if use_metal {
             if let Some(runtime) = self.runtime() {
@@ -496,6 +504,9 @@ impl MetalCommitBackend<F> {
         self.update_metrics(|metrics| {
             metrics.digit_rows_calls += digit_vectors.len();
             metrics.digit_rows_metal_calls += digit_vectors.len() * usize::from(used_metal);
+            metrics.digit_rows_max_rows = metrics.digit_rows_max_rows.max(row_len);
+            metrics.digit_rows_max_columns = metrics.digit_rows_max_columns.max(num_cols);
+            metrics.digit_rows_max_batch = metrics.digit_rows_max_batch.max(digit_vectors.len());
             metrics.digit_rows_time += elapsed;
             metrics.digit_rows_gpu_time += metal_gpu_time.unwrap_or_default();
         })
@@ -620,6 +631,14 @@ mod tests {
     use akita_types::SetupMatrixCapacity;
 
     use super::*;
+
+    #[test]
+    fn fp128_d64_digit_rows_admit_the_t28_two_slice_shape() {
+        let metal = MetalCommitBackend::<F>::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let runtime = metal.runtime().unwrap();
+
+        assert!(runtime.supports_fp128_d64_digit_rows::<64>(2, 1, 1_409_024));
+    }
 
     #[test]
     fn fp128_d64_digit_rows_match_cpu() {
