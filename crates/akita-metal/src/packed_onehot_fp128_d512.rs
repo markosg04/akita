@@ -28,11 +28,13 @@ pub(crate) struct ValidatedShape {
     output_coefficients: usize,
     positions_per_partial: usize,
     blocks_per_column: usize,
+    populated_blocks_per_column: usize,
     live_columns: usize,
 }
 
 pub(crate) trait PackedCommitInput {
     fn num_rows(&self) -> usize;
+    fn populated_rows(&self) -> usize;
     fn num_columns(&self) -> usize;
     fn column_capacity(&self) -> usize;
     fn onehot_k(&self) -> usize;
@@ -48,6 +50,10 @@ pub(crate) trait PackedCommitInput {
 
 impl<const D: usize> PackedCommitInput for PackedOneHotView<'_, F, D> {
     fn num_rows(&self) -> usize {
+        (*self).num_rows()
+    }
+
+    fn populated_rows(&self) -> usize {
         (*self).num_rows()
     }
 
@@ -84,6 +90,10 @@ impl<const D: usize> PackedCommitInput for PackedOneHotView<'_, F, D> {
 impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
     fn num_rows(&self) -> usize {
         StreamingPackedOneHotView::num_rows(self)
+    }
+
+    fn populated_rows(&self) -> usize {
+        StreamingPackedOneHotView::populated_rows(self)
     }
 
     fn num_columns(&self) -> usize {
@@ -148,9 +158,11 @@ pub(crate) fn validate_shape<const D: usize>(
         .num_positions_per_block
         .checked_mul(2)
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 rows per block").into_akita())?;
-    if !source.num_rows().is_multiple_of(rows_per_block) {
+    if source.populated_rows() > source.num_rows()
+        || !source.num_rows().is_multiple_of(rows_per_block)
+    {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 D512 panels require an integral number of trace blocks".into(),
+            "fp128 D512 panels require a bounded populated prefix and integral trace blocks".into(),
         )
         .into_akita());
     }
@@ -166,11 +178,13 @@ pub(crate) fn validate_shape<const D: usize>(
         .and_then(|count| count.checked_mul(INNER_RANK))
         .and_then(|count| count.checked_mul(D))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 output").into_akita())?;
+    let populated_blocks_per_column = source.populated_rows().div_ceil(rows_per_block);
     Ok(ValidatedShape {
         active_a_cols: plan.num_positions_per_block,
         output_coefficients,
         positions_per_partial,
         blocks_per_column,
+        populated_blocks_per_column,
         live_columns: source.num_columns(),
     })
 }
@@ -187,7 +201,7 @@ pub(crate) fn commit_validated<const D: usize>(
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
     let work_units = shape
         .live_columns
-        .checked_mul(shape.blocks_per_column)
+        .checked_mul(shape.populated_blocks_per_column)
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 work units").into_akita())?;
     let params = PackedOneHotCommitParams {
         num_rows: to_u64(source.num_rows(), "fp128 D512 row count")?,
@@ -200,7 +214,10 @@ pub(crate) fn commit_validated<const D: usize>(
         positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
         num_digits_inner: 1,
         blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 block count")?,
-        full_blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 full blocks")?,
+        full_blocks_per_column: to_u64(
+            shape.populated_blocks_per_column,
+            "fp128 D512 populated blocks",
+        )?,
         boundary_columns: 0,
         num_blocks: to_u64(work_units, "fp128 D512 work units")?,
         task_offset: 0,
@@ -237,8 +254,11 @@ pub(crate) fn commit_validated<const D: usize>(
         .and_then(|count| count.checked_mul(D))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 additions").into_akita())?;
     let reduction_field_additions = shape
-        .output_coefficients
-        .checked_mul(POSITION_PARTIALS - 1)
+        .live_columns
+        .checked_mul(shape.populated_blocks_per_column)
+        .and_then(|count| count.checked_mul(INNER_RANK))
+        .and_then(|count| count.checked_mul(D))
+        .and_then(|count| count.checked_mul(POSITION_PARTIALS - 1))
         .ok_or_else(|| {
             MetalCommitError::ShapeOverflow("fp128 D512 reduction additions").into_akita()
         })?;
@@ -251,9 +271,12 @@ pub(crate) fn commit_validated<const D: usize>(
         .ok_or_else(|| {
             MetalCommitError::ShapeOverflow("fp128 D512 modeled matrix bytes").into_akita()
         })?;
-    let task_row_probes = source
-        .lane_count()
-        .checked_mul(INNER_RANK)
+    let task_row_probes = shape
+        .populated_blocks_per_column
+        .checked_mul(plan.num_positions_per_block)
+        .and_then(|count| count.checked_mul(2))
+        .and_then(|count| count.checked_mul(shape.live_columns))
+        .and_then(|count| count.checked_mul(INNER_RANK))
         .and_then(|count| count.checked_mul(2))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 probes").into_akita())?;
     let selected_lane_broadcasts = hot_entries
@@ -266,8 +289,8 @@ pub(crate) fn commit_validated<const D: usize>(
             blocks_per_threadgroup: outcome.blocks_per_threadgroup,
             columns_per_threadgroup: outcome.columns_per_threadgroup,
             cpu_blocks: 0,
-            metal_blocks: shape.blocks_per_column,
-            metal_full_blocks: shape.blocks_per_column,
+            metal_blocks: shape.populated_blocks_per_column,
+            metal_full_blocks: shape.populated_blocks_per_column,
             metal_boundary_columns: 0,
             cpu_columns: 0,
             metal_columns: shape.live_columns,
@@ -447,11 +470,12 @@ mod tests {
     #[test]
     fn streaming_fp128_d512_panels_match_resident_input() {
         const ROWS: usize = 4_096;
+        const POPULATED_ROWS: usize = 2_345;
         const COLUMNS: usize = 29;
         const CAPACITY: usize = 32;
         const POSITIONS_PER_BLOCK: usize = 64;
         let lane = |row: usize, column: usize| {
-            if (row + column).is_multiple_of(5) {
+            if row >= POPULATED_ROWS || (row + column).is_multiple_of(5) {
                 0
             } else {
                 ((row * 73 + column * 19) % 255 + 1) as u8
@@ -468,7 +492,9 @@ mod tests {
         .unwrap();
         let buffer =
             PackedOneHotStreamBuffer::zeroed(super::ONEHOT_K, CAPACITY, COLUMNS, ROWS).unwrap();
-        let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::from_buffer(buffer);
+        let (stream, mut writer) =
+            StreamingPackedOneHotPoly::<F>::from_buffer_with_zero_suffix(buffer, POPULATED_ROWS)
+                .unwrap();
         let plan = CommitInnerPlan {
             n_a: 1,
             num_positions_per_block: POSITIONS_PER_BLOCK,
@@ -494,9 +520,11 @@ mod tests {
             .unwrap();
         let streaming_output = std::thread::scope(|scope| {
             let producer = scope.spawn(move || {
-                for _ in 0..8 {
+                let mut remaining = POPULATED_ROWS;
+                while remaining != 0 {
+                    let rows = remaining.min(ROWS / 8);
                     writer
-                        .fill_next_rows_in_place(ROWS / 8, |row, output| {
+                        .fill_next_rows_in_place(rows, |row, output| {
                             output
                                 .iter_mut()
                                 .enumerate()
@@ -504,6 +532,7 @@ mod tests {
                             Ok(())
                         })
                         .unwrap();
+                    remaining -= rows;
                 }
                 writer.finish().unwrap();
             });
@@ -522,5 +551,10 @@ mod tests {
             streaming_output[0].inner_rows
         );
         assert_eq!(stream.finalize().unwrap().lanes(), resident.lanes());
+        let metrics = metal.last_commit_metrics().unwrap().unwrap();
+        assert_eq!(
+            metrics.metal_work_units,
+            COLUMNS * POPULATED_ROWS.div_ceil(POSITIONS_PER_BLOCK * 2)
+        );
     }
 }

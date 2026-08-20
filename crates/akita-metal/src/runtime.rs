@@ -450,7 +450,7 @@ impl MetalRuntime {
                 .ok_or(MetalCommitError::ShapeOverflow("packed lane count"))?;
             let expected_tasks = params
                 .num_columns
-                .checked_mul(params.blocks_per_column)
+                .checked_mul(params.full_blocks_per_column)
                 .ok_or(MetalCommitError::ShapeOverflow("packed task count"))?;
             let expected_output = params
                 .column_capacity
@@ -470,7 +470,7 @@ impl MetalRuntime {
                 || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
                 || !params.positions_per_partial.is_multiple_of(4)
                 || !matches!(params.blocks_per_column, 32 | 64 | 128 | 256)
-                || params.full_blocks_per_column != params.blocks_per_column
+                || params.full_blocks_per_column > params.blocks_per_column
                 || params.boundary_columns != 0
                 || params.num_blocks != expected_tasks
                 || params.task_offset != 0

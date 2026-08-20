@@ -186,6 +186,26 @@ fn streaming_storage_publishes_prefixes_and_finalizes_without_copying() {
 }
 
 #[test]
+fn streaming_zeroed_suffix_finishes_after_populated_prefix() {
+    let buffer = PackedOneHotStreamBuffer::zeroed(16, 4, 3, 8).unwrap();
+    let (stream, mut writer) =
+        StreamingPackedOneHotPoly::<F>::from_buffer_with_zero_suffix(buffer, 5).unwrap();
+    let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();
+    assert_eq!(view.populated_rows(), 5);
+    writer
+        .fill_next_rows_in_place(5, |_row, output| {
+            output.fill(1);
+            Ok(())
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let packed = stream.finalize().unwrap();
+    assert_eq!(packed.hot_entries(), 15);
+    assert!(packed.lanes()[15..].iter().all(|lane| *lane == 0));
+}
+
+#[test]
 fn streaming_storage_failure_wakes_consumers() {
     let (stream, mut writer) = StreamingPackedOneHotPoly::<F>::new(16, 4, 3, 8).unwrap();
     let view = RootCommitSource::<F, 64>::commit_view(&stream).unwrap();

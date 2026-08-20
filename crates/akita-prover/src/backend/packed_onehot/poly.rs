@@ -159,6 +159,7 @@ struct StreamingProgress {
 struct StreamingPackedOneHotInner<F: FieldCore> {
     lanes: Arc<AlignedBytes>,
     num_rows: usize,
+    populated_rows: usize,
     num_columns: usize,
     column_capacity: usize,
     onehot_k: usize,
@@ -193,6 +194,12 @@ pub struct PackedOneHotStreamWriter<F: FieldCore> {
     next_row: usize,
     initialized: bool,
     closed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingStorageState {
+    populated_rows: usize,
+    initialized: bool,
 }
 
 /// An owned streaming commit view at ring dimension `D`.
@@ -470,7 +477,10 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             num_columns,
             validated_rows,
             total_field_elems.trailing_zeros() as usize,
-            false,
+            StreamingStorageState {
+                populated_rows: validated_rows,
+                initialized: false,
+            },
         ))
     }
 
@@ -484,8 +494,36 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             buffer.num_columns,
             buffer.num_rows,
             buffer.num_vars,
-            true,
+            StreamingStorageState {
+                populated_rows: buffer.num_rows,
+                initialized: true,
+            },
         )
+    }
+
+    /// Consume zeroed storage whose suffix starting at `populated_rows` remains zero.
+    pub fn from_buffer_with_zero_suffix(
+        buffer: PackedOneHotStreamBuffer,
+        populated_rows: usize,
+    ) -> Result<(Self, PackedOneHotStreamWriter<F>), AkitaError> {
+        if populated_rows > buffer.num_rows {
+            return Err(AkitaError::InvalidInput(format!(
+                "packed one-hot populated prefix {populated_rows} exceeds {} rows",
+                buffer.num_rows
+            )));
+        }
+        Ok(Self::from_storage(
+            buffer.lanes,
+            buffer.onehot_k,
+            buffer.column_capacity,
+            buffer.num_columns,
+            buffer.num_rows,
+            buffer.num_vars,
+            StreamingStorageState {
+                populated_rows,
+                initialized: true,
+            },
+        ))
     }
 
     fn from_storage(
@@ -495,11 +533,12 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
         num_columns: usize,
         num_rows: usize,
         num_vars: usize,
-        initialized: bool,
+        storage: StreamingStorageState,
     ) -> (Self, PackedOneHotStreamWriter<F>) {
         let inner = Arc::new(StreamingPackedOneHotInner {
             lanes: Arc::new(lanes),
             num_rows,
+            populated_rows: storage.populated_rows,
             num_columns,
             column_capacity,
             onehot_k,
@@ -520,7 +559,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
             PackedOneHotStreamWriter {
                 inner,
                 next_row: 0,
-                initialized,
+                initialized: storage.initialized,
                 closed: false,
             },
         )
@@ -529,6 +568,11 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
     #[must_use]
     pub fn num_rows(&self) -> usize {
         self.inner.num_rows
+    }
+
+    #[must_use]
+    pub fn populated_rows(&self) -> usize {
+        self.inner.populated_rows
     }
 
     #[must_use]
@@ -696,10 +740,10 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
             .next_row
             .checked_add(row_count)
             .ok_or_else(|| AkitaError::InvalidInput("packed one-hot row range overflow".into()))?;
-        if row_end > self.inner.num_rows {
+        if row_end > self.inner.populated_rows {
             return Err(AkitaError::InvalidInput(format!(
-                "packed one-hot stream row range {}..{row_end} exceeds {} rows",
-                self.next_row, self.inner.num_rows
+                "packed one-hot stream row range {}..{row_end} exceeds its {}-row populated prefix",
+                self.next_row, self.inner.populated_rows
             )));
         }
         {
@@ -811,12 +855,12 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
         Ok(())
     }
 
-    /// Mark a fully generated stream complete and wake all consumers.
+    /// Mark the populated prefix complete and publish the zeroed suffix.
     pub fn finish(mut self) -> Result<(), AkitaError> {
-        if self.next_row != self.inner.num_rows {
+        if self.next_row != self.inner.populated_rows {
             return Err(AkitaError::InvalidInput(format!(
                 "packed one-hot stream finished after {} of {} rows",
-                self.next_row, self.inner.num_rows
+                self.next_row, self.inner.populated_rows
             )));
         }
         let mut progress = self
@@ -827,6 +871,7 @@ impl<F: FieldCore> PackedOneHotStreamWriter<F> {
         if let Some(failure) = &progress.failure {
             return Err(stream_failure(failure));
         }
+        progress.completed_rows = self.inner.num_rows;
         progress.finished = true;
         self.closed = true;
         drop(progress);
@@ -859,6 +904,11 @@ impl<F: FieldCore, const D: usize> StreamingPackedOneHotView<F, D> {
     #[must_use]
     pub fn num_rows(&self) -> usize {
         self.inner.num_rows
+    }
+
+    #[must_use]
+    pub fn populated_rows(&self) -> usize {
+        self.inner.populated_rows
     }
 
     #[must_use]

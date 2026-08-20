@@ -244,7 +244,9 @@ kernel void akita_packed_onehot_reduce_partials(
     ulong coefficients_per_block = params.n_a * params.ring_d;
     ulong block = (ulong)output_index / coefficients_per_block;
     ulong column = block / params.blocks_per_column;
-    if (column >= params.num_columns) {
+    ulong column_block = block % params.blocks_per_column;
+    if (column >= params.num_columns
+        || column_block >= params.full_blocks_per_column) {
         output[output_index] = akita_zero();
         return;
     }
