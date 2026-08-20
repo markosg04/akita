@@ -501,6 +501,73 @@ pub fn find_schedule(
     policy: &PlannerPolicy,
     ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
 ) -> Result<PlannedFoldSchedule, AkitaError> {
+    find_schedule_impl(
+        key,
+        final_honest_fold_policy,
+        precommitted_honest_fold_policies,
+        policy,
+        None,
+        ring_challenge_config,
+    )
+}
+
+/// Optional restrictions applied only to root-level candidates.
+#[derive(Clone, Copy, Debug)]
+pub struct RootCandidateConstraint<'a> {
+    /// Admitted `(A, B, D)` ring-dimension triples.
+    pub dimensions: &'a [CommitmentRingDims],
+    /// Exact source positions per block, or any value when absent.
+    pub num_positions_per_block: Option<usize>,
+    /// Exact inner commitment output rank, or any value when absent.
+    pub inner_output_rank: Option<usize>,
+}
+
+impl RootCandidateConstraint<'_> {
+    pub(crate) fn admits(&self, params: &CommittedGroupParams) -> bool {
+        self.dimensions.contains(&params.role_dims())
+            && self
+                .num_positions_per_block
+                .is_none_or(|positions| positions == params.num_positions_per_block)
+            && self
+                .inner_output_rank
+                .is_none_or(|rank| rank == params.inner_commit_matrix.output_rank())
+    }
+}
+
+/// Build the best schedule admitted by `root_constraint`.
+///
+/// Recursive levels retain the configuration's ordinary candidate search.
+pub fn find_schedule_with_root_constraint(
+    key: &AkitaScheduleLookupKey,
+    final_honest_fold_policy: HonestFoldPolicySpec,
+    precommitted_honest_fold_policies: &[HonestFoldPolicySpec],
+    policy: &PlannerPolicy,
+    root_constraint: RootCandidateConstraint<'_>,
+    ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
+) -> Result<PlannedFoldSchedule, AkitaError> {
+    if root_constraint.dimensions.is_empty() {
+        return Err(AkitaError::InvalidSetup(
+            "root dimension filter must not be empty".into(),
+        ));
+    }
+    find_schedule_impl(
+        key,
+        final_honest_fold_policy,
+        precommitted_honest_fold_policies,
+        policy,
+        Some(root_constraint),
+        ring_challenge_config,
+    )
+}
+
+fn find_schedule_impl(
+    key: &AkitaScheduleLookupKey,
+    final_honest_fold_policy: HonestFoldPolicySpec,
+    precommitted_honest_fold_policies: &[HonestFoldPolicySpec],
+    policy: &PlannerPolicy,
+    root_candidate_constraint: Option<RootCandidateConstraint<'_>>,
+    ring_challenge_config: impl Fn(usize) -> Result<akita_challenges::SparseChallengeConfig, AkitaError>,
+) -> Result<PlannedFoldSchedule, AkitaError> {
     let diagnostics = crate::diagnostics::active();
     let diagnostics = diagnostics.as_deref();
     akita_schedules::planner_support::validate_policy(policy)?;
@@ -543,6 +610,7 @@ pub fn find_schedule(
         root_honest_fold_policy: Some(final_honest_fold_policy),
         precommitted_honest_fold_policies,
         level_zero_is_root: true,
+        root_candidate_constraint,
     };
     let mut memo = ScheduleMemo::new();
     let dimension_ceiling = super::schedule_params::initial_dimension_ceiling(active_policy)?;

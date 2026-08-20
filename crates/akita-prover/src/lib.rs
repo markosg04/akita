@@ -24,8 +24,10 @@ pub use api::{
 
 pub use backend::{
     tensor_pack_recursive_witness, DensePoly, MultilinearPolynomial, OneHotIndex, OneHotPoly,
-    RecursiveFoldSource, RecursiveWitnessFlat, SparseRingBlockEntry, SuffixWitnessBatchView,
-    SuffixWitnessView,
+    PackedOneHotPoly, PackedOneHotStreamBuffer, PackedOneHotStreamWriter, PackedOneHotView,
+    RecursiveFoldSource, RecursiveWitnessFlat, SparseRingBlockEntry, StreamingPackedOneHotPoly,
+    StreamingPackedOneHotView, SuffixWitnessBatchView, SuffixWitnessView,
+    PACKED_ONEHOT_BUFFER_ALIGNMENT,
 };
 pub use compute::{
     planned_ntt_cache_metrics, prewarm_ntt_requirements, BatchDecomposeFoldOutcome,

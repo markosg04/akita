@@ -143,6 +143,13 @@ fn opening_work_domain(
     let mut packing_work = Vec::new();
 
     for dimensions in dimension_candidates(policy, state.level, state.dimension_ceiling)? {
+        if root_level_key.is_some()
+            && ctx
+                .root_candidate_constraint
+                .is_some_and(|constraint| !constraint.dimensions.contains(&dimensions))
+        {
+            continue;
+        }
         if root_level_key.is_some_and(|root_key| {
             !crate::schedule_params::precommitted_groups_support_opening_dimension(
                 root_key.precommitteds.iter(),
@@ -347,6 +354,12 @@ impl<'a> CandidateDomain<'a> {
                         true,
                     )?;
                     for (params, next_witness_len) in dimension_candidates {
+                        if ctx
+                            .root_candidate_constraint
+                            .is_some_and(|constraint| !constraint.admits(&params))
+                        {
+                            continue;
+                        }
                         if work.purpose.allows_terminal() {
                             terminal.push(RawLevelCandidate {
                                 params: params.clone(),

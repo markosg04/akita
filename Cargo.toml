@@ -12,6 +12,7 @@ members = [
   "crates/akita-types",
   "crates/akita-verifier",
   "crates/akita-prover",
+  "crates/akita-metal",
   "crates/akita-planner",
   "crates/akita-schedules",
   "crates/akita-witness",
