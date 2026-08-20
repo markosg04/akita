@@ -1,10 +1,9 @@
 # Metal packed one-hot commitment
 
-`akita-metal` accelerates the inner root commitment for an exact fp128 packed
-one-hot source on Apple GPUs. The backend implements Akita's existing compute
-traits, returns the canonical `CommitInnerWitness`, and delegates later commit
-stages to `CpuBackend`. It does not change proof bytes, transcript behavior, or
-verifier logic.
+`akita-metal` accelerates the inner root commitment and its D64 outer image for
+an exact fp128 packed one-hot source on Apple GPUs. The backend implements
+Akita's compute traits and returns the canonical commitment data. It does not
+change proof bytes, transcript behavior, or verifier logic.
 
 ## Supported schedule
 
@@ -15,14 +14,16 @@ shapes either return an error (`RequireMetal`) or select CPU before dispatch
 - field: `Prime128OffsetA7F7`
 - one-hot width: `K = 256`, with byte zero denoting an absent entry
 - inner ring: `D = 512`; A rank: 1; positions per block: `2^19`
-- four equal position partials per output block
+- 16 equal position partials per output block
 - logical column capacity 32, with 25, 28, or 32 live columns
 - trace lengths `2^25` through `2^28`
 
 The benchmark schedule uses `D = 64` for the outer commitment, `D = 128` for
 the evaluation-trace opening commitment, eight outer slices, and three fold
-digits. The outer and compression stages remain on CPU and are included in
-full-commit timing; the opening stage is outside `commit` and is not timed.
+digits. Same-shape D64 outer slices with three-bit balanced digits and at most
+524,288 columns are submitted as one Metal batch. Other digit-row shapes and
+compression remain on CPU. The opening stage is outside `commit` and is not
+timed.
 
 ## Data and execution
 
@@ -36,8 +37,13 @@ threadgroup contains 32 SIMDgroups, and each SIMDgroup owns one
 `(column, block)` task. A threadgroup loads four matrix positions (eight trace
 rows) into 32 KiB of transposed threadgroup memory. SIMD ballots compact the
 nonzero lanes. Two coefficient-band dispatches keep eight fp128 coefficients
-live per lane and cover all 512 output coefficients. Four independently written
-position partials are reduced by a second device kernel.
+live per lane and cover all 512 output coefficients. Sixteen independently
+written position partials are reduced by a second device kernel.
+
+For the outer image, one 64-thread group accumulates 64 matrix columns at a
+time. It loads each matrix ring once into threadgroup memory, writes one ring
+partial, and a second kernel reduces the column partials. The eight canonical
+outer slices share one command and one input allocation.
 
 Field accumulation is exact modulo `2^128 - 0xa809`. The kernel tracks whole
 128-bit wraps while accumulating transposed limbs, then applies the Solinas
@@ -55,7 +61,7 @@ coefficient bands read approximately
 ```
 
 from the matrix. Packed lanes are scanned twice. Output size is
-`32 * blocks_per_column * 512 * 16` bytes, and device scratch is four times the
+`32 * blocks_per_column * 512 * 16` bytes, and device scratch is 16 times the
 output size. This path is therefore dominated by matrix traffic; sparsity
 mainly changes selected-lane arithmetic rather than the fixed matrix scan.
 

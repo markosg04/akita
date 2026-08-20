@@ -97,10 +97,17 @@ where
     F: FieldCore + CanonicalField,
     B: DigitRowsComputeBackend<F>,
 {
-    let mut stacked = Vec::with_capacity(geometry.logical_output_rows(n_b)?);
+    let expected_rows = geometry.logical_output_rows(n_b)?;
     let polynomial_planes = validate_outer_slice_digits::<D_B>(polynomial_digits, geometry)?;
+    let mut slice_inputs = Vec::with_capacity(geometry.slice_count().get());
     for_each_outer_slice_input::<D_B>(polynomial_planes, geometry, |input| {
-        let rows = backend.digit_rows::<D_B>(prepared, n_b, input, log_basis)?;
+        slice_inputs.push(input.to_vec());
+        Ok(())
+    })?;
+    let input_views = slice_inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let row_batches = backend.digit_rows_batch::<D_B>(prepared, n_b, &input_views, log_basis)?;
+    let mut stacked = Vec::with_capacity(expected_rows);
+    for rows in row_batches {
         if rows.len() != n_b {
             return Err(AkitaError::InvalidSetup(format!(
                 "backend returned {} B commitment rows, expected {n_b}",
@@ -108,8 +115,13 @@ where
             )));
         }
         stacked.extend(rows);
-        Ok(())
-    })?;
+    }
+    if stacked.len() != expected_rows {
+        return Err(AkitaError::InvalidSetup(format!(
+            "backend returned {} stacked B rows, expected {expected_rows}",
+            stacked.len()
+        )));
+    }
     Ok(stacked)
 }
 

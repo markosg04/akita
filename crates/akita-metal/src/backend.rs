@@ -16,7 +16,10 @@ use metal::Device;
 
 use crate::field::{MetalField, F};
 use crate::prepared::MetalPreparedSetup;
-use crate::runtime::{MetalDeviceCapabilities, MetalOneHotKernel, MetalRuntime};
+use crate::runtime::{
+    DigitRowsParams, MetalDeviceCapabilities, MetalOneHotKernel, MetalRuntime,
+    FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
+};
 use crate::{MetalCommitError, MetalExecutionPolicy};
 
 /// Timings and structural counters from the most recent Metal one-hot dispatch.
@@ -104,8 +107,12 @@ pub struct MetalCommitMetrics {
     pub total_time: Duration,
     /// Successful delegated B-row calls after the most recent inner commit.
     pub digit_rows_calls: usize,
+    /// Delegated B-row calls executed by Metal.
+    pub digit_rows_metal_calls: usize,
     /// Cumulative wall time in delegated B-row calls.
     pub digit_rows_time: Duration,
+    /// Cumulative GPU timestamp interval for delegated B-row calls.
+    pub digit_rows_gpu_time: Duration,
     /// Successful delegated compression calls after the most recent inner commit.
     pub compression_calls: usize,
     /// Cumulative wall time in delegated compression calls.
@@ -369,10 +376,138 @@ where
     }
 }
 
-impl<Field: MetalField> DigitRowsComputeBackend<Field> for MetalCommitBackend<Field>
+impl MetalCommitBackend<F> {
+    fn digit_rows_batch_impl<const D: usize>(
+        &self,
+        prepared: &MetalPreparedSetup<F>,
+        row_len: usize,
+        digit_vectors: &[&[[i8; D]]],
+        log_basis: u32,
+    ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
+        if digit_vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let start = Instant::now();
+        let num_cols = digit_vectors[0].len();
+        let use_metal = D == 64
+            && row_len != 0
+            && num_cols != 0
+            && num_cols <= 524_288
+            && log_basis == 3
+            && digit_vectors.iter().all(|digits| digits.len() == num_cols)
+            && digit_vectors.iter().all(|digits| {
+                digits
+                    .iter()
+                    .flatten()
+                    .all(|&digit| (-4..=3).contains(&digit))
+            });
+        let (row_batches, used_metal, metal_gpu_time) = if use_metal {
+            if let Some(runtime) = self.runtime() {
+                let matrix = prepared.matrix(runtime, D, row_len, num_cols)?;
+                let output_coefficients = digit_vectors
+                    .len()
+                    .checked_mul(row_len)
+                    .and_then(|count| count.checked_mul(D))
+                    .ok_or_else(|| {
+                        MetalCommitError::ShapeOverflow("digit-row output coefficients")
+                            .into_akita()
+                    })?;
+                let outcome = runtime
+                    .dispatch_fp128_d64_digit_rows(
+                        matrix.buffer.as_ref(),
+                        digit_vectors,
+                        DigitRowsParams {
+                            num_vectors: u64::try_from(digit_vectors.len()).map_err(|_| {
+                                MetalCommitError::ShapeOverflow("digit-row vector count")
+                                    .into_akita()
+                            })?,
+                            num_rows: u64::try_from(row_len).map_err(|_| {
+                                MetalCommitError::ShapeOverflow("digit-row row count").into_akita()
+                            })?,
+                            num_cols: u64::try_from(num_cols).map_err(|_| {
+                                MetalCommitError::ShapeOverflow("digit-row column count")
+                                    .into_akita()
+                            })?,
+                            ring_d: D as u64,
+                            output_coefficients: u64::try_from(output_coefficients).map_err(
+                                |_| {
+                                    MetalCommitError::ShapeOverflow("digit-row output coefficients")
+                                        .into_akita()
+                                },
+                            )?,
+                            columns_per_partial: FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64,
+                            column_partials: u64::try_from(
+                                num_cols.div_ceil(FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL),
+                            )
+                            .map_err(|_| {
+                                MetalCommitError::ShapeOverflow("digit-row column partials")
+                                    .into_akita()
+                            })?,
+                        },
+                    )
+                    .map_err(MetalCommitError::into_akita)?;
+                let coefficients = outcome
+                    .coefficients
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| F::from_device(value, index))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(MetalCommitError::into_akita)?;
+                let coefficients_per_vector = row_len.checked_mul(D).ok_or_else(|| {
+                    MetalCommitError::ShapeOverflow("digit-row vector output").into_akita()
+                })?;
+                let row_batches = coefficients
+                    .chunks_exact(coefficients_per_vector)
+                    .map(|vector| {
+                        vector
+                            .chunks_exact(D)
+                            .map(CyclotomicRing::from_slice)
+                            .collect()
+                    })
+                    .collect();
+                (row_batches, true, outcome.timings.gpu)
+            } else {
+                (
+                    digit_vectors
+                        .iter()
+                        .map(|digits| {
+                            self.cpu_backend()
+                                .digit_rows(&prepared.cpu, row_len, digits, log_basis)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    false,
+                    None,
+                )
+            }
+        } else {
+            (
+                digit_vectors
+                    .iter()
+                    .map(|digits| {
+                        self.cpu_backend()
+                            .digit_rows(&prepared.cpu, row_len, digits, log_basis)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                false,
+                None,
+            )
+        };
+        let elapsed = start.elapsed();
+        self.update_metrics(|metrics| {
+            metrics.digit_rows_calls += digit_vectors.len();
+            metrics.digit_rows_metal_calls += digit_vectors.len() * usize::from(used_metal);
+            metrics.digit_rows_time += elapsed;
+            metrics.digit_rows_gpu_time += metal_gpu_time.unwrap_or_default();
+        })
+        .map_err(MetalCommitError::into_akita)?;
+        Ok(row_batches)
+    }
+}
+
+impl DigitRowsComputeBackend<F> for MetalCommitBackend<F>
 where
-    CpuBackend: ComputeBackendSetup<Field, PreparedSetup = CpuPreparedSetup<Field>>
-        + DigitRowsComputeBackend<Field>,
+    CpuBackend:
+        ComputeBackendSetup<F, PreparedSetup = CpuPreparedSetup<F>> + DigitRowsComputeBackend<F>,
 {
     fn digit_rows<const D: usize>(
         &self,
@@ -380,25 +515,31 @@ where
         row_len: usize,
         digits: &[[i8; D]],
         log_basis: u32,
-    ) -> Result<Vec<CyclotomicRing<Field, D>>, AkitaError> {
-        let start = Instant::now();
-        let rows = self
-            .cpu_backend()
-            .digit_rows(&prepared.cpu, row_len, digits, log_basis)?;
-        let elapsed = start.elapsed();
-        self.update_metrics(|metrics| {
-            metrics.digit_rows_calls += 1;
-            metrics.digit_rows_time += elapsed;
-        })
-        .map_err(MetalCommitError::into_akita)?;
-        Ok(rows)
+    ) -> Result<Vec<CyclotomicRing<F, D>>, AkitaError> {
+        let mut batches = self.digit_rows_batch_impl(prepared, row_len, &[digits], log_basis)?;
+        if batches.len() != 1 {
+            return Err(AkitaError::InvalidSetup(
+                "single digit-row dispatch returned an invalid batch count".into(),
+            ));
+        }
+        Ok(batches.remove(0))
+    }
+
+    fn digit_rows_batch<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        row_len: usize,
+        digit_vectors: &[&[[i8; D]]],
+        log_basis: u32,
+    ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
+        self.digit_rows_batch_impl(prepared, row_len, digit_vectors, log_basis)
     }
 }
 
-impl<Field: MetalField> CyclicRowsComputeBackend<Field> for MetalCommitBackend<Field>
+impl CyclicRowsComputeBackend<F> for MetalCommitBackend<F>
 where
-    CpuBackend: ComputeBackendSetup<Field, PreparedSetup = CpuPreparedSetup<Field>>
-        + CyclicRowsComputeBackend<Field>,
+    CpuBackend:
+        ComputeBackendSetup<F, PreparedSetup = CpuPreparedSetup<F>> + CyclicRowsComputeBackend<F>,
 {
     fn cyclic_digit_rows<const D: usize>(
         &self,
@@ -406,7 +547,7 @@ where
         row_len: usize,
         digits: &[[i8; D]],
         log_basis: u32,
-    ) -> Result<Vec<CyclotomicRing<Field, D>>, AkitaError> {
+    ) -> Result<Vec<CyclotomicRing<F, D>>, AkitaError> {
         self.cpu_backend()
             .cyclic_digit_rows(&prepared.cpu, row_len, digits, log_basis)
     }
@@ -470,5 +611,79 @@ where
             source,
             plan,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use akita_prover::{AkitaProverSetup, ComputeBackendSetup, DigitRowsComputeBackend};
+    use akita_types::SetupMatrixCapacity;
+
+    use super::*;
+
+    #[test]
+    fn fp128_d64_digit_rows_match_cpu() {
+        const D: usize = 64;
+        const ROWS: usize = 1;
+        const COLUMNS: usize = 44_032;
+
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            20,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: ROWS * COLUMNS * D,
+            },
+        )
+        .unwrap();
+        let digits = (0..COLUMNS)
+            .map(|column| {
+                std::array::from_fn(|coefficient| {
+                    const VALUES: [i8; 8] = [-4, -3, -1, 0, 1, 2, 3, 0];
+                    VALUES[(column * 13 + coefficient * 5) % VALUES.len()]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let cpu = CpuBackend::DEFAULT;
+        let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
+        let expected = cpu
+            .digit_rows::<D>(&cpu_prepared, ROWS, &digits, 3)
+            .unwrap();
+
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let metal_prepared = metal.prepare_setup(&setup).unwrap();
+        let actual = metal
+            .digit_rows::<D>(&metal_prepared, ROWS, &digits, 3)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(metal_prepared.matrix_cache_entries().unwrap(), 1);
+
+        let cached = metal
+            .digit_rows::<D>(&metal_prepared, ROWS, &digits, 3)
+            .unwrap();
+        assert_eq!(cached, expected);
+        assert_eq!(metal_prepared.matrix_cache_entries().unwrap(), 1);
+
+        let second_digits = (0..COLUMNS)
+            .map(|column| {
+                std::array::from_fn(|coefficient| {
+                    const VALUES: [i8; 8] = [3, 0, -4, 2, -1, 1, -3, 0];
+                    VALUES[(column * 7 + coefficient * 11) % VALUES.len()]
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected_second = cpu
+            .digit_rows::<D>(&cpu_prepared, ROWS, &second_digits, 3)
+            .unwrap();
+        let actual_batch = metal
+            .digit_rows_batch::<D>(
+                &metal_prepared,
+                ROWS,
+                &[digits.as_slice(), second_digits.as_slice()],
+                3,
+            )
+            .unwrap();
+        assert_eq!(actual_batch, vec![expected, expected_second]);
+        assert_eq!(metal_prepared.matrix_cache_entries().unwrap(), 1);
     }
 }

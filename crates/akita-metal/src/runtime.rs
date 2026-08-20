@@ -20,6 +20,8 @@ const DIRECT_KERNEL_NAME: &str = "akita_onehot_commit_gather";
 const BLOCK_BATCHED_KERNEL_NAME: &str = "akita_onehot_commit_block_batched";
 const PACKED_FP128_D512_PANELS_KERNEL_NAME: &str = "akita_packed_onehot_commit_fp128_d512_panels";
 const PACKED_PARTIAL_REDUCTION_KERNEL_NAME: &str = "akita_packed_onehot_reduce_partials";
+const FP128_D64_DIGIT_ROWS_PARTIALS_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_partials";
+const FP128_D64_DIGIT_ROWS_REDUCE_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_reduce";
 const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const FP128_D512_TASKS_PER_STREAM: usize = 32;
@@ -29,6 +31,9 @@ const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
     FP128_D512_TILE_FIELD_ELEMENTS * size_of::<Fp128Limbs>();
 const FP128_D512_COEFFICIENT_BANDS: usize = 2;
+const FP128_D64_DIGIT_ROWS_THREADS: usize = 256;
+const FP128_D64_DIGIT_ROWS_PARTIAL_THREADS: usize = 64;
+pub(crate) const FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL: usize = 64;
 
 /// Metal implementation selected for a one-hot inner commitment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -109,6 +114,20 @@ pub(crate) struct PackedOneHotCommitParams {
 
 const _: [(); 168] = [(); size_of::<PackedOneHotCommitParams>()];
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DigitRowsParams {
+    pub(crate) num_vectors: u64,
+    pub(crate) num_rows: u64,
+    pub(crate) num_cols: u64,
+    pub(crate) ring_d: u64,
+    pub(crate) output_coefficients: u64,
+    pub(crate) columns_per_partial: u64,
+    pub(crate) column_partials: u64,
+}
+
+const _: [(); 56] = [(); size_of::<DigitRowsParams>()];
+
 trait PackedLaneSource {
     fn lane_count(&self) -> usize;
 
@@ -178,6 +197,11 @@ pub(crate) struct DispatchOutcome {
     pub(crate) input_zero_copy: bool,
 }
 
+pub(crate) struct DigitRowsDispatchOutcome {
+    pub(crate) coefficients: Vec<Fp128Limbs>,
+    pub(crate) timings: DispatchTimings,
+}
+
 struct PackedLaneBuffer<'a> {
     buffer: Buffer,
     zero_copy: bool,
@@ -191,6 +215,8 @@ pub(crate) struct MetalRuntime {
     block_batched_pipeline: ComputePipelineState,
     packed_fp128_d512_pipeline: ComputePipelineState,
     packed_partial_reduction_pipeline: ComputePipelineState,
+    fp128_d64_digit_rows_partials_pipeline: ComputePipelineState,
+    fp128_d64_digit_rows_reduce_pipeline: ComputePipelineState,
 }
 
 impl MetalRuntime {
@@ -219,6 +245,12 @@ impl MetalRuntime {
             block_batched_pipeline: pipeline(BLOCK_BATCHED_KERNEL_NAME)?,
             packed_fp128_d512_pipeline: pipeline(PACKED_FP128_D512_PANELS_KERNEL_NAME)?,
             packed_partial_reduction_pipeline: pipeline(PACKED_PARTIAL_REDUCTION_KERNEL_NAME)?,
+            fp128_d64_digit_rows_partials_pipeline: pipeline(
+                FP128_D64_DIGIT_ROWS_PARTIALS_KERNEL_NAME,
+            )?,
+            fp128_d64_digit_rows_reduce_pipeline: pipeline(
+                FP128_D64_DIGIT_ROWS_REDUCE_KERNEL_NAME,
+            )?,
             device,
         })
     }
@@ -266,6 +298,29 @@ impl MetalRuntime {
             bytes as u64,
             MTLResourceOptions::StorageModeShared,
         ))
+    }
+
+    fn shared_buffer_from_digit_rows<const D: usize>(
+        &self,
+        digit_vectors: &[&[[i8; D]]],
+    ) -> Result<Buffer, MetalCommitError> {
+        let bytes = digit_vectors.iter().try_fold(0usize, |total, digits| {
+            total
+                .checked_add(size_of_val(*digits))
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row input bytes"))
+        })?;
+        let buffer = self.shared_buffer(bytes)?;
+        let mut destination = buffer.contents().cast::<u8>();
+        for digits in digit_vectors {
+            let len = size_of_val(*digits);
+            // SAFETY: `buffer` owns `bytes`, the checked sum of the disjoint
+            // source lengths, and both pointers are valid for `len` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(digits.as_ptr().cast::<u8>(), destination, len);
+                destination = destination.add(len);
+            }
+        }
+        Ok(buffer)
     }
 
     pub(crate) fn private_buffer_from_slice<T>(
@@ -415,6 +470,137 @@ impl MetalRuntime {
                 matrix_block_streams: 0,
                 scratch_bytes: 0,
                 input_zero_copy: false,
+            })
+        })
+    }
+
+    pub(crate) fn dispatch_fp128_d64_digit_rows<const D: usize>(
+        &self,
+        matrix: &Buffer,
+        digit_vectors: &[&[[i8; D]]],
+        params: DigitRowsParams,
+    ) -> Result<DigitRowsDispatchOutcome, MetalCommitError> {
+        autoreleasepool(|| {
+            let expected_output = params
+                .num_vectors
+                .checked_mul(params.num_rows)
+                .and_then(|count| count.checked_mul(params.ring_d))
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row output"))?;
+            let expected_vector_width = usize::try_from(params.num_cols)
+                .map_err(|_| MetalCommitError::ShapeOverflow("digit-row column count"))?;
+            let expected_vector_count = usize::try_from(params.num_vectors)
+                .map_err(|_| MetalCommitError::ShapeOverflow("digit-row vector count"))?;
+            let expected_column_partials = params
+                .num_cols
+                .div_ceil(FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64);
+            let partial_count = params
+                .num_vectors
+                .checked_mul(params.num_rows)
+                .and_then(|count| count.checked_mul(expected_column_partials))
+                .and_then(|count| count.checked_mul(params.ring_d))
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row partials"))?;
+            let expected_matrix_bytes = params
+                .num_rows
+                .checked_mul(params.num_cols)
+                .and_then(|count| count.checked_mul(params.ring_d))
+                .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64))
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row matrix bytes"))?;
+            if D != 64
+                || params.ring_d != 64
+                || params.num_vectors == 0
+                || params.num_rows == 0
+                || digit_vectors.len() != expected_vector_count
+                || digit_vectors
+                    .iter()
+                    .any(|digits| digits.len() != expected_vector_width)
+                || params.num_cols > 524_288
+                || params.output_coefficients != expected_output
+                || params.columns_per_partial != FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64
+                || params.column_partials != expected_column_partials
+                || params.output_coefficients > u64::from(u32::MAX)
+                || params
+                    .num_vectors
+                    .checked_mul(params.num_rows)
+                    .and_then(|count| count.checked_mul(params.column_partials))
+                    .is_none_or(|count| count > u64::from(u32::MAX))
+                || matrix.length() != expected_matrix_bytes
+                || self
+                    .fp128_d64_digit_rows_partials_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_D64_DIGIT_ROWS_PARTIAL_THREADS as u64
+                || self
+                    .fp128_d64_digit_rows_reduce_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_D64_DIGIT_ROWS_THREADS as u64
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "fp128 D64 digit rows require nonempty rows, at most 524288 columns, and the exact matrix shape"
+                        .into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let digit_buffer = self.shared_buffer_from_digit_rows(digit_vectors)?;
+            let output_count = usize::try_from(params.output_coefficients)
+                .map_err(|_| MetalCommitError::ShapeOverflow("digit-row output coefficients"))?;
+            let output_bytes = output_count
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row output bytes"))?;
+            let output = self.shared_buffer(output_bytes)?;
+            let partial_count = usize::try_from(partial_count)
+                .map_err(|_| MetalCommitError::ShapeOverflow("digit-row partial count"))?;
+            let partial_bytes = partial_count
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row partial bytes"))?;
+            let partials = self.private_buffer(partial_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 D64 digit rows");
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_label("Akita fp128 D64 digit-row partials");
+            encoder.set_compute_pipeline_state(&self.fp128_d64_digit_rows_partials_pipeline);
+            encoder.set_buffer(0, Some(matrix), 0);
+            encoder.set_buffer(1, Some(&digit_buffer), 0);
+            encoder.set_buffer(2, Some(&partials), 0);
+            set_inline_bytes(encoder, 3, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    params.num_vectors * params.num_rows * params.column_partials,
+                    1,
+                    1,
+                ),
+                MTLSize::new(FP128_D64_DIGIT_ROWS_PARTIAL_THREADS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_label("Akita fp128 D64 digit-row reduction");
+            encoder.set_compute_pipeline_state(&self.fp128_d64_digit_rows_reduce_pipeline);
+            encoder.set_buffer(0, Some(&partials), 0);
+            encoder.set_buffer(1, Some(&output), 0);
+            set_inline_bytes(encoder, 2, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(params.output_coefficients, 1, 1),
+                MTLSize::new(FP128_D64_DIGIT_ROWS_THREADS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let (command_wall, gpu) = complete_command(command)?;
+
+            let readback_start = Instant::now();
+            // SAFETY: `output` is live shared storage for exactly `output_count`
+            // aligned `Fp128Limbs` values.
+            let coefficients = unsafe {
+                std::slice::from_raw_parts(output.contents().cast::<Fp128Limbs>(), output_count)
+                    .to_vec()
+            };
+            Ok(DigitRowsDispatchOutcome {
+                coefficients,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: readback_start.elapsed(),
+                },
             })
         })
     }

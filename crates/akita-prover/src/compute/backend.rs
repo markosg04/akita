@@ -172,6 +172,23 @@ where
         digits: &[[i8; D]],
         log_basis: u32,
     ) -> Result<Vec<CyclotomicRing<F, D>>, AkitaError>;
+
+    /// Same-matrix digit mat-vecs for independent right-hand sides.
+    ///
+    /// Backends may fuse same-shape inputs. The default preserves the scalar
+    /// operation and its validation exactly.
+    fn digit_rows_batch<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        row_len: usize,
+        digit_vectors: &[&[[i8; D]]],
+        log_basis: u32,
+    ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
+        digit_vectors
+            .iter()
+            .map(|digits| self.digit_rows(prepared, row_len, digits, log_basis))
+            .collect()
+    }
 }
 
 /// Cyclic digit mat-vec operations needed by ring-switch relation code.

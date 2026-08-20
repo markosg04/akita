@@ -25,7 +25,7 @@ mod implementation {
     const RING_D: usize = 512;
     const COLUMN_CAPACITY: usize = 32;
     const POSITIONS_PER_BLOCK: usize = 524_288;
-    const POSITION_PARTIALS: usize = 4;
+    const POSITION_PARTIALS: usize = 16;
     const INNER_RANK: usize = 1;
 
     #[derive(Clone, Copy)]
@@ -187,8 +187,10 @@ mod implementation {
         assert_eq!(metrics.field_additions, (hot_entries * RING_D) as u64);
         assert_eq!(
             metrics.reduction_field_additions,
-            (output_coefficients * (POSITION_PARTIALS - 1)) as u64
+            (work_units * RING_D * (POSITION_PARTIALS - 1)) as u64
         );
+        assert_ne!(metrics.digit_rows_calls, 0);
+        assert_eq!(metrics.digit_rows_metal_calls, metrics.digit_rows_calls);
     }
 
     fn report(
@@ -212,7 +214,7 @@ mod implementation {
             .map(|value| format!("{value:.6}"))
             .unwrap_or_else(|| "unavailable".into());
         println!(
-            "AKITA_F128_COMMIT_RESULT session={} workload={} samples={} backend_setup_ms={:.6} matrix_prepare_ms={:.6} cpu_mean_ms={:.6} metal_mean_ms={:.6} ratio={:.6} ratio_lcb95={:.6} gpu_ms={} inner_total_ms={:.6} digit_rows_ms={:.6} compression_ms={:.6} matrix_bytes={} matrix_read_bytes={} lane_bytes={} lane_read_bytes={} output_bytes={} scratch_bytes={} hot_entries={} input_zero_copy={} matrix_cache_hit={} cpu_work_units={} metal_work_units={}",
+            "AKITA_F128_COMMIT_RESULT session={} workload={} samples={} backend_setup_ms={:.6} matrix_prepare_ms={:.6} cpu_mean_ms={:.6} metal_mean_ms={:.6} ratio={:.6} ratio_lcb95={:.6} gpu_ms={} inner_total_ms={:.6} digit_rows_ms={:.6} digit_rows_gpu_ms={:.6} digit_rows_calls={} digit_rows_metal_calls={} compression_ms={:.6} matrix_bytes={} matrix_read_bytes={} lane_bytes={} lane_read_bytes={} output_bytes={} scratch_bytes={} hot_entries={} input_zero_copy={} matrix_cache_hit={} cpu_work_units={} metal_work_units={}",
             session,
             workload.name,
             cpu_times.len(),
@@ -225,6 +227,9 @@ mod implementation {
             gpu_ms,
             milliseconds(metrics.total_time),
             milliseconds(metrics.digit_rows_time),
+            milliseconds(metrics.digit_rows_gpu_time),
+            metrics.digit_rows_calls,
+            metrics.digit_rows_metal_calls,
             milliseconds(metrics.compression_time),
             metrics.matrix_bytes,
             metrics.modeled_matrix_read_bytes,

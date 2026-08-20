@@ -330,7 +330,9 @@ pub(crate) fn commit_validated<const D: usize>(
             merge_time: std::time::Duration::ZERO,
             total_time: total_start.elapsed(),
             digit_rows_calls: 0,
+            digit_rows_metal_calls: 0,
             digit_rows_time: std::time::Duration::ZERO,
+            digit_rows_gpu_time: std::time::Duration::ZERO,
             compression_calls: 0,
             compression_time: std::time::Duration::ZERO,
         })
