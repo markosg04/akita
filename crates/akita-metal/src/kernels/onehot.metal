@@ -402,42 +402,57 @@ inline void akita_fp128_d512_accumulate_value(
     accumulator.wraps += select(carry_words - int4(1), carry_words, positive);
 }
 
-inline void akita_fp128_d512_accumulate_group(
+inline void akita_fp128_d512_accumulate_positive(
     thread AkitaTransposedFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
-    uint simd_lane,
-    uint coefficient_group,
-    uint local_position,
-    uint local_shift,
-    bool odd_row)
+    uint matrix_base,
+    uint4 sources)
 {
-    uint coefficient_base = coefficient_group * 128u;
-    uint4 coefficients = uint4(
-        simd_lane + coefficient_base,
-        simd_lane + coefficient_base + 32u,
-        simd_lane + coefficient_base + 64u,
-        simd_lane + coefficient_base + 96u);
-    uint4 sources;
-    bool4 positive;
-    if (!odd_row) {
-        if (coefficient_group < 2u) {
-            sources = (coefficients - uint4(local_shift)) & uint4(511u);
-            positive = coefficients >= uint4(local_shift);
-        } else {
-            sources = coefficients - uint4(local_shift);
-            positive = bool4(true);
-        }
-    } else {
-        if (coefficient_group < 2u) {
-            sources = coefficients + uint4(256u) - uint4(local_shift);
-            positive = bool4(false);
-        } else {
-            uint shift = 256u + local_shift;
-            sources = (coefficients - uint4(shift)) & uint4(511u);
-            positive = coefficients >= uint4(shift);
-        }
-    }
-    uint matrix_base = local_position * 512u;
+    uint4 carry = uint4(0u);
+    accumulator.word_0 = akita_add_transposed_word(
+        accumulator.word_0,
+        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
+    accumulator.word_1 = akita_add_transposed_word(
+        accumulator.word_1,
+        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
+    accumulator.word_2 = akita_add_transposed_word(
+        accumulator.word_2,
+        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
+    accumulator.word_3 = akita_add_transposed_word(
+        accumulator.word_3,
+        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
+    accumulator.wraps += int4(carry);
+}
+
+inline void akita_fp128_d512_accumulate_negative(
+    thread AkitaTransposedFp128Accumulator &accumulator,
+    threadgroup const uint *matrix,
+    uint matrix_base,
+    uint4 sources)
+{
+    uint4 carry = uint4(1u);
+    accumulator.word_0 = akita_add_transposed_word(
+        accumulator.word_0,
+        ~akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
+    accumulator.word_1 = akita_add_transposed_word(
+        accumulator.word_1,
+        ~akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
+    accumulator.word_2 = akita_add_transposed_word(
+        accumulator.word_2,
+        ~akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
+    accumulator.word_3 = akita_add_transposed_word(
+        accumulator.word_3,
+        ~akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
+    accumulator.wraps += int4(carry) - int4(1);
+}
+
+inline void akita_fp128_d512_accumulate_mixed(
+    thread AkitaTransposedFp128Accumulator &accumulator,
+    threadgroup const uint *matrix,
+    uint matrix_base,
+    uint4 sources,
+    bool4 positive)
+{
     akita_fp128_d512_accumulate_value(
         accumulator,
         akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources),
@@ -445,6 +460,57 @@ inline void akita_fp128_d512_accumulate_group(
         akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources),
         akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources),
         positive);
+}
+
+inline void akita_fp128_d512_accumulate_pair(
+    thread AkitaTransposedFp128Accumulator &accumulator_0,
+    thread AkitaTransposedFp128Accumulator &accumulator_1,
+    threadgroup const uint *matrix,
+    uint simd_lane,
+    uint coefficient_band,
+    uint local_position,
+    uint local_shift,
+    bool odd_row)
+{
+    uint coefficient_base = coefficient_band * 256u;
+    uint4 coefficients_0 = uint4(
+        simd_lane + coefficient_base,
+        simd_lane + coefficient_base + 32u,
+        simd_lane + coefficient_base + 64u,
+        simd_lane + coefficient_base + 96u);
+    uint4 coefficients_1 = coefficients_0 + uint4(128u);
+    uint matrix_base = local_position * 512u;
+    if (coefficient_band == 0u) {
+        if (odd_row) {
+            uint4 shift = uint4(256u - local_shift);
+            akita_fp128_d512_accumulate_negative(
+                accumulator_0, matrix, matrix_base, coefficients_0 + shift);
+            akita_fp128_d512_accumulate_negative(
+                accumulator_1, matrix, matrix_base, coefficients_1 + shift);
+        } else {
+            uint4 shift = uint4(local_shift);
+            akita_fp128_d512_accumulate_mixed(
+                accumulator_0, matrix, matrix_base,
+                (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+            akita_fp128_d512_accumulate_mixed(
+                accumulator_1, matrix, matrix_base,
+                (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
+        }
+    } else if (odd_row) {
+        uint4 shift = uint4(256u + local_shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_0, matrix, matrix_base,
+            (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_1, matrix, matrix_base,
+            (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
+    } else {
+        uint4 shift = uint4(local_shift);
+        akita_fp128_d512_accumulate_positive(
+            accumulator_0, matrix, matrix_base, coefficients_0 - shift);
+        akita_fp128_d512_accumulate_positive(
+            accumulator_1, matrix, matrix_base, coefficients_1 - shift);
+    }
 }
 
 inline void akita_store_fp128_d512_group(
@@ -552,12 +618,9 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
             uint selected_hot = simd_shuffle(local_hot, selected_lane);
             uint local_position = selected_lane >> 1u;
             bool odd_row = (selected_lane & 1u) != 0u;
-            akita_fp128_d512_accumulate_group(
-                accumulator_0, shared_matrix, simd_lane, coefficient_group_0,
-                local_position, selected_hot, odd_row);
-            akita_fp128_d512_accumulate_group(
-                accumulator_1, shared_matrix, simd_lane, coefficient_group_1,
-                local_position, selected_hot, odd_row);
+            akita_fp128_d512_accumulate_pair(
+                accumulator_0, accumulator_1, shared_matrix, simd_lane,
+                coefficient_band, local_position, selected_hot, odd_row);
             selected &= selected - 1u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
