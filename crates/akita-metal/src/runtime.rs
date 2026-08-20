@@ -523,7 +523,7 @@ impl MetalRuntime {
                     .checked_mul(params.num_rows)
                     .and_then(|count| count.checked_mul(params.column_partials))
                     .is_none_or(|count| count > u64::from(u32::MAX))
-                || matrix.length() != expected_matrix_bytes
+                || matrix.length() < expected_matrix_bytes
                 || self
                     .fp128_d64_digit_rows_partials_pipeline
                     .max_total_threads_per_threadgroup()
@@ -534,7 +534,7 @@ impl MetalRuntime {
                     < FP128_D64_DIGIT_ROWS_THREADS as u64
             {
                 return Err(MetalCommitError::UnsupportedShape(
-                    "fp128 D64 digit rows require nonempty rows, at most 524288 columns, and the exact matrix shape"
+                    "fp128 D64 digit rows require nonempty rows, at most 524288 columns, and a sufficient matrix prefix"
                         .into(),
                 ));
             }
@@ -674,9 +674,9 @@ impl MetalRuntime {
                 .and_then(|count| count.checked_mul(params.ring_d))
                 .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64))
                 .ok_or(MetalCommitError::ShapeOverflow("packed matrix bytes"))?;
-            if matrix.length() != expected_matrix_bytes {
+            if matrix.length() < expected_matrix_bytes {
                 return Err(MetalCommitError::UnsupportedShape(
-                    "packed fp128 D512 matrix length does not match the plan".into(),
+                    "packed fp128 D512 matrix prefix is shorter than the plan".into(),
                 ));
             }
             if !self.supports_packed_fp128_d512_panels() {

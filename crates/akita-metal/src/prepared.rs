@@ -60,6 +60,16 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
         n_a: usize,
         active_a_cols: usize,
     ) -> Result<MatrixPreparation, AkitaError> {
+        self.expanded
+            .shared_matrix
+            .ring_view_dyn(n_a, active_a_cols, ring_d)?;
+        let field_count = n_a
+            .checked_mul(active_a_cols)
+            .and_then(|count| count.checked_mul(ring_d))
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("A matrix field count").into_akita())?;
+        let required_bytes = field_count
+            .checked_mul(size_of::<Field::DeviceElement>())
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("A matrix bytes").into_akita())?;
         let key = MatrixCacheKey {
             ring_d,
             n_a,
@@ -77,15 +87,20 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
                 prepare_time: Duration::ZERO,
             });
         }
+        if let Some(prepared) = matrices
+            .values()
+            .filter(|prepared| prepared.bytes >= required_bytes)
+            .min_by_key(|prepared| prepared.bytes)
+        {
+            return Ok(MatrixPreparation {
+                buffer: prepared.buffer.clone(),
+                bytes: prepared.bytes,
+                cache_hit: true,
+                prepare_time: Duration::ZERO,
+            });
+        }
 
         let start = Instant::now();
-        self.expanded
-            .shared_matrix
-            .ring_view_dyn(n_a, active_a_cols, ring_d)?;
-        let field_count = n_a
-            .checked_mul(active_a_cols)
-            .and_then(|count| count.checked_mul(ring_d))
-            .ok_or_else(|| MetalCommitError::ShapeOverflow("A matrix field count").into_akita())?;
         let fields = self
             .expanded
             .shared_matrix
@@ -122,7 +137,7 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
         })
     }
 
-    /// Number of exact A-matrix shapes currently resident on the device.
+    /// Number of independently allocated matrix prefixes resident on the device.
     pub fn matrix_cache_entries(&self) -> Result<usize, MetalCommitError> {
         Ok(self
             .matrices
@@ -131,7 +146,7 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
             .len())
     }
 
-    /// Total resident bytes across exact A-matrix shapes.
+    /// Total bytes across independently allocated resident matrix prefixes.
     pub fn matrix_cache_bytes(&self) -> Result<usize, MetalCommitError> {
         self.matrices
             .lock()
@@ -142,5 +157,38 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
                     .checked_add(matrix.bytes)
                     .ok_or(MetalCommitError::ShapeOverflow("matrix cache bytes"))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use akita_prover::{AkitaProverSetup, ComputeBackendSetup};
+    use akita_types::SetupMatrixCapacity;
+
+    use super::*;
+    use crate::{MetalCommitBackend, MetalExecutionPolicy};
+
+    #[test]
+    fn larger_resident_matrix_serves_a_smaller_reshaped_prefix() {
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            20,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: 512 * 16,
+            },
+        )
+        .unwrap();
+        let backend = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let prepared = backend.prepare_setup(&setup).unwrap();
+        let runtime = backend.runtime().unwrap();
+
+        let root = prepared.matrix(runtime, 512, 1, 16).unwrap();
+        assert!(!root.cache_hit);
+        let outer = prepared.matrix(runtime, 64, 2, 32).unwrap();
+        assert!(outer.cache_hit);
+        assert_eq!(outer.prepare_time, Duration::ZERO);
+        assert!(Arc::ptr_eq(&root.buffer, &outer.buffer));
+        assert_eq!(prepared.matrix_cache_entries().unwrap(), 1);
+        assert_eq!(prepared.matrix_cache_bytes().unwrap(), root.bytes);
     }
 }

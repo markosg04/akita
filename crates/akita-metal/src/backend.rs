@@ -626,12 +626,13 @@ mod tests {
         const D: usize = 64;
         const ROWS: usize = 1;
         const COLUMNS: usize = 44_032;
+        const ROOT_COLUMNS: usize = 8_192;
 
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
             20,
             1,
             SetupMatrixCapacity {
-                num_field_elements: ROWS * COLUMNS * D,
+                num_field_elements: ROOT_COLUMNS * 512,
             },
         )
         .unwrap();
@@ -652,6 +653,10 @@ mod tests {
 
         let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
+        let root = metal
+            .prewarm_packed_fp128_d512_matrix(&metal_prepared, ROOT_COLUMNS)
+            .unwrap();
+        assert!(!root.cache_hit);
         let actual = metal
             .digit_rows::<D>(&metal_prepared, ROWS, &digits, 3)
             .unwrap();
