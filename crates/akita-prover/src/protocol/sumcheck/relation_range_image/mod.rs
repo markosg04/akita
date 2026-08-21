@@ -81,17 +81,23 @@
 use super::fold_prefix_pair_with_zero_padding as fold_folded_lane_pair;
 use super::two_round_prefix::{
     build_stage2_bivariate_skip_proof_from_m_compact, can_use_stage2_two_round_prefix,
-    Stage2BivariateSkipState,
+    default_stage2_norm_omitted_corner, stage2_norm_corner_weights_from_taus, BooleanCorner,
+    Stage2BivariateSkipProof, Stage2BivariateSkipState, Stage2CompressedGrid,
 };
 use super::two_round_prefix::{stage2_b4_w_digit, stage2_b8_w_digit};
+use crate::compute::{ComputeBackendSetup, CpuBackend, OpeningCluster, OperationCtx};
+use akita_algebra::eq_poly::EqPolynomial;
 use akita_algebra::poly::trim_trailing_zeros;
 use akita_algebra::split_eq::GruenSplitEq;
 use akita_field::parallel::*;
 use akita_field::unreduced::{HasOptimizedFold, HasUnreducedOps};
 use akita_field::{AkitaError, FieldCore, FromPrimitiveInt, Zero};
+use akita_serialization::AkitaSerialize;
 use akita_sumcheck::{
-    fold_evals_in_place, reduce_signed_accum, CompactPairFoldLut, SumcheckInstanceProver, UniPoly,
+    fold_evals_in_place, reduce_signed_accum, CompactPairFoldLut, SumcheckInstanceProver,
+    SumcheckInstanceProverExt, SumcheckProof, UniPoly,
 };
+use akita_transcript::{sample_ext_challenge, Transcript};
 use std::mem;
 use std::time::Instant;
 
@@ -253,6 +259,125 @@ pub struct RelationRangeImageProver<E: FieldCore> {
     scan_time_total: f64,
     fold_time_total: f64,
     rounds_completed: usize,
+}
+
+/// One factored structured-linear source segment for direct Stage-2 backends.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DirectLinearSegment<E: FieldCore> {
+    pub factor: E,
+    pub source_index: usize,
+    pub target_lane_start: usize,
+    pub source_lane_start: usize,
+    pub lane_count: usize,
+}
+
+/// Static lane-to-source mapping for the structured-linear Stage-2 term.
+#[doc(hidden)]
+pub struct DirectLinearLayout<E: FieldCore> {
+    pub segments: Vec<DirectLinearSegment<E>>,
+    pub lane_offsets: Vec<usize>,
+    pub lane_segments: Vec<usize>,
+    pub source_count: usize,
+}
+
+/// Current structured-linear source values or their dense lane-folded form.
+#[doc(hidden)]
+pub struct DirectLinearRound<E: FieldCore> {
+    pub source_values: Vec<E>,
+    pub source_offsets: Vec<usize>,
+    pub dense_values: Option<Vec<E>>,
+}
+
+/// One current sparse additional-relation parent pair.
+#[doc(hidden)]
+pub struct DirectAdditionalPair<E: FieldCore> {
+    pub parent: usize,
+    pub linear: [E; 2],
+    pub binary: [E; 2],
+}
+
+/// Current sparse additional-relation data.
+#[doc(hidden)]
+pub struct DirectAdditionalRound<E: FieldCore> {
+    pub pairs: Vec<DirectAdditionalPair<E>>,
+    pub binary_batching: E,
+}
+
+/// Static inputs for Akita's canonical two-round Stage-2 prefix.
+#[doc(hidden)]
+pub struct DirectRelationTwoRoundPrefixData<'a, E: FieldCore> {
+    pub equality_first: Vec<E>,
+    pub equality_second: Vec<E>,
+    pub alpha: &'a [E],
+    pub lane_weights: &'a [E],
+    pub basis: usize,
+    pub live_lane_count: usize,
+    pub coefficient_count: usize,
+    pub norm_omitted_corner: usize,
+}
+
+/// Host reconstruction state for the two ordinary messages represented by a
+/// transient Stage-2 bivariate prefix grid.
+#[doc(hidden)]
+pub struct DirectRelationTwoRoundPrefixState<E: FieldCore> {
+    inner: Stage2BivariateSkipState<E>,
+}
+
+impl<E: FieldCore + FromPrimitiveInt> DirectRelationTwoRoundPrefixState<E> {
+    fn coefficients_except_linear(norm: UniPoly<E>, relation: UniPoly<E>) -> [E; 3] {
+        [0usize, 2, 3].map(|coefficient| {
+            norm.coeffs
+                .get(coefficient)
+                .copied()
+                .unwrap_or_else(E::zero)
+                + relation
+                    .coeffs
+                    .get(coefficient)
+                    .copied()
+                    .unwrap_or_else(E::zero)
+        })
+    }
+
+    pub fn round_zero_coefficients_except_linear(&self) -> [E; 3] {
+        let (norm, relation) = self.inner.reconstruct_round0_polys();
+        Self::coefficients_except_linear(norm, relation)
+    }
+
+    pub fn round_one_coefficients_except_linear(&self, round_zero_challenge: E) -> [E; 3] {
+        let (norm, relation) = self.inner.reconstruct_round1_polys(round_zero_challenge);
+        Self::coefficients_except_linear(norm, relation)
+    }
+}
+
+/// Opaque host-side auxiliary state for a resident direct Stage-2 backend.
+#[doc(hidden)]
+pub struct DirectRelationRangeProofState<E: FieldCore> {
+    prover: RelationRangeImageProver<E>,
+    linear_layout: DirectLinearLayout<E>,
+}
+
+type DirectRelationRangeProofOutput<E> = (SumcheckProof<E>, Vec<E>, RelationRangeImageProver<E>);
+
+/// Backend operation for the complete fused relation/range-image sumcheck.
+pub trait DirectRelationRangeProofBackend<F, E>: ComputeBackendSetup<F>
+where
+    F: FieldCore + akita_field::CanonicalField,
+    E: akita_field::ExtField<F>
+        + FromPrimitiveInt
+        + HasOptimizedFold
+        + HasUnreducedOps
+        + AkitaSerialize,
+{
+    /// Prove one Stage-2 instance while retaining its shrinking witness table.
+    fn prove_direct_relation_range<T>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        prover: RelationRangeImageProver<E>,
+        transcript: &mut T,
+    ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
+    where
+        T: Transcript<F>;
 }
 
 mod additional_terms;

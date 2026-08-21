@@ -4,6 +4,7 @@ use crate::compute::{
     RuntimeCommitBackendFor, RuntimeRingSwitchProveBackend,
 };
 use crate::RecursiveWitnessFlat;
+use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend};
 use akita_field::unreduced::ReduceTo;
 use akita_field::AdditiveGroup;
 
@@ -145,7 +146,11 @@ where
     T: Transcript<F> + ProverTranscriptGrind<F>,
     P: RootProverGroupOpening<F, E, O> + Clone,
     C: RuntimeCommitBackendFor<F, RecursiveWitnessFlat> + ComputeBackendSetup<F> + 'stack,
-    O: DigitRowsComputeBackend<F> + ComputeBackendSetup<F> + 'stack,
+    O: DigitRowsComputeBackend<F>
+        + ComputeBackendSetup<F>
+        + DirectDigitRangeProofBackend<F, E>
+        + DirectRelationRangeProofBackend<F, E>
+        + 'stack,
     TS: ComputeBackendSetup<F> + 'stack,
     R: RuntimeRingSwitchProveBackend<F>
         + DigitRowsComputeBackend<F>

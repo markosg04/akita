@@ -25,7 +25,8 @@ pub use packed_onehot::{
     StreamingPackedOneHotPoly, StreamingPackedOneHotView, PACKED_ONEHOT_BUFFER_ALIGNMENT,
 };
 pub use recursive::{
-    RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView, SuffixWitnessView,
+    RecursiveFoldBatchView, RecursiveFoldSource, RecursiveFoldView, RecursiveWitnessFlat,
+    SuffixWitnessBatchView, SuffixWitnessView,
 };
 pub use ring_switch::RingSwitchRelationView;
 pub use sparse_ring::SparseRingBlockEntry;

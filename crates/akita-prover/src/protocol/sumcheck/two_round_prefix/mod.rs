@@ -50,5 +50,6 @@ pub(crate) use stage1::{
 };
 pub(crate) use stage2::{
     build_stage2_bivariate_skip_proof_from_m_compact, can_use_stage2_two_round_prefix,
-    Stage2BivariateSkipState,
+    default_stage2_norm_omitted_corner, stage2_norm_corner_weights_from_taus, BooleanCorner,
+    Stage2BivariateSkipProof, Stage2BivariateSkipState, Stage2CompressedGrid,
 };

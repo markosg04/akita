@@ -28,8 +28,9 @@ mod relation_weights;
 mod tests;
 
 pub use coeffs::ring_switch_build_w;
-pub(crate) use coeffs::PreparedRingSwitchGroup;
+pub(crate) use coeffs::{ring_switch_build_w_pipelined, PreparedRingSwitchGroup};
 pub use commit::{commit_terminal_w, commit_w, NextWitnessState, NextWitnessStateOutput};
+pub(crate) use commit::{commit_w_with_prefix, prepare_recursive_commit_prefix};
 pub use evals::build_w_evals_compact;
 pub(crate) use finalize::ring_switch_finalize;
 pub use relation_weights::{

@@ -17,7 +17,6 @@ use crate::kernels::linear::try_centered_i8;
 use crate::DecomposeFoldWitness;
 use akita_algebra::CyclotomicRing;
 use akita_challenges::SparseChallenge;
-use akita_field::parallel::*;
 use akita_field::{AkitaError, CanonicalField};
 use akita_types::SubfieldMultiplierOpeningPoint;
 use std::array::from_fn;
@@ -643,12 +642,9 @@ fn signed_accum_to_coefficients<F: CanonicalField, const D: usize>(
 
 pub fn build_decompose_fold_witness<F: CanonicalField, const D: usize>(
     centered_coeffs: Vec<[i32; D]>,
-    modulus: u128,
+    _modulus: u128,
 ) -> DecomposeFoldWitness<F> {
-    let z_folded_coeffs = cfg_iter!(centered_coeffs)
-        .map(|coeff_accum| signed_accum_to_coefficients::<F, D>(*coeff_accum, modulus))
-        .collect();
-    DecomposeFoldWitness::from_coefficient_parts(z_folded_coeffs, centered_coeffs)
+    DecomposeFoldWitness::from_centered_coefficients(centered_coeffs)
 }
 
 /// Fused base-field fold + evaluation shared by backends that do not specialize it.

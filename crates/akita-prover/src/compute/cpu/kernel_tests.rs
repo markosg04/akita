@@ -57,6 +57,35 @@ fn recursive_commit_ignores_commitment_padding_blocks() {
 }
 
 #[test]
+fn recursive_commit_rows_compose_at_block_boundaries() {
+    let prepared = prepared();
+    let positions_per_block = 3;
+    let coeffs = (0..5 * positions_per_block)
+        .map(|position| std::array::from_fn(|coefficient| ((position + coefficient) % 7) as i8 - 3))
+        .collect::<Vec<[i8; D]>>();
+    let commit = |coeffs: &[[i8; D]], blocks| {
+        CpuBackend::DEFAULT
+            .recursive_witness_commit_rows(
+                &prepared,
+                coeffs,
+                2,
+                positions_per_block,
+                blocks,
+                1,
+                3,
+                Some(3),
+            )
+            .expect("recursive commit rows")
+    };
+
+    let full = commit(&coeffs, 5);
+    let mut split = commit(&coeffs[..4 * positions_per_block], 4);
+    split.extend(commit(&coeffs[4 * positions_per_block..], 1));
+
+    assert_eq!(split, full);
+}
+
+#[test]
 fn cpu_cyclic_digit_rows_match_direct_kernel() {
     let prepared = prepared();
     let digits = vec![[1i8; D], [0i8; D], [-2i8; D], [3i8; D]];

@@ -25,6 +25,7 @@ mod round_accumulation;
 
 pub use direct_range_leaf::LowBasisRangeCheckProver;
 
+use crate::compute::{ComputeBackendSetup, CpuBackend, OpeningCluster, OperationCtx};
 use akita_field::unreduced::{HasOptimizedFold, HasUnreducedOps};
 use akita_field::{AkitaError, CanonicalField, ExtField, FieldCore, FromPrimitiveInt};
 use akita_serialization::AkitaSerialize;
@@ -40,6 +41,186 @@ use class_indexed_range_leaf::ClassIndexedRangeLeafProver;
 use compact_digit_source::CompactDigitSource;
 
 type DigitRangeProveOutput<E> = (AkitaStage1Proof<E>, Vec<E>);
+
+/// Complete input to the direct low-basis digit-range proof operation.
+///
+/// Backends receive the compact live witness plus its logical Boolean-domain
+/// shape. Missing suffix columns are protocol padding and evaluate to zero.
+pub struct DirectDigitRangeProofInput<E: FieldCore> {
+    digit_witness: std::sync::Arc<[i8]>,
+    equality_point: Vec<E>,
+    plan: DigitRangePlan,
+    live_column_count: usize,
+    column_variable_count: usize,
+    ring_variable_count: usize,
+}
+
+impl<E: FieldCore> DirectDigitRangeProofInput<E> {
+    /// Build a checked direct range-proof input.
+    pub fn new(
+        digit_witness: std::sync::Arc<[i8]>,
+        equality_point: Vec<E>,
+        plan: DigitRangePlan,
+        live_column_count: usize,
+        column_variable_count: usize,
+        ring_variable_count: usize,
+    ) -> Result<Self, AkitaError> {
+        let num_vars = column_variable_count
+            .checked_add(ring_variable_count)
+            .ok_or_else(|| AkitaError::InvalidInput("digit-range width overflow".into()))?;
+        let column_shift = u32::try_from(column_variable_count)
+            .map_err(|_| AkitaError::InvalidInput("digit-range column width overflow".into()))?;
+        let column_count = 1usize
+            .checked_shl(column_shift)
+            .ok_or_else(|| AkitaError::InvalidInput("digit-range column width overflow".into()))?;
+        let ring_shift = u32::try_from(ring_variable_count)
+            .map_err(|_| AkitaError::InvalidInput("digit-range ring width overflow".into()))?;
+        let ring_len = 1usize
+            .checked_shl(ring_shift)
+            .ok_or_else(|| AkitaError::InvalidInput("digit-range ring width overflow".into()))?;
+        let expected_live_len = live_column_count.checked_mul(ring_len).ok_or_else(|| {
+            AkitaError::InvalidInput("digit-range witness length overflow".into())
+        })?;
+        if !plan.product_stage_arities().is_empty()
+            || !matches!(plan.basis(), 4 | 8)
+            || live_column_count == 0
+            || live_column_count > column_count
+            || equality_point.len() != num_vars
+            || digit_witness.len() != expected_live_len
+        {
+            return Err(AkitaError::InvalidInput(
+                "direct digit-range input has inconsistent shape".into(),
+            ));
+        }
+        Ok(Self {
+            digit_witness,
+            equality_point,
+            plan,
+            live_column_count,
+            column_variable_count,
+            ring_variable_count,
+        })
+    }
+
+    /// Compact live digit witness in column-major table order.
+    pub fn digit_witness(&self) -> &std::sync::Arc<[i8]> {
+        &self.digit_witness
+    }
+
+    /// Equality point in the same little-endian binding order as the table.
+    pub fn equality_point(&self) -> &[E] {
+        &self.equality_point
+    }
+
+    /// Range-check plan. Direct execution requires basis four or eight.
+    pub const fn plan(&self) -> DigitRangePlan {
+        self.plan
+    }
+
+    /// Number of live columns before zero-padding to the Boolean domain.
+    pub const fn live_column_count(&self) -> usize {
+        self.live_column_count
+    }
+
+    /// Number of Boolean variables selecting a padded column.
+    pub const fn column_variable_count(&self) -> usize {
+        self.column_variable_count
+    }
+
+    /// Number of Boolean variables selecting a coefficient within a column.
+    pub const fn ring_variable_count(&self) -> usize {
+        self.ring_variable_count
+    }
+}
+
+/// Backend operation for a complete direct low-basis digit-range proof.
+///
+/// The boundary is proof-shaped so an accelerator can retain and fold the
+/// virtual range-image table across rounds without exposing device buffers to
+/// the protocol driver. Implementations must append the same transcript
+/// messages and return the same proof as the canonical CPU prover.
+pub trait DirectDigitRangeProofBackend<F, E>: ComputeBackendSetup<F>
+where
+    F: FieldCore + CanonicalField,
+    E: ExtField<F> + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps + AkitaSerialize,
+{
+    /// Prove one direct range-check instance.
+    fn prove_direct_digit_range<T>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        input: DirectDigitRangeProofInput<E>,
+        transcript: &mut T,
+    ) -> Result<DigitRangeProveOutput<E>, AkitaError>
+    where
+        T: Transcript<F>;
+}
+
+fn prove_direct_digit_range_cpu<F, E, T>(
+    input: DirectDigitRangeProofInput<E>,
+    transcript: &mut T,
+) -> Result<DigitRangeProveOutput<E>, AkitaError>
+where
+    F: FieldCore + CanonicalField,
+    E: ExtField<F> + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps + AkitaSerialize,
+    T: Transcript<F>,
+{
+    let mut leaf_stage = direct_range_leaf::LowBasisRangeCheckProver::new(
+        input.digit_witness,
+        &input.equality_point,
+        input.plan,
+        input.live_column_count,
+        input.column_variable_count,
+        input.ring_variable_count,
+    )?;
+    let (sumcheck, stage1_point, _final_claim) = leaf_stage.prove::<F, T, _>(transcript, |tr| {
+        sample_ext_challenge::<F, E, T>(tr, labels::CHALLENGE_SUMCHECK_ROUND)
+    })?;
+    let proof = AkitaStage1Proof {
+        stages: vec![AkitaStage1StageProof {
+            sumcheck_proof: sumcheck,
+            child_claims: Vec::new(),
+        }],
+        range_image_evaluation: leaf_stage.final_range_image_eval(),
+        norm_proof: None,
+    };
+    Ok((proof, stage1_point))
+}
+
+impl<F, E> DirectDigitRangeProofBackend<F, E> for CpuBackend
+where
+    F: FieldCore + CanonicalField,
+    E: ExtField<F> + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps + AkitaSerialize,
+{
+    fn prove_direct_digit_range<T>(
+        &self,
+        _prepared: &Self::PreparedSetup,
+        input: DirectDigitRangeProofInput<E>,
+        transcript: &mut T,
+    ) -> Result<DigitRangeProveOutput<E>, AkitaError>
+    where
+        T: Transcript<F>,
+    {
+        prove_direct_digit_range_cpu::<F, E, T>(input, transcript)
+    }
+}
+
+impl<F, E> DirectDigitRangeProofBackend<F, E> for OpeningCluster
+where
+    F: FieldCore + CanonicalField,
+    E: ExtField<F> + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps + AkitaSerialize,
+{
+    fn prove_direct_digit_range<T>(
+        &self,
+        _prepared: &Self::PreparedSetup,
+        input: DirectDigitRangeProofInput<E>,
+        transcript: &mut T,
+    ) -> Result<DigitRangeProveOutput<E>, AkitaError>
+    where
+        T: Transcript<F>,
+    {
+        prove_direct_digit_range_cpu::<F, E, T>(input, transcript)
+    }
+}
 
 const MAX_TREE_STAGE_Q_DEGREE: usize = 4;
 const MAX_QUARTET_TABLE_CLASS_COUNT: usize = 8;
@@ -255,6 +436,47 @@ impl<E: FieldCore + FromPrimitiveInt> DigitRangeProver<E> {
 impl<E: FieldCore + FromPrimitiveInt + HasUnreducedOps + HasOptimizedFold + AkitaSerialize>
     DigitRangeProver<E>
 {
+    /// Produce stage 1 through the selected backend when the protocol uses a
+    /// direct low-basis leaf. Other range-proof routes retain the canonical CPU
+    /// choreography.
+    pub fn prove_with_backend<F, T, B>(
+        self,
+        backend: &OperationCtx<'_, F, B>,
+        transcript: &mut T,
+        physical_plan: Option<&PhysicalResponsePlan>,
+    ) -> Result<DigitRangeProveOutput<E>, AkitaError>
+    where
+        F: FieldCore + CanonicalField,
+        E: ExtField<F>,
+        T: Transcript<F>,
+        B: DirectDigitRangeProofBackend<F, E>,
+    {
+        if physical_plan.is_none() && self.plan.basis() <= 8 {
+            let Self {
+                digit_source,
+                equality_point,
+                plan,
+                live_block_count,
+                high_variable_count,
+                low_variable_count,
+            } = self;
+            let input = DirectDigitRangeProofInput::new(
+                digit_source.digits(),
+                equality_point,
+                plan,
+                live_block_count,
+                high_variable_count,
+                low_variable_count,
+            )?;
+            return backend.backend().prove_direct_digit_range(
+                backend.prepared(),
+                input,
+                transcript,
+            );
+        }
+        self.prove::<F, T>(transcript, physical_plan)
+    }
+
     /// Produce the full stage-1 tree proof and return the final `stage1_point`.
     /// An optional physical-response plan adds the scheduled norm identity to
     /// the existing final range leaf.
@@ -298,28 +520,17 @@ impl<E: FieldCore + FromPrimitiveInt + HasUnreducedOps + HasOptimizedFold + Akit
         }
         if physical_plan.is_none() && plan.basis() <= 8 {
             let _leaf_span = tracing::info_span!("digit_range_direct_leaf").entered();
-            let mut leaf_stage = direct_range_leaf::LowBasisRangeCheckProver::new(
-                digit_source.digits(),
-                &equality_point,
-                plan,
-                live_block_count,
-                high_variable_count,
-                low_variable_count,
-            )?;
-            let (sumcheck, stage1_point, _final_claim) = leaf_stage
-                .prove::<F, T, _>(transcript, |tr| {
-                    sample_ext_challenge::<F, E, T>(tr, labels::CHALLENGE_SUMCHECK_ROUND)
-                })?;
-            let range_image_eval = leaf_stage.final_range_image_eval();
-            let proof = AkitaStage1Proof {
-                stages: vec![AkitaStage1StageProof {
-                    sumcheck_proof: sumcheck,
-                    child_claims: Vec::new(),
-                }],
-                range_image_evaluation: range_image_eval,
-                norm_proof: None,
-            };
-            return Ok((proof, stage1_point));
+            return prove_direct_digit_range_cpu::<F, E, T>(
+                DirectDigitRangeProofInput::new(
+                    digit_source.digits(),
+                    equality_point,
+                    plan,
+                    live_block_count,
+                    high_variable_count,
+                    low_variable_count,
+                )?,
+                transcript,
+            );
         }
 
         if physical_plan.is_some() {

@@ -26,6 +26,9 @@ parallel = [
 akita-algebra = { version = "0.1.0", path = "../akita-algebra" }
 akita-field = { version = "0.1.0", path = "../akita-field" }
 akita-prover = { version = "0.1.0", path = "../akita-prover" }
+akita-serialization = { version = "0.1.0", path = "../akita-serialization" }
+akita-sumcheck = { version = "0.1.0", path = "../akita-sumcheck", default-features = false }
+akita-transcript = { version = "0.1.0", path = "../akita-transcript", default-features = false }
 akita-types = { version = "0.1.0", path = "../akita-types", default-features = false }
 thiserror = "2.0"
 tracing = "0.1"

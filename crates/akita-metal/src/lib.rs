@@ -19,6 +19,8 @@ pub enum MetalExecutionPolicy {
 #[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
+mod coefficient_packing;
+#[cfg(target_os = "macos")]
 mod field;
 #[cfg(target_os = "macos")]
 mod onehot;
@@ -29,10 +31,16 @@ mod packed_onehot_fp128_d512;
 #[cfg(target_os = "macos")]
 mod prepared;
 #[cfg(target_os = "macos")]
+mod recursive_commit;
+#[cfg(target_os = "macos")]
+mod ring_switch;
+#[cfg(target_os = "macos")]
 mod runtime;
 
 #[cfg(target_os = "macos")]
-pub use backend::{MetalCommitBackend, MetalCommitMetrics, MetalMatrixPrewarmMetrics};
+pub use backend::{
+    MetalCommitBackend, MetalCommitMetrics, MetalMatrixPrewarmMetrics, MetalOpeningMetrics,
+};
 #[cfg(target_os = "macos")]
 pub use prepared::MetalPreparedSetup;
 #[cfg(target_os = "macos")]

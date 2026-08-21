@@ -6,6 +6,7 @@ use crate::compute::{
     RuntimeRingSwitchProveBackend, RuntimeTensorBackendFor, SuffixOpeningProveBackend,
     SuffixTensorProveBackend,
 };
+use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend};
 use akita_field::unreduced::ReduceTo;
 use akita_field::AdditiveGroup;
 use akita_types::AkitaCommitmentHint;
@@ -97,6 +98,8 @@ where
             RecursiveFoldSource<Cfg::Field>,
             Cfg::ExtField,
         > + DigitRowsComputeBackend<Cfg::Field>
+        + DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + ComputeBackendSetup<Cfg::Field>
         + 'stack,
     TS: SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>

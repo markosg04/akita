@@ -3,6 +3,7 @@ use crate::api::commitment::commit_outer_slices;
 use crate::compute::compression::{execute_compression_chains, CompressionExecutionInput};
 use crate::compute::{CommitInnerPlan, OperationCtx, RuntimeCommitBackendFor};
 use crate::kernels::linear::decompose_commit_blocks_into;
+use crate::{CommitInnerWitness, SuffixWitnessView};
 use akita_types::{
     dispatch_for_field, CommittedSourceEncoding, CompressionChainPlan, TerminalCommittedGroupParams,
 };
@@ -25,6 +26,68 @@ pub struct NextWitnessStateOutput<F: FieldCore> {
     pub hint: AkitaCommitmentHint<F>,
 }
 
+pub(crate) struct RecursiveCommitPrefix<F: FieldCore> {
+    coeff_len: usize,
+    known_balanced_log_basis: u32,
+    inner: CommitInnerWitness<F>,
+}
+
+pub(crate) fn prepare_recursive_commit_prefix<Cfg, B>(
+    commit_params: &CommittedGroupParams,
+    expanded: &AkitaExpandedSetup<Cfg::Field>,
+    commit_ctx: &OperationCtx<'_, Cfg::Field, B>,
+    digits: &[i8],
+    known_balanced_log_basis: u32,
+) -> Result<RecursiveCommitPrefix<Cfg::Field>, AkitaError>
+where
+    Cfg: CommitmentConfig,
+    Cfg::Field: FieldCore + CanonicalField,
+    B: RuntimeCommitBackendFor<Cfg::Field, RecursiveWitnessFlat>,
+{
+    if commit_params.source_encoding != CommittedSourceEncoding::CanonicalCoefficientTable {
+        return Err(AkitaError::InvalidSetup(
+            "pipelined recursive commitment requires a canonical coefficient source".into(),
+        ));
+    }
+    let backend = commit_ctx.backend();
+    let prepared = commit_ctx.prepared();
+    backend.validate_prepared_setup(prepared, expanded)?;
+    let plan = CommitInnerPlan::from_level(commit_params);
+    let d_a = commit_params.role_dims().d_a();
+    dispatch_for_field!(
+        ProtocolDispatchSlot::Role(RingRole::Inner),
+        Cfg::Field,
+        d_a,
+        |D_A| {
+            let block_coeff_len = plan
+                .num_positions_per_block
+                .checked_mul(D_A)
+                .ok_or_else(|| AkitaError::InvalidSetup("commit block width overflow".into()))?;
+            if digits.is_empty() || !digits.len().is_multiple_of(block_coeff_len) {
+                return Err(AkitaError::InvalidSetup(
+                    "pipelined commitment prefix must contain complete source blocks".into(),
+                ));
+            }
+            let block_count = digits.len() / block_coeff_len;
+            let view = SuffixWitnessView::<Cfg::Field, D_A>::from_balanced_i8_digits(
+                digits,
+                known_balanced_log_basis,
+            )?;
+            let mut inner_group = backend.commit_inner_group(prepared, vec![view], plan)?;
+            let inner = inner_group.pop().ok_or(AkitaError::InvalidProof)?;
+            if !inner_group.is_empty() {
+                return Err(AkitaError::InvalidProof);
+            }
+            validate_commit_inner_shape::<Cfg::Field, D_A>(&inner, block_count, plan.n_a)?;
+            Ok(RecursiveCommitPrefix {
+                coeff_len: digits.len(),
+                known_balanced_log_basis,
+                inner,
+            })
+        }
+    )
+}
+
 /// Commit the next recursive witness under config `Cfg`.
 ///
 /// The commitment ring dimension is schedule-owned (`commit_params.ring_dimension`).
@@ -43,6 +106,29 @@ pub fn commit_w<Cfg, B>(
     expanded: &std::sync::Arc<AkitaExpandedSetup<Cfg::Field>>,
     commit_ctx: &OperationCtx<'_, Cfg::Field, B>,
     logical_w: &RecursiveWitnessFlat,
+) -> Result<NextWitnessStateOutput<Cfg::Field>, AkitaError>
+where
+    Cfg: CommitmentConfig,
+    Cfg::Field: FieldCore + CanonicalField + RandomSampling + HalvingField,
+    B: RuntimeCommitBackendFor<Cfg::Field, RecursiveWitnessFlat>,
+{
+    commit_w_with_prefix::<Cfg, B>(
+        commit_params,
+        fold_level,
+        expanded,
+        commit_ctx,
+        logical_w,
+        None,
+    )
+}
+
+pub(crate) fn commit_w_with_prefix<Cfg, B>(
+    commit_params: &CommittedGroupParams,
+    fold_level: usize,
+    expanded: &std::sync::Arc<AkitaExpandedSetup<Cfg::Field>>,
+    commit_ctx: &OperationCtx<'_, Cfg::Field, B>,
+    logical_w: &RecursiveWitnessFlat,
+    commit_prefix: Option<RecursiveCommitPrefix<Cfg::Field>>,
 ) -> Result<NextWitnessStateOutput<Cfg::Field>, AkitaError>
 where
     Cfg: CommitmentConfig,
@@ -106,10 +192,65 @@ where
 
             let w_view = w.view::<Cfg::Field, D_A>()?;
             let plan = CommitInnerPlan::from_level(commit_params);
-            let inner_group = backend.commit_inner_group(prepared, vec![w_view], plan)?;
-            let [inner] = inner_group
-                .try_into()
-                .map_err(|_: Vec<_>| AkitaError::InvalidProof)?;
+            let inner = if let Some(prefix) = commit_prefix {
+                if packed_witness.is_some() {
+                    return Err(AkitaError::InvalidSetup(
+                        "a tensor-packed witness cannot use a canonical commit prefix".into(),
+                    ));
+                }
+                let block_coeff_len =
+                    plan.num_positions_per_block
+                        .checked_mul(D_A)
+                        .ok_or_else(|| {
+                            AkitaError::InvalidSetup("commit block width overflow".into())
+                        })?;
+                if prefix.coeff_len == 0
+                    || !prefix.coeff_len.is_multiple_of(block_coeff_len)
+                    || prefix.coeff_len > committed_coeff_len
+                {
+                    return Err(AkitaError::InvalidSetup(
+                        "recursive commitment prefix does not cover complete source blocks".into(),
+                    ));
+                }
+                let prefix_blocks = prefix.coeff_len / block_coeff_len;
+                validate_commit_inner_shape::<Cfg::Field, D_A>(
+                    &prefix.inner,
+                    prefix_blocks,
+                    plan.n_a,
+                )?;
+                let suffix_digits = w_view
+                    .committed_i8_digits()
+                    .get(prefix.coeff_len..)
+                    .ok_or(AkitaError::InvalidProof)?;
+                let suffix_live_coeff_len = w
+                    .live_coeff_len()
+                    .checked_sub(prefix.coeff_len)
+                    .ok_or(AkitaError::InvalidProof)?;
+                let mut coefficients = prefix.inner.into_inner_rows().into_coeffs();
+                if suffix_live_coeff_len != 0 {
+                    let suffix_view = SuffixWitnessView::<Cfg::Field, D_A>::
+                        from_balanced_i8_digits_with_live_len(
+                            suffix_digits,
+                            suffix_live_coeff_len,
+                            prefix.known_balanced_log_basis,
+                        )?;
+                    let suffix_group =
+                        backend.commit_inner_group(prepared, vec![suffix_view], plan)?;
+                    let [suffix] = suffix_group
+                        .try_into()
+                        .map_err(|_: Vec<_>| AkitaError::InvalidProof)?;
+                    coefficients.extend(suffix.into_inner_rows().into_coeffs());
+                }
+                CommitInnerWitness {
+                    inner_rows: RingVec::from_coeffs_with_ring_dim(coefficients, D_A)?,
+                }
+            } else {
+                let inner_group = backend.commit_inner_group(prepared, vec![w_view], plan)?;
+                let [inner] = inner_group
+                    .try_into()
+                    .map_err(|_: Vec<_>| AkitaError::InvalidProof)?;
+                inner
+            };
             validate_commit_inner_shape::<Cfg::Field, D_A>(
                 &inner,
                 commit_params.num_live_blocks,

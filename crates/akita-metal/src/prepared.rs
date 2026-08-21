@@ -8,7 +8,7 @@ use akita_types::AkitaExpandedSetup;
 use metal::Buffer;
 
 use crate::field::{MetalField, F};
-use crate::runtime::MetalRuntime;
+use crate::runtime::{MetalRuntime, SharedSliceBuffer};
 use crate::MetalCommitError;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -28,6 +28,14 @@ pub(crate) struct MatrixPreparation {
     pub(crate) bytes: usize,
     pub(crate) cache_hit: bool,
     pub(crate) prepare_time: Duration,
+}
+
+pub(crate) struct SharedMatrixPreparation<'a> {
+    pub(crate) buffer: Buffer,
+    pub(crate) bytes: usize,
+    pub(crate) zero_copy: bool,
+    pub(crate) prepare_time: Duration,
+    marker: std::marker::PhantomData<&'a [F]>,
 }
 
 /// Setup-bound CPU fallback state and lazily packed Metal matrix prefixes.
@@ -157,6 +165,47 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
                     .checked_add(matrix.bytes)
                     .ok_or(MetalCommitError::ShapeOverflow("matrix cache bytes"))
             })
+    }
+}
+
+impl MetalPreparedSetup<F> {
+    pub(crate) fn shared_matrix(
+        &self,
+        runtime: &MetalRuntime,
+        ring_d: usize,
+        n_a: usize,
+        active_a_cols: usize,
+    ) -> Result<SharedMatrixPreparation<'_>, AkitaError> {
+        self.expanded
+            .shared_matrix
+            .ring_view_dyn(n_a, active_a_cols, ring_d)?;
+        let field_count = n_a
+            .checked_mul(active_a_cols)
+            .and_then(|count| count.checked_mul(ring_d))
+            .ok_or_else(|| MetalCommitError::ShapeOverflow("A matrix field count").into_akita())?;
+        let fields = self
+            .expanded
+            .shared_matrix
+            .as_field_slice()
+            .get(..field_count)
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup(
+                    "validated Metal A-matrix prefix is unexpectedly unavailable".into(),
+                )
+            })?;
+        let start = Instant::now();
+        let SharedSliceBuffer {
+            buffer, zero_copy, ..
+        } = runtime
+            .shared_slice_buffer(fields)
+            .map_err(MetalCommitError::into_akita)?;
+        Ok(SharedMatrixPreparation {
+            buffer,
+            bytes: size_of_val(fields),
+            zero_copy,
+            prepare_time: start.elapsed(),
+            marker: std::marker::PhantomData,
+        })
     }
 }
 

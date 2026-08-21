@@ -60,6 +60,13 @@ pub struct RecursiveFoldBatchView<'a, F: FieldCore, const D: usize> {
     polys: &'a [&'a RecursiveFoldSource<F>],
 }
 
+impl<'a, F: FieldCore, const D: usize> RecursiveFoldBatchView<'a, F, D> {
+    /// Borrow the scheduled recursive sources in claim order.
+    pub const fn sources(&self) -> &'a [&'a RecursiveFoldSource<F>] {
+        self.polys
+    }
+}
+
 impl<F: FieldCore> RootPolyMeta<F> for RecursiveFoldSource<F> {
     fn num_vars(&self) -> usize {
         match self {

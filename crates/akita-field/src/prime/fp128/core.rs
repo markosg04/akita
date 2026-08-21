@@ -8,6 +8,7 @@ use super::*;
 /// compile time from the const-generic `P`. Instantiating `Fp128` with a
 /// modulus that is not of this form is a compile-time error.
 #[cfg_attr(feature = "jolt-compat", derive(allocative::Allocative))]
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Fp128<const P: u128>(pub(crate) [u64; 2]);
 

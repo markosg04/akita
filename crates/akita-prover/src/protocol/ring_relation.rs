@@ -225,8 +225,7 @@ pub(super) fn aggregate_decompose_fold_witnesses<F: FieldCore, const D: usize>(
     };
     first.ensure_ring_dim::<D>()?;
     let row_count = first.row_count();
-    let (z_folded_rings, mut centered_coeffs) = first.into_owned_flat_parts();
-    let mut z_folded_coeffs = z_folded_rings.into_coeffs();
+    let mut centered_coeffs = first.into_centered_coeffs_flat();
 
     for witness in witnesses {
         witness.ensure_ring_dim::<D>()?;
@@ -234,12 +233,6 @@ pub(super) fn aggregate_decompose_fold_witnesses<F: FieldCore, const D: usize>(
             return Err(AkitaError::InvalidInput(
                 "batched decompose_fold witness length mismatch".to_string(),
             ));
-        }
-        for (dst, src) in z_folded_coeffs
-            .iter_mut()
-            .zip(witness.z_folded_rings.coeffs())
-        {
-            *dst += *src;
         }
         for (dst, src) in centered_coeffs
             .iter_mut()
@@ -253,10 +246,7 @@ pub(super) fn aggregate_decompose_fold_witnesses<F: FieldCore, const D: usize>(
         }
     }
 
-    DecomposeFoldWitness::from_owned_flat_parts::<D>(
-        akita_types::RingVec::from_coeffs_with_ring_dim(z_folded_coeffs, D)?,
-        centered_coeffs,
-    )
+    DecomposeFoldWitness::from_owned_centered_flat::<D>(centered_coeffs)
 }
 
 #[allow(clippy::too_many_arguments)]

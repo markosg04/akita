@@ -7,6 +7,7 @@ use crate::compute::{
     SuffixOpeningProveBackend, SuffixTensorProveBackend,
 };
 use crate::SelectedProverOpeningData;
+use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend};
 use akita_config::{
     effective_batched_schedule, ensure_prover_schedule_fits_setup, CommitmentConfig,
 };
@@ -71,6 +72,8 @@ where
             Cfg::ExtField,
         > + SuffixOpeningProveBackend<Cfg::Field>
         + DigitRowsComputeBackend<Cfg::Field>
+        + DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + 'a,
     TS: ComputeBackendSetup<Cfg::Field>
         + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
@@ -179,6 +182,8 @@ where
             Cfg::ExtField,
         > + SuffixOpeningProveBackend<Cfg::Field>
         + DigitRowsComputeBackend<Cfg::Field>
+        + DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + 'a,
     TS: ComputeBackendSetup<Cfg::Field>
         + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>

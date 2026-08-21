@@ -36,7 +36,7 @@ mod stack;
 
 pub use backend::{
     CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
-    CyclicRowsComputeBackend, DigitRowsComputeBackend, NttCacheOwnerId,
+    ComputeExecutionDomain, CyclicRowsComputeBackend, DigitRowsComputeBackend, NttCacheOwnerId,
 };
 pub use cpu::{CpuBackend, CpuPreparedSetup, PreparedCrtNttProfile, PreparedNttCacheMetric};
 pub use delegating_cpu::{CommitCluster, OpeningCluster, RingSwitchCluster, TensorCluster};

@@ -10,23 +10,12 @@ pub(crate) fn aggregate_witnesses<F: FieldCore, const D: usize>(
     first
         .ensure_ring_dim::<D>()
         .expect("witness ring dimension");
-    let mut z_folded_rings = first
-        .z_folded_rings_trusted::<D>()
-        .expect("witness ring storage")
-        .to_vec();
     let mut centered_coeffs = first.centered_coeffs_owned::<D>();
 
     for witness in rest {
         witness
             .ensure_ring_dim::<D>()
             .expect("witness ring dimension");
-        for (dst, src) in z_folded_rings.iter_mut().zip(
-            witness
-                .z_folded_rings_trusted::<D>()
-                .expect("witness ring storage"),
-        ) {
-            *dst += *src;
-        }
         for (dst, src) in centered_coeffs
             .iter_mut()
             .zip(witness.centered_coeffs_trusted::<D>())
@@ -39,5 +28,5 @@ pub(crate) fn aggregate_witnesses<F: FieldCore, const D: usize>(
         }
     }
 
-    DecomposeFoldWitness::from_parts(z_folded_rings, centered_coeffs)
+    DecomposeFoldWitness::from_centered_coefficients(centered_coeffs)
 }

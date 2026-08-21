@@ -7,6 +7,8 @@ use akita_sumcheck::reduce_signed_accum;
 use std::cmp::Ordering;
 use std::ops::Range;
 
+use super::{DirectAdditionalPair, DirectAdditionalRound};
+
 #[derive(Clone, Copy)]
 struct SparseWeight<E: FieldCore> {
     index: usize,
@@ -28,6 +30,32 @@ pub(crate) struct AdditionalRelationTerms<E: FieldCore> {
 }
 
 impl<E: FieldCore + FromPrimitiveInt> AdditionalRelationTerms<E> {
+    pub(super) fn direct_round(&self) -> DirectAdditionalRound<E> {
+        let mut pairs = Vec::with_capacity(self.weights.len());
+        let mut cursor = 0;
+        while cursor < self.weights.len() {
+            let parent = self.weights[cursor].index >> 1;
+            let mut linear = [E::zero(); 2];
+            let mut binary = [E::zero(); 2];
+            while cursor < self.weights.len() && self.weights[cursor].index >> 1 == parent {
+                let weight = self.weights[cursor];
+                let side = weight.index & 1;
+                linear[side] = weight.linear;
+                binary[side] = weight.binary;
+                cursor += 1;
+            }
+            pairs.push(DirectAdditionalPair {
+                parent,
+                linear,
+                binary,
+            });
+        }
+        DirectAdditionalRound {
+            pairs,
+            binary_batching: self.binary_batching,
+        }
+    }
+
     pub(crate) fn new(
         compact_witness: &[i8],
         domain_len: usize,

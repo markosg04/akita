@@ -3,21 +3,24 @@ mod single_field;
 
 use super::*;
 use crate::compute::{
-    ComputeBackendSetup, DigitRowsComputeBackend, ProverComputeStack, RuntimeCommitBackendFor,
-    RuntimeRingSwitchProveBackend,
+    ComputeBackendSetup, ComputeExecutionDomain, DigitRowsComputeBackend, ProverComputeStack,
+    RuntimeCommitBackendFor, RuntimeRingSwitchProveBackend,
+};
+use crate::protocol::ring_switch::{
+    commit_w_with_prefix, prepare_recursive_commit_prefix, ring_switch_build_w_pipelined,
 };
 use crate::protocol::sumcheck::relation_range_image::{
     prepare_coefficient_packing_linear_terms, PreparedProverLinearTerms,
 };
 use crate::protocol::sumcheck::DigitRangeProver;
-use crate::RecursiveWitnessFlat;
+use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend, RecursiveWitnessFlat};
 use akita_algebra::offset_eq::{materialize_eq_tensor_left, OffsetEqWindow};
 use akita_field::unreduced::ReduceTo;
 use akita_field::AdditiveGroup;
 
 use akita_types::{
-    dispatch_for_field, DigitRangeEqualityPoint, InnerCommitSecurityRoute, OpeningClaimsLayout,
-    OpeningFamily, PhysicalResponsePlan, RelationRangeImagePlan,
+    dispatch_for_field, CommittedSourceEncoding, DigitRangeEqualityPoint, InnerCommitSecurityRoute,
+    OpeningClaimsLayout, OpeningFamily, PhysicalResponsePlan, RelationRangeImagePlan,
 };
 
 pub(in crate::protocol::core) struct PhysicalL2ProverReplay<E: FieldCore> {
@@ -417,7 +420,9 @@ where
         + AkitaSerialize,
     T: Transcript<F> + ProverTranscriptGrind<F>,
     C: RuntimeCommitBackendFor<F, RecursiveWitnessFlat> + ComputeBackendSetup<F> + 'stack,
-    O: ComputeBackendSetup<F>,
+    O: ComputeBackendSetup<F>
+        + DirectDigitRangeProofBackend<F, E>
+        + DirectRelationRangeProofBackend<F, E>,
     TS: ComputeBackendSetup<F>,
     R: RuntimeRingSwitchProveBackend<F> + ComputeBackendSetup<F> + 'stack,
     <C as ComputeBackendSetup<F>>::PreparedSetup: 'stack,
@@ -430,15 +435,58 @@ where
         AkitaError::InvalidSetup("non-terminal fold is missing successor params".into())
     })?;
     let next_opening_ring_dim = next_params.inner_ring_dimension();
-    let logical_w = ring_switch_build_w::<F, R>(
-        &prepared_fold.instance,
-        prepared_fold.witness,
-        stack.ring_switch(),
-        lp,
-    )
-    .map_err(|err| {
-        AkitaError::InvalidInput(format!("ring-switch witness build failed: {err:?}"))
-    })?;
+    const PIPELINE_MIN_WITNESS_COEFFS: usize = 64 * 1024 * 1024;
+    let pipeline_params = match next_params {
+        FoldSuccessorParams::Recursive(params)
+            if params.witness.source_encoding
+                == CommittedSourceEncoding::CanonicalCoefficientTable
+                && expected_output_witness_len
+                    .is_some_and(|len| len >= PIPELINE_MIN_WITNESS_COEFFS)
+                && stack.ring_switch().backend().execution_domain()
+                    == ComputeExecutionDomain::Accelerator
+                && stack.commit().backend().execution_domain() == ComputeExecutionDomain::Host =>
+        {
+            Some(&params.witness)
+        }
+        _ => None,
+    };
+    let (logical_w, mut commit_prefix) = if let Some(params) = pipeline_params {
+        let block_coeff_len = params
+            .num_positions_per_block
+            .checked_mul(params.role_dims().d_a())
+            .ok_or_else(|| AkitaError::InvalidSetup("commit block width overflow".into()))?;
+        let (witness, prefix) = ring_switch_build_w_pipelined::<F, R, _, _>(
+            &prepared_fold.instance,
+            prepared_fold.witness,
+            stack.ring_switch(),
+            lp,
+            block_coeff_len,
+            |digits, known_balanced_log_basis| {
+                prepare_recursive_commit_prefix::<Cfg, C>(
+                    params,
+                    expanded.as_ref(),
+                    stack.commit(),
+                    digits,
+                    known_balanced_log_basis,
+                )
+            },
+        )
+        .map_err(|err| {
+            AkitaError::InvalidInput(format!("ring-switch witness build failed: {err:?}"))
+        })?;
+        (witness, Some(prefix))
+    } else {
+        let witness = ring_switch_build_w::<F, R>(
+            &prepared_fold.instance,
+            prepared_fold.witness,
+            stack.ring_switch(),
+            lp,
+        )
+        .map_err(|err| {
+            AkitaError::InvalidInput(format!("ring-switch witness build failed: {err:?}"))
+        })?;
+        (witness, None)
+    };
     let committed_witness_len = akita_types::witness_commitment_domain_len(
         logical_w.live_coeff_len(),
         next_opening_ring_dim,
@@ -458,7 +506,7 @@ where
                     "recursive successor requires outer-payload binding".into(),
                 ));
             }
-            crate::commit_w::<Cfg, C>(
+            commit_w_with_prefix::<Cfg, C>(
                 &params.witness,
                 level
                     .checked_add(1)
@@ -466,6 +514,7 @@ where
                 expanded,
                 stack.commit(),
                 &logical_w,
+                commit_prefix.take(),
             )?
         }
         FoldSuccessorParams::Terminal(params) => {
@@ -522,7 +571,13 @@ where
         prepared_fold.instance.rhs(),
     )?;
     let (stage1_proof, stage1_point, range_image_evaluation, physical_l2) =
-        prove_stage1::<F, E, T>(transcript, &mut rs, lp, &relation_range_image_plan)?;
+        prove_stage1::<F, E, T, O>(
+            transcript,
+            stack.opening(),
+            &mut rs,
+            lp,
+            &relation_range_image_plan,
+        )?;
     transcript.append_serde(
         ABSORB_RANGE_IMAGE_EVALUATION,
         &stage1_proof.range_image_evaluation,
@@ -646,9 +701,10 @@ where
     let relation_address_geometry = rs.relation_address_geometry;
     let tau1 = rs.tau1.clone();
     let alpha = rs.alpha;
-    let (stage2_sumcheck_proof, sumcheck_challenges, stage2_prover) = prove_stage2::<F, E, T>(
+    let (stage2_sumcheck_proof, sumcheck_challenges, stage2_prover) = prove_stage2::<F, E, T, O>(
         level,
         transcript,
+        stack.opening(),
         batching_coeff,
         rs,
         &stage1_point,

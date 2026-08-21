@@ -89,4 +89,16 @@ mod tests {
         let modulus = 0xffff_ffff_ffff_ffff_ffff_ffff_0000_5809;
         assert!(Fp128Limbs::from_u128(modulus).into_field(0).is_err());
     }
+
+    #[test]
+    fn field_storage_matches_device_limbs() {
+        assert_eq!(size_of::<F>(), size_of::<Fp128Limbs>());
+        let field =
+            F::from_canonical_u128_checked(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210).unwrap();
+        // SAFETY: Fp128 is transparent over two little-endian u64 limbs and
+        // Fp128Limbs is the same 16-byte value split into four u32 limbs.
+        let stored =
+            unsafe { std::ptr::read_unaligned(std::ptr::from_ref(&field).cast::<Fp128Limbs>()) };
+        assert_eq!(stored, Fp128Limbs::from_field(field));
+    }
 }

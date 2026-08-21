@@ -135,16 +135,16 @@ where
     /// Returns an error if any opening point is invalid or proof generation fails.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, name = "AkitaCommitmentScheme::batched_prove")]
-    pub fn batched_prove<'a, T, P, B>(
+    pub fn batched_prove<'a, T, P, C, O, TS, R>(
         setup: &AkitaProverSetup<Cfg::Field>,
         opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
         stacks: &'a impl LevelProveStacks<
             'a,
             Cfg::Field,
-            Commit = B,
-            Opening = B,
-            Tensor = B,
-            RingSwitch = B,
+            Commit = C,
+            Opening = O,
+            Tensor = TS,
+            RingSwitch = R,
         >,
         transcript: &mut T,
         basis: BasisMode,
@@ -153,9 +153,11 @@ where
         T: Transcript<Cfg::Field> + ProverTranscriptGrind<Cfg::Field>,
         Cfg::Field: FromPrimitiveInt + HasWide + RandomSampling + 'static,
         <Cfg::Field as HasWide>::Wide: From<Cfg::Field> + ReduceTo<Cfg::Field> + AdditiveGroup,
-        P: PreparedGroupProveOps<Cfg::Field, Cfg::ExtField, B>,
-        B: ComputeBackendSetup<Cfg::Field>
+        P: PreparedGroupProveOps<Cfg::Field, Cfg::ExtField, O>,
+        C: ComputeBackendSetup<Cfg::Field>
             + RuntimeCommitBackendFor<Cfg::Field, akita_prover::RecursiveWitnessFlat>
+            + 'a,
+        O: ComputeBackendSetup<Cfg::Field>
             + RuntimeOpeningProveBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>>
             + RuntimeCoefficientPackingBackendFor<
                 Cfg::Field,
@@ -163,15 +165,25 @@ where
                 Cfg::ExtField,
             > + SuffixOpeningProveBackend<Cfg::Field>
             + DigitRowsComputeBackend<Cfg::Field>
+            + akita_prover::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + akita_prover::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + 'a,
+        TS: ComputeBackendSetup<Cfg::Field>
             + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
             + SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>
-            + RuntimeRingSwitchProveBackend<Cfg::Field>
             + 'a,
-        <B as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        R: ComputeBackendSetup<Cfg::Field>
+            + RuntimeRingSwitchProveBackend<Cfg::Field>
+            + DigitRowsComputeBackend<Cfg::Field>
+            + 'a,
+        <C as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <O as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <TS as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <R as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
     {
         let t_prove_total = Instant::now();
         akita_config::validate_config_policy::<Cfg>()?;
-        let proof = akita_prover::batched_prove::<Cfg, T, P, B, B, B, B>(
+        let proof = akita_prover::batched_prove::<Cfg, T, P, C, O, TS, R>(
             &setup.expanded,
             &setup.prefix_slots,
             stacks,

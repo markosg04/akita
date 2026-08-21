@@ -307,9 +307,6 @@ fn emit_group_native_a_segments<F: CanonicalField, const D_GROUP: usize>(
 /// # Errors
 ///
 /// Returns an error if the ring-relation witness is missing prover-side data.
-#[tracing::instrument(skip_all, name = "ring_switch_build_w")]
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
 pub fn ring_switch_build_w<F, B>(
     instance: &RingRelationInstance<F>,
     witness: RingRelationWitness<F>,
@@ -324,6 +321,66 @@ where
         + HalvingField
         + AkitaSerialize,
     B: RuntimeRingSwitchProveBackend<F>,
+{
+    let (witness, prefix) = ring_switch_build_w_impl::<
+        F,
+        B,
+        (),
+        fn(&[i8], u32) -> Result<(), AkitaError>,
+    >(instance, witness, ring_switch_ctx, lp, None)?;
+    debug_assert!(prefix.is_none());
+    Ok(witness)
+}
+
+pub(crate) fn ring_switch_build_w_pipelined<F, B, T, C>(
+    instance: &RingRelationInstance<F>,
+    witness: RingRelationWitness<F>,
+    ring_switch_ctx: &OperationCtx<'_, F, B>,
+    lp: &CommittedGroupParams,
+    prefix_block_coeff_len: usize,
+    consume_prefix: C,
+) -> Result<(RecursiveWitnessFlat, T), AkitaError>
+where
+    F: FieldCore
+        + CanonicalField
+        + RandomSampling
+        + FromPrimitiveInt
+        + HalvingField
+        + AkitaSerialize,
+    B: RuntimeRingSwitchProveBackend<F>,
+    T: Send,
+    C: FnOnce(&[i8], u32) -> Result<T, AkitaError> + Send,
+{
+    let (witness, prefix) = ring_switch_build_w_impl(
+        instance,
+        witness,
+        ring_switch_ctx,
+        lp,
+        Some((prefix_block_coeff_len, consume_prefix)),
+    )?;
+    Ok((witness, prefix.ok_or(AkitaError::InvalidProof)?))
+}
+
+#[tracing::instrument(skip_all, name = "ring_switch_build_w")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn ring_switch_build_w_impl<F, B, T, C>(
+    instance: &RingRelationInstance<F>,
+    witness: RingRelationWitness<F>,
+    ring_switch_ctx: &OperationCtx<'_, F, B>,
+    lp: &CommittedGroupParams,
+    pipeline: Option<(usize, C)>,
+) -> Result<(RecursiveWitnessFlat, Option<T>), AkitaError>
+where
+    F: FieldCore
+        + CanonicalField
+        + RandomSampling
+        + FromPrimitiveInt
+        + HalvingField
+        + AkitaSerialize,
+    B: RuntimeRingSwitchProveBackend<F>,
+    T: Send,
+    C: FnOnce(&[i8], u32) -> Result<T, AkitaError> + Send,
 {
     let opening_batch = instance.opening_batch();
     validate_i8_setup_log_basis(lp.log_basis_open, "for i8 prover opening decomposition")?;
@@ -470,39 +527,81 @@ where
     }
     let witness_layout = instance.segment_layout(lp, None)?;
 
+    let known_balanced_log_basis = owned
+        .iter()
+        .flat_map(|group| {
+            [
+                group.params.log_basis_inner(),
+                group.params.log_basis_outer(),
+                group.params.log_basis_open(),
+            ]
+        })
+        .fold(lp.log_basis_open, u32::max);
+
     // Relation quotient `r`: each group owns a native consistency/A/B
     // block, while the level owns the shared D tail. One trailing witness
     // segment carries all quotient rows in canonical relation order.
-    let r = compute_multi_group_relation_quotient::<F, B>(
-        ring_switch_ctx,
-        lp,
-        opening_batch,
-        &owned,
-        instance.group_openings(),
-        instance.extension_degree(),
-        &d_quotients,
-        instance.rhs(),
-        compression.as_ref(),
-    )
-    .map_err(|err| {
-        AkitaError::InvalidInput(format!("relation quotient preparation failed: {err:?}"))
-    })?;
-
-    let mut out = {
+    let prepare_relation_quotient = || {
+        compute_multi_group_relation_quotient::<F, B>(
+            ring_switch_ctx,
+            lp,
+            opening_batch,
+            &owned,
+            instance.group_openings(),
+            instance.extension_degree(),
+            &d_quotients,
+            instance.rhs(),
+            compression.as_ref(),
+        )
+        .map_err(|err| {
+            AkitaError::InvalidInput(format!("relation quotient preparation failed: {err:?}"))
+        })
+    };
+    let allocate_output = || {
         let _span = tracing::info_span!("ring_switch_allocate_output").entered();
         vec![0i8; witness_layout.live_coeff_len()]
     };
-    for &group_index in &order {
-        let _span = tracing::info_span!("ring_switch_emit_group_segments", group_index).entered();
-        let group_layout = opening_batch.group_layout(group_index)?;
-        emit_group_witness_segments::<F>(
-            &mut out,
-            &witness_layout,
-            group_index,
-            &owned[group_index],
-            group_layout.num_polynomials(),
-        )?;
-    }
+    let emit_group_segments = |out: &mut [i8]| -> Result<(), AkitaError> {
+        for &group_index in &order {
+            let _span =
+                tracing::info_span!("ring_switch_emit_group_segments", group_index).entered();
+            let group_layout = opening_batch.group_layout(group_index)?;
+            emit_group_witness_segments::<F>(
+                out,
+                &witness_layout,
+                group_index,
+                &owned[group_index],
+                group_layout.num_polynomials(),
+            )?;
+        }
+        Ok(())
+    };
+
+    let (r, mut out, prefix_output) = if let Some((block_coeff_len, consume_prefix)) = pipeline {
+        if block_coeff_len == 0 {
+            return Err(AkitaError::InvalidSetup(
+                "pipelined ring switch requires a nonzero commit block width".into(),
+            ));
+        }
+        let prefix_coeff_len = witness_layout.r_range().start / block_coeff_len * block_coeff_len;
+        if prefix_coeff_len == 0 {
+            return Err(AkitaError::InvalidSetup(
+                "ring-switch body contains no complete commitment block".into(),
+            ));
+        }
+        let mut out = allocate_output();
+        let build_body_and_prefix = || -> Result<T, AkitaError> {
+            emit_group_segments(&mut out)?;
+            consume_prefix(&out[..prefix_coeff_len], known_balanced_log_basis)
+        };
+        let (r, prefix) = akita_field::cfg_join!(prepare_relation_quotient, build_body_and_prefix);
+        (r?, out, Some(prefix?))
+    } else {
+        let r = prepare_relation_quotient()?;
+        let mut out = allocate_output();
+        emit_group_segments(&mut out)?;
+        (r, out, None)
+    };
     let levels = r_decomp_levels::<F>(lp.log_basis_open);
     {
         let _span = tracing::info_span!("ring_switch_emit_r_rows").entered();
@@ -522,21 +621,11 @@ where
     #[cfg(feature = "response-model-diagnostics")]
     trace_witness_source_moments(&out, &witness_layout, lp);
 
-    // Every segment of the generated witness is balanced, but grouped
-    // roots may mix decomposition bases. The whole-buffer certificate
-    // must therefore carry the widest emitted basis: using only the
-    // root basis could incorrectly trust a later narrower commit.
-    let known_balanced_log_basis = owned
-        .iter()
-        .flat_map(|group| {
-            [
-                group.params.log_basis_inner(),
-                group.params.log_basis_outer(),
-                group.params.log_basis_open(),
-            ]
-        })
-        .fold(lp.log_basis_open, u32::max);
-    RecursiveWitnessFlat::from_witness_layout(out, &witness_layout, known_balanced_log_basis)
+    // Every segment of the generated witness is balanced, but grouped roots
+    // may mix decomposition bases, so certify the widest emitted basis.
+    let witness =
+        RecursiveWitnessFlat::from_witness_layout(out, &witness_layout, known_balanced_log_basis)?;
+    Ok((witness, prefix_output))
 }
 
 pub(super) fn balanced_decompose_centered_i32_i8_into<const D: usize>(

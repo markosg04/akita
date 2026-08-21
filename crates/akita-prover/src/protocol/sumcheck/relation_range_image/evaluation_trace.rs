@@ -14,6 +14,8 @@ use akita_types::{
     FpExtEncoding,
 };
 
+use super::{DirectLinearLayout, DirectLinearRound, DirectLinearSegment};
+
 /// One contiguous physical opening-digit run for a claim inside one witness chunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EvaluationTraceSegment {
@@ -235,6 +237,83 @@ pub(crate) struct PreparedProverLinearTerms<E: FieldCore> {
 }
 
 impl<E: FieldCore> PreparedProverLinearTerms<E> {
+    pub(super) fn direct_layout(&self) -> DirectLinearLayout<E> {
+        let mut segments = Vec::new();
+        match &self.lane_weights {
+            PreparedLaneWeights::Packing(packing) => {
+                segments.extend(packing.segments.iter().map(|segment| DirectLinearSegment {
+                    factor: segment.factor,
+                    source_index: segment.source_index,
+                    target_lane_start: segment.target_lane_start,
+                    source_lane_start: segment.source_lane_start,
+                    lane_count: segment.lane_count,
+                }));
+            }
+            PreparedLaneWeights::Sparse(lanes) => {
+                for (lane, terms) in lanes.iter().enumerate() {
+                    segments.extend(terms.iter().map(|term| DirectLinearSegment {
+                        factor: term.factor,
+                        source_index: term.source_index,
+                        target_lane_start: lane,
+                        source_lane_start: term.lane,
+                        lane_count: 1,
+                    }));
+                }
+            }
+            PreparedLaneWeights::Dense(_) => {}
+        }
+
+        let mut lane_offsets = vec![0usize; self.live_lane_count + 1];
+        for segment in &segments {
+            for lane in segment.target_lane_start..segment.target_lane_start + segment.lane_count {
+                lane_offsets[lane + 1] += 1;
+            }
+        }
+        for lane in 0..self.live_lane_count {
+            lane_offsets[lane + 1] += lane_offsets[lane];
+        }
+        let mut lane_segments = vec![0usize; *lane_offsets.last().unwrap_or(&0)];
+        let mut cursors = lane_offsets[..self.live_lane_count].to_vec();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            for cursor in cursors
+                .iter_mut()
+                .skip(segment.target_lane_start)
+                .take(segment.lane_count)
+            {
+                lane_segments[*cursor] = segment_index;
+                *cursor += 1;
+            }
+        }
+        DirectLinearLayout {
+            segments,
+            lane_offsets,
+            lane_segments,
+            source_count: self.sources.len(),
+        }
+    }
+
+    pub(super) fn direct_round(&self) -> DirectLinearRound<E> {
+        if let PreparedLaneWeights::Dense(values) = &self.lane_weights {
+            return DirectLinearRound {
+                source_values: Vec::new(),
+                source_offsets: Vec::new(),
+                dense_values: Some(values.clone()),
+            };
+        }
+        let mut source_values = Vec::new();
+        let mut source_offsets = Vec::with_capacity(self.sources.len() + 1);
+        for source in &self.sources {
+            source_offsets.push(source_values.len());
+            source_values.extend_from_slice(&source.values);
+        }
+        source_offsets.push(source_values.len());
+        DirectLinearRound {
+            source_values,
+            source_offsets,
+            dense_values: None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn source_count(&self) -> usize {
         self.sources.len()

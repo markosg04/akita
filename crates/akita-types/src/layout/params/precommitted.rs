@@ -428,7 +428,7 @@ impl PrecommittedLevelParams {
 ///
 /// Use this trait when code only needs the shared commitment geometry carried
 /// by both [`CommittedGroupParams`] and [`PrecommittedLevelParams`].
-pub trait LevelParamsLike {
+pub trait LevelParamsLike: Sync {
     fn source_encoding(&self) -> crate::CommittedSourceEncoding;
     fn opening_method(&self) -> OpeningMethod;
     fn inner_commit_matrix_params(&self) -> &InnerCommitMatrixParams;

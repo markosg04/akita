@@ -171,6 +171,21 @@ impl<'a, F: FieldCore, const D: usize> SuffixWitnessView<'a, F, D> {
         Self::from_recursive_witness(digits, digits.len(), None)
     }
 
+    pub(crate) fn from_balanced_i8_digits(
+        digits: &'a [i8],
+        known_balanced_log_basis: u32,
+    ) -> Result<Self, AkitaError> {
+        Self::from_recursive_witness(digits, digits.len(), Some(known_balanced_log_basis))
+    }
+
+    pub(crate) fn from_balanced_i8_digits_with_live_len(
+        digits: &'a [i8],
+        live_coeff_len: usize,
+        known_balanced_log_basis: u32,
+    ) -> Result<Self, AkitaError> {
+        Self::from_recursive_witness(digits, live_coeff_len, Some(known_balanced_log_basis))
+    }
+
     fn from_recursive_witness(
         digits: &'a [i8],
         live_coeff_len: usize,
@@ -215,6 +230,21 @@ impl<'a, F: FieldCore, const D: usize> SuffixWitnessView<'a, F, D> {
 
     pub fn num_ring_elems(&self) -> usize {
         self.padded_ring_elems
+    }
+
+    /// Complete commitment-domain digits, including the zero-padded suffix.
+    pub fn committed_i8_digits(&self) -> &'a [i8] {
+        self.coeffs.as_flattened()
+    }
+
+    /// Number of coefficients before commitment-domain padding.
+    pub const fn live_coeff_len(&self) -> usize {
+        self.live_coeff_len
+    }
+
+    /// Number of live ring elements before commitment-domain padding.
+    pub const fn live_ring_elems(&self) -> usize {
+        self.live_ring_elems
     }
 
     #[inline]
@@ -525,6 +555,13 @@ fn padded_ring_elems_for_live_len<const D: usize>(live_coeff_len: usize) -> usiz
 pub struct SuffixWitnessBatchView<'a, F: FieldCore, const D: usize> {
     polys: &'a [&'a RecursiveWitnessFlat],
     _marker: PhantomData<F>,
+}
+
+impl<'a, F: FieldCore, const D: usize> SuffixWitnessBatchView<'a, F, D> {
+    /// Borrow the D-agnostic witnesses in claim order.
+    pub const fn witnesses(&self) -> &'a [&'a RecursiveWitnessFlat] {
+        self.polys
+    }
 }
 
 impl<F, const D: usize> RootPolyShape<F, D> for RecursiveWitnessFlat
@@ -923,6 +960,17 @@ mod tests {
         assert_eq!(view.live_ring_elems, 70);
         assert!(view.coeffs.len() >= view.live_ring_elems);
         assert_eq!(view.num_live_blocks(10).expect("live blocks"), 7);
+    }
+
+    #[test]
+    fn suffix_view_excludes_global_commitment_padding() {
+        const D: usize = 64;
+        let digits = vec![0; 16 * D];
+        let view =
+            SuffixWitnessView::<F, D>::from_balanced_i8_digits_with_live_len(&digits, 5 * D, 3)
+                .expect("padded suffix view");
+
+        assert_eq!(view.num_live_blocks(4).expect("live blocks"), 2);
     }
 
     #[test]

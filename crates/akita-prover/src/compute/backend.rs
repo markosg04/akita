@@ -15,6 +15,15 @@ impl NttCacheOwnerId {
     }
 }
 
+/// Physical execution domain used for coarse protocol scheduling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComputeExecutionDomain {
+    /// Work primarily consumes host CPU resources.
+    Host,
+    /// Work primarily consumes an independent accelerator.
+    Accelerator,
+}
+
 /// Shared prepared-setup contract for prover compute backends.
 ///
 /// `PreparedSetup` is keyed by exact [`NttCacheKey`] prefixes at runtime.
@@ -26,6 +35,11 @@ where
 {
     /// Backend-prepared setup (ring dimension is a runtime cache key, not a type param).
     type PreparedSetup: Send + Sync;
+
+    /// Coarse resource domain used to overlap independent protocol work.
+    fn execution_domain(&self) -> ComputeExecutionDomain {
+        ComputeExecutionDomain::Host
+    }
 
     /// Prepare backend state from a prover setup wrapper.
     ///
