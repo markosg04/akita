@@ -55,6 +55,54 @@ impl<E: FieldCore + FromPrimitiveInt + HasUnreducedOps> RelationRangeImageProver
         )
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn new_backend_test_instance(
+        w_evals_compact: Vec<i8>,
+        stage1_point: &[E],
+        b: usize,
+        common_alpha_factor: Vec<E>,
+        relation_lane_weights: Vec<E>,
+        live_lane_count: usize,
+        lane_bits: usize,
+        coefficient_bits: usize,
+    ) -> Result<Self, AkitaError> {
+        let (_, coeff_count) = stage2_geometry(lane_bits, coefficient_bits)?;
+        let equality = EqPolynomial::evals(stage1_point)?;
+        let (range_image_evaluation, relation_claim) =
+            w_evals_compact.iter().zip(&equality).enumerate().fold(
+                (E::zero(), E::zero()),
+                |(range, relation), (index, (&digit, &eq))| {
+                    let witness = E::from_i64(i64::from(digit));
+                    let lane = index / coeff_count;
+                    let coefficient = index % coeff_count;
+                    (
+                        range + eq * witness * (witness + E::one()),
+                        relation
+                            + witness
+                                * common_alpha_factor[coefficient]
+                                * relation_lane_weights[lane],
+                    )
+                },
+            );
+        Self::new(
+            E::one(),
+            w_evals_compact,
+            stage1_point,
+            range_image_evaluation,
+            b,
+            common_alpha_factor,
+            relation_lane_weights,
+            live_lane_count,
+            lane_bits,
+            coefficient_bits,
+            relation_claim,
+            PreparedProverLinearTerms::zero(live_lane_count, coeff_count),
+            E::zero(),
+            None,
+        )
+    }
+
     /// Create a fused stage-2 virtual-claim + relation sumcheck prover.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, name = "RelationRangeImageProver::new")]
@@ -127,7 +175,7 @@ impl<E: FieldCore + FromPrimitiveInt + HasUnreducedOps> RelationRangeImageProver
         // `O(lane_capacity * coeff_count)` pass, so it is gated to
         // debug/test builds and never runs in release proving.
         #[cfg(debug_assertions)]
-        {
+        if linear_terms.sources_are_materialized() {
             let (ordinary_relation_sum, structured_relation_sum) = w_evals_compact
                 .chunks_exact(coeff_count)
                 .zip(&relation_lane_weights)
@@ -500,6 +548,10 @@ impl<E: FieldCore + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps>
         self.prover.linear_terms.direct_round()
     }
 
+    pub fn take_linear_round(&mut self) -> DirectLinearRound<E> {
+        self.prover.linear_terms.take_direct_round()
+    }
+
     pub fn additional_round(&self) -> DirectAdditionalRound<E> {
         self.prover.additional_relation_terms.as_ref().map_or(
             DirectAdditionalRound {
@@ -588,6 +640,20 @@ impl<E: FieldCore + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps>
         self.prover.rounds_completed += 1;
     }
 
+    pub fn bind_without_linear_terms(&mut self, challenge: E) {
+        if let Some(additional) = &mut self.prover.additional_relation_terms {
+            additional.bind(challenge);
+        }
+        self.prover.split_eq.bind(challenge);
+        if self.prover.rounds_completed < self.prover.coefficient_bits() {
+            fold_evals_in_place(&mut self.prover.common_alpha_factor, challenge);
+        } else {
+            fold_evals_in_place(&mut self.prover.relation_lane_weights, challenge);
+            self.prover.live_lane_count = self.prover.live_lane_count.div_ceil(2);
+        }
+        self.prover.rounds_completed += 1;
+    }
+
     pub fn finish(
         mut self,
         final_witness_evaluation: E,
@@ -599,10 +665,27 @@ impl<E: FieldCore + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps>
         let expected = self.prover.expected_final_claim()?;
         Ok((self.prover, expected))
     }
+
+    pub fn finish_with_linear_evaluation(
+        mut self,
+        final_witness_evaluation: E,
+        final_linear_evaluation: E,
+    ) -> Result<(RelationRangeImageProver<E>, E), AkitaError> {
+        if self.prover.rounds_completed != self.prover.num_vars {
+            return Err(AkitaError::InvalidProof);
+        }
+        self.prover.witness_state = WitnessState::FoldedSuffix(vec![final_witness_evaluation]);
+        self.prover
+            .linear_terms
+            .replace_with_final_value(final_linear_evaluation);
+        let expected = self.prover.expected_final_claim()?;
+        Ok((self.prover, expected))
+    }
 }
 
 fn prove_relation_range_cpu<F, E, T>(
     mut prover: RelationRangeImageProver<E>,
+    setup: &akita_types::AkitaExpandedSetup<F>,
     transcript: &mut T,
 ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
 where
@@ -614,6 +697,7 @@ where
         + AkitaSerialize,
     T: Transcript<F>,
 {
+    prover.linear_terms.materialize_reduced_sources(setup)?;
     let (proof, challenges, final_claim) = prover.prove::<F, T, _>(transcript, |tr| {
         sample_ext_challenge::<F, E, T>(tr, akita_transcript::labels::CHALLENGE_SUMCHECK_ROUND)
     })?;
@@ -636,14 +720,14 @@ where
 {
     fn prove_direct_relation_range<T>(
         &self,
-        _prepared: &Self::PreparedSetup,
+        prepared: &Self::PreparedSetup,
         prover: RelationRangeImageProver<E>,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where
         T: Transcript<F>,
     {
-        prove_relation_range_cpu::<F, E, T>(prover, transcript)
+        prove_relation_range_cpu::<F, E, T>(prover, prepared.expanded_setup(), transcript)
     }
 }
 
@@ -658,14 +742,14 @@ where
 {
     fn prove_direct_relation_range<T>(
         &self,
-        _prepared: &Self::PreparedSetup,
+        prepared: &Self::PreparedSetup,
         prover: RelationRangeImageProver<E>,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where
         T: Transcript<F>,
     {
-        prove_relation_range_cpu::<F, E, T>(prover, transcript)
+        prove_relation_range_cpu::<F, E, T>(prover, prepared.expanded_setup(), transcript)
     }
 }
 

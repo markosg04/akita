@@ -14,9 +14,9 @@ use akita_prover::compute::{
 };
 use akita_prover::{
     CpuBackend, CpuPreparedSetup, DirectDigitRangeProofBackend, DirectDigitRangeProofInput,
-    DirectRelationRangeProofBackend, DirectRelationRangeProofState, NttCacheOwnerId,
-    NttOperationCluster, PackedOneHotView, RecursiveFoldBatchView, RecursiveFoldView,
-    RelationRangeImageProver, SuffixWitnessBatchView, SuffixWitnessView,
+    DirectLinearSource, DirectRelationRangeProofBackend, DirectRelationRangeProofState,
+    NttCacheOwnerId, NttOperationCluster, PackedOneHotView, RecursiveFoldBatchView,
+    RecursiveFoldView, RelationRangeImageProver, SuffixWitnessBatchView, SuffixWitnessView,
 };
 use akita_sumcheck::{
     CompressedUniPoly, EqFactoredSumcheckProof, EqFactoredUniPoly, SumcheckProof,
@@ -29,9 +29,9 @@ use crate::field::{MetalField, F};
 use crate::prepared::MetalPreparedSetup;
 use crate::runtime::{
     DigitRowsParams, DirectRangeRoundOutcome, DirectRelationAdditionalPair,
-    DirectRelationLinearSegment, DirectRelationRoundData, DirectRelationRoundOutcome,
-    DirectRelationScalars, MetalDeviceCapabilities, MetalOneHotKernel, MetalRuntime,
-    PackedDecomposeFoldParams, FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
+    DirectRelationLinearSegment, DirectRelationLinearSourceInput, DirectRelationRoundData,
+    DirectRelationRoundOutcome, DirectRelationScalars, MetalDeviceCapabilities, MetalOneHotKernel,
+    MetalRuntime, PackedDecomposeFoldParams, FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
 };
 use crate::{MetalCommitError, MetalExecutionPolicy};
 
@@ -147,6 +147,10 @@ pub struct MetalOpeningMetrics {
     pub command_wall_time: Duration,
     /// Sum of GPU timestamp intervals reported by Metal.
     pub gpu_active_time: Duration,
+    /// Wall time for resident direct-relation linear-source construction.
+    pub linear_source_command_wall_time: Duration,
+    /// GPU timestamp interval for resident direct-relation linear-source construction.
+    pub linear_source_gpu_time: Duration,
     /// Host time spent constructing and populating transient dispatch buffers.
     pub upload_time: Duration,
     /// Host time spent copying shared output storage.
@@ -590,9 +594,6 @@ struct DirectRelationHostRound {
     e_first: Vec<crate::field::Fp128Limbs>,
     e_second: Vec<crate::field::Fp128Limbs>,
     alpha: Vec<crate::field::Fp128Limbs>,
-    linear_values: Vec<crate::field::Fp128Limbs>,
-    source_offsets: Vec<u32>,
-    linear_mode: usize,
     additional_pairs: Vec<DirectRelationAdditionalPair>,
     scalars: DirectRelationScalars,
     live_lane_count: usize,
@@ -604,9 +605,6 @@ impl DirectRelationHostRound {
             e_first: &self.e_first,
             e_second: &self.e_second,
             alpha: &self.alpha,
-            linear_values: &self.linear_values,
-            source_offsets: &self.source_offsets,
-            linear_mode: self.linear_mode,
             additional_pairs: &self.additional_pairs,
             scalars: self.scalars,
             live_lane_count: self.live_lane_count,
@@ -616,7 +614,6 @@ impl DirectRelationHostRound {
 
 fn direct_relation_host_round(
     state: &DirectRelationRangeProofState<F>,
-    has_factored_linear_terms: bool,
 ) -> Result<DirectRelationHostRound, AkitaError> {
     let to_limbs = |values: &[F]| {
         values
@@ -626,25 +623,6 @@ fn direct_relation_host_round(
             .collect::<Vec<_>>()
     };
     let (e_first, e_second) = state.remaining_eq_tables();
-    let linear = state.linear_round();
-    let (linear_values, source_offsets, linear_mode) = if let Some(dense) = linear.dense_values {
-        (to_limbs(&dense), Vec::new(), 2)
-    } else if has_factored_linear_terms {
-        let source_offsets = linear
-            .source_offsets
-            .into_iter()
-            .map(|offset| {
-                u32::try_from(offset).map_err(|_| {
-                    AkitaError::InvalidSetup(
-                        "direct relation source offset does not fit the Metal ABI".into(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        (to_limbs(&linear.source_values), source_offsets, 1)
-    } else {
-        (Vec::new(), Vec::new(), 0)
-    };
     let additional = state.additional_round();
     let additional_pairs = additional
         .pairs
@@ -667,9 +645,6 @@ fn direct_relation_host_round(
         e_first: to_limbs(e_first),
         e_second: to_limbs(e_second),
         alpha: to_limbs(state.common_alpha_factor()),
-        linear_values,
-        source_offsets,
-        linear_mode,
         additional_pairs,
         scalars: DirectRelationScalars {
             l_at_0: crate::field::Fp128Limbs::from_field(l_at_0),
@@ -678,6 +653,27 @@ fn direct_relation_host_round(
         },
         live_lane_count: state.current_live_lane_count(),
     })
+}
+
+fn direct_relation_reduced_source_scalars(
+    alpha: F,
+    ring_dimension: usize,
+) -> (
+    Vec<crate::field::Fp128Limbs>,
+    crate::field::Fp128Limbs,
+    crate::field::Fp128Limbs,
+) {
+    let mut power = F::one();
+    let mut powers = Vec::with_capacity(ring_dimension);
+    for _ in 0..ring_dimension {
+        powers.push(crate::field::Fp128Limbs::from_field(power));
+        power *= alpha;
+    }
+    (
+        powers,
+        crate::field::Fp128Limbs::from_field(alpha),
+        crate::field::Fp128Limbs::from_field(power + F::one()),
+    )
 }
 
 fn direct_relation_round_poly(
@@ -824,6 +820,21 @@ impl MetalCommitBackend<F> {
             metrics.upload_time += timings.buffer_setup;
             metrics.readback_time += timings.readback_copy;
             metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
+        })
+        .map_err(MetalCommitError::into_akita)
+    }
+
+    fn record_direct_relation_source_dispatch(
+        &self,
+        timings: crate::runtime::DispatchTimings,
+    ) -> Result<(), AkitaError> {
+        self.update_opening_metrics(|metrics| {
+            metrics.command_wall_time += timings.command_wall;
+            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
+            metrics.upload_time += timings.buffer_setup;
+            metrics.readback_time += timings.readback_copy;
+            metrics.linear_source_command_wall_time += timings.command_wall;
+            metrics.linear_source_gpu_time += timings.gpu.unwrap_or_default();
         })
         .map_err(MetalCommitError::into_akita)
     }
@@ -1082,11 +1093,25 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                             "direct relation target lane does not fit the Metal ABI".into(),
                         )
                     })?,
+                    target_lane_stride: u32::try_from(segment.target_lane_stride).map_err(
+                        |_| {
+                            AkitaError::InvalidSetup(
+                                "direct relation target stride does not fit the Metal ABI".into(),
+                            )
+                        },
+                    )?,
                     source_lane_start: u32::try_from(segment.source_lane_start).map_err(|_| {
                         AkitaError::InvalidSetup(
                             "direct relation source lane does not fit the Metal ABI".into(),
                         )
                     })?,
+                    source_lane_stride: u32::try_from(segment.source_lane_stride).map_err(
+                        |_| {
+                            AkitaError::InvalidSetup(
+                                "direct relation source stride does not fit the Metal ABI".into(),
+                            )
+                        },
+                    )?,
                     lane_count: u32::try_from(segment.lane_count).map_err(|_| {
                         AkitaError::InvalidSetup(
                             "direct relation lane count does not fit the Metal ABI".into(),
@@ -1119,7 +1144,6 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let has_factored_linear_terms = !linear_segments.is_empty();
         let runtime = match self.runtime() {
             Some(runtime) => runtime,
             None if self.policy() == MetalExecutionPolicy::PreferMetal => {
@@ -1134,7 +1158,82 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             .copied()
             .map(crate::field::Fp128Limbs::from_field)
             .collect::<Vec<_>>();
-        let (mut session, setup_time) = match runtime.begin_fp128_direct_relation(
+        let linear_round = if self.policy() == MetalExecutionPolicy::RequireMetal {
+            state.take_linear_round()
+        } else {
+            state.linear_round()
+        };
+        let linear_dense_values = linear_round
+            .dense_values
+            .unwrap_or_default()
+            .into_iter()
+            .map(crate::field::Fp128Limbs::from_field)
+            .collect::<Vec<_>>();
+        let linear_sources = linear_round
+            .sources
+            .into_iter()
+            .map(
+                |source| -> Result<DirectRelationLinearSourceInput, AkitaError> {
+                    Ok(match source {
+                        DirectLinearSource::Values(values) => {
+                            DirectRelationLinearSourceInput::Values(
+                                values
+                                    .into_iter()
+                                    .map(crate::field::Fp128Limbs::from_field)
+                                    .collect(),
+                            )
+                        }
+                        DirectLinearSource::ReducedSetup {
+                            ring_dimension,
+                            row_count,
+                            column_count,
+                            row_weights,
+                            alpha,
+                        } => {
+                            let matrix = prepared.shared_matrix(
+                                runtime,
+                                ring_dimension,
+                                row_count,
+                                column_count,
+                            )?;
+                            let (alpha_powers, alpha, wrap_correction) =
+                                direct_relation_reduced_source_scalars(alpha, ring_dimension);
+                            DirectRelationLinearSourceInput::ReducedSetup {
+                                matrix: matrix.buffer,
+                                ring_dimension,
+                                row_count,
+                                column_count,
+                                row_weights: row_weights
+                                    .into_iter()
+                                    .map(crate::field::Fp128Limbs::from_field)
+                                    .collect(),
+                                alpha_powers,
+                                alpha,
+                                wrap_correction,
+                            }
+                        }
+                        DirectLinearSource::ReducedSparse(source) => {
+                            let (alpha_powers, alpha, wrap_correction) =
+                                direct_relation_reduced_source_scalars(
+                                    source.alpha,
+                                    source.ring_dimension,
+                                );
+                            DirectRelationLinearSourceInput::ReducedSparse {
+                                ring_dimension: source.ring_dimension,
+                                challenge_count: source.challenge_count,
+                                term_offsets: source.term_offsets,
+                                positions: source.positions,
+                                coefficients: source.coefficients,
+                                alpha_powers,
+                                alpha,
+                                wrap_correction,
+                            }
+                        }
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        let (mut session, setup_timings) = match runtime.begin_fp128_direct_relation(
             compact_witness.as_ref(),
             domain_len,
             COMPACT_PREFIX_ROUNDS,
@@ -1143,6 +1242,8 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             &linear_segments,
             &lane_offsets,
             &lane_segments,
+            &linear_sources,
+            &linear_dense_values,
         ) {
             Ok(session) => session,
             Err(_error) if self.policy() == MetalExecutionPolicy::PreferMetal => {
@@ -1150,7 +1251,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             }
             Err(error) => return Err(error.into_akita()),
         };
-        let initial_round = direct_relation_host_round(&state, has_factored_linear_terms)?;
+        let initial_round = direct_relation_host_round(&state)?;
         let (mut next_poly, prefix_reconstruction, initial_timings, initial_allocation_bytes) =
             if let Some(prefix) = &two_round_prefix {
                 let outcome = match runtime.dispatch_fp128_direct_relation_two_round_prefix(
@@ -1207,15 +1308,17 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 )
             };
         self.record_direct_range_session(
-            setup_time,
+            Duration::ZERO,
             runtime.direct_relation_session_allocation_bytes(&session),
         )?;
+        self.record_direct_relation_source_dispatch(setup_timings)?;
         self.record_direct_range_dispatch(initial_timings, initial_allocation_bytes)?;
 
         let mut claim = state.input_claim();
         let mut round_polys = Vec::with_capacity(num_rounds);
         let mut challenges = Vec::with_capacity(num_rounds);
         let mut final_evaluation = None;
+        let mut final_linear_evaluation = None;
         transcript.append_serde(labels::ABSORB_SUMCHECK_CLAIM, &claim);
         for round in 0..num_rounds {
             transcript.append_serde(labels::ABSORB_SUMCHECK_ROUND, &next_poly);
@@ -1224,17 +1327,18 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             claim = next_poly.eval_from_hint(&claim, &challenge);
             challenges.push(challenge);
             round_polys.push(next_poly.clone());
-            state.bind(challenge);
+            state.bind_without_linear_terms(challenge);
             if round == 0 {
                 if let Some(prefix_reconstruction) = &prefix_reconstruction {
                     let prefix_weights = EqPolynomial::evals(&challenges)?
                         .into_iter()
                         .map(crate::field::Fp128Limbs::from_field)
                         .collect::<Vec<_>>();
-                    let next_round = direct_relation_host_round(&state, has_factored_linear_terms)?;
+                    let next_round = direct_relation_host_round(&state)?;
                     let additional = runtime
                         .dispatch_fp128_direct_relation_additional_compact_only(
-                            &session,
+                            &mut session,
+                            crate::field::Fp128Limbs::from_field(challenge),
                             domain_len / 2,
                             &prefix_weights,
                             next_round.as_runtime(),
@@ -1256,10 +1360,11 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                     .into_iter()
                     .map(crate::field::Fp128Limbs::from_field)
                     .collect::<Vec<_>>();
-                let next_round = direct_relation_host_round(&state, has_factored_linear_terms)?;
+                let next_round = direct_relation_host_round(&state)?;
                 let outcome = runtime
                     .dispatch_fp128_direct_relation_resume_after_two_round_prefix(
                         &mut session,
+                        crate::field::Fp128Limbs::from_field(challenge),
                         &prefix_weights,
                         next_round.as_runtime(),
                     )
@@ -1277,10 +1382,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 Vec::new()
             };
             let next_round = if round + 1 < num_rounds {
-                Some(direct_relation_host_round(
-                    &state,
-                    has_factored_linear_terms,
-                )?)
+                Some(direct_relation_host_round(&state)?)
             } else {
                 None
             };
@@ -1311,9 +1413,18 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                         .map_err(MetalCommitError::into_akita)?,
                 );
             }
+            if let Some(evaluation) = advance.final_linear_evaluation {
+                final_linear_evaluation = Some(
+                    evaluation
+                        .into_field(0)
+                        .map_err(MetalCommitError::into_akita)?,
+                );
+            }
         }
         let final_evaluation = final_evaluation.ok_or(AkitaError::InvalidProof)?;
-        let (prover, expected_claim) = state.finish(final_evaluation)?;
+        let final_linear_evaluation = final_linear_evaluation.ok_or(AkitaError::InvalidProof)?;
+        let (prover, expected_claim) =
+            state.finish_with_linear_evaluation(final_evaluation, final_linear_evaluation)?;
         if claim != expected_claim {
             return Err(AkitaError::InvalidInput(
                 "Metal stage-2 final claim disagrees with its folded oracle".into(),
@@ -1903,6 +2014,67 @@ mod tests {
         assert!(metrics.command_wall_time > Duration::ZERO);
         assert!(metrics.gpu_active_time > Duration::ZERO);
         assert!(metrics.allocation_bytes > 0);
+    }
+
+    #[test]
+    fn fp128_direct_relation_nonzero_terms_match_cpu() {
+        const COEFFICIENT_BITS: usize = 6;
+        const LANE_BITS: usize = 8;
+        const LIVE_LANES: usize = 173;
+        let num_vars = COEFFICIENT_BITS + LANE_BITS;
+        let coeff_count = 1usize << COEFFICIENT_BITS;
+        let lane_capacity = 1usize << LANE_BITS;
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            num_vars,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: 512,
+            },
+        )
+        .unwrap();
+        let digits = (0..LIVE_LANES * coeff_count)
+            .map(|index| [-2, -1, 0, 1][(index * 7 + 3) & 3])
+            .collect::<Vec<_>>();
+        let stage1_point = (0..num_vars)
+            .map(|index| F::from_u64((index * 29 + 7) as u64))
+            .collect::<Vec<_>>();
+        let common_alpha_factor = (0..coeff_count)
+            .map(|index| F::from_u64((index * 17 + 5) as u64))
+            .collect::<Vec<_>>();
+        let relation_lane_weights = (0..lane_capacity)
+            .map(|index| F::from_u64((index * 31 + 11) as u64))
+            .collect::<Vec<_>>();
+        let prover = || {
+            RelationRangeImageProver::new_backend_test_instance(
+                digits.clone(),
+                &stage1_point,
+                4,
+                common_alpha_factor.clone(),
+                relation_lane_weights.clone(),
+                LIVE_LANES,
+                LANE_BITS,
+                COEFFICIENT_BITS,
+            )
+            .unwrap()
+        };
+
+        let cpu = CpuBackend::DEFAULT;
+        let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
+        let mut cpu_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-nonzero");
+        let (expected_proof, expected_point, expected_prover) = cpu
+            .prove_direct_relation_range(&cpu_prepared, prover(), &mut cpu_transcript)
+            .unwrap();
+
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let metal_prepared = metal.prepare_setup(&setup).unwrap();
+        let mut metal_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-nonzero");
+        let (actual_proof, actual_point, actual_prover) = metal
+            .prove_direct_relation_range(&metal_prepared, prover(), &mut metal_transcript)
+            .unwrap();
+
+        assert_eq!(actual_proof, expected_proof);
+        assert_eq!(actual_point, expected_point);
+        assert_eq!(actual_prover.final_w_eval(), expected_prover.final_w_eval());
     }
 
     #[test]

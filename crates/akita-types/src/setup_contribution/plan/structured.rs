@@ -1,8 +1,5 @@
 use super::*;
-use akita_algebra::{
-    offset_eq::{eval_affine_digit_intervals, AffineWeightProduct},
-    ring::scalar_powers_with_stride,
-};
+use akita_algebra::{offset_eq::eval_affine_digit_intervals, ring::scalar_powers_with_stride};
 
 impl<E: FieldCore> SetupContributionPlan<E> {
     /// Contract one group's structured E/T/Z terms through its canonical
@@ -44,7 +41,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
         }
 
         let opening_gadget = extension_gadget::<F, E>(group.depth_open, group.log_basis_open);
-        let commitment_gadget = extension_gadget::<F, E>(group.depth_commit, group.log_basis_outer);
         let witness_gadget = extension_gadget::<F, E>(group.depth_witness, group.log_basis_inner);
         let (outer_subcolumns, _) =
             SetupProjectionGeometry::native_role_subcolumn_counts(group.role_dims)?;
@@ -61,9 +57,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             .ok_or_else(|| AkitaError::InvalidSetup("structured T stride overflow".into()))?;
         let opening_scales = (opening_subcolumns != 1)
             .then(|| scalar_powers_with_stride(alpha, group.role_dims.d_d(), opening_subcolumns))
-            .transpose()?;
-        let outer_scales = (outer_subcolumns != 1)
-            .then(|| scalar_powers_with_stride(alpha, group.role_dims.d_b(), outer_subcolumns))
             .transpose()?;
         let e_len = block_claims
             .checked_mul(e_stride)
@@ -93,31 +86,10 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             let direct_opening_gadget = projected_opening_gadget
                 .as_deref()
                 .unwrap_or(&opening_gadget);
-            let projected_commitment_gadget = outer_scales.as_ref().map(|scales| {
-                scales
-                    .iter()
-                    .flat_map(|&scale| commitment_gadget.iter().map(move |&gadget| scale * gadget))
-                    .collect::<Vec<_>>()
-            });
-            let direct_commitment_gadget = projected_commitment_gadget
-                .as_deref()
-                .unwrap_or(&commitment_gadget);
-            let t_row_stride = checked_product(
-                outer_subcolumns,
-                group.depth_commit,
-                "structured T row stride overflow",
-            )?;
-            if direct_opening_gadget.len() != e_stride
-                || direct_commitment_gadget.len() != t_row_stride
-            {
+            if direct_opening_gadget.len() != e_stride {
                 return Err(AkitaError::InvalidProof);
             }
-            // E and T share the block-claim index space, so they stay one
-            // fused fold gated on their combined width, and Z keeps its own
-            // gate. Splitting E from T would drop the multi-core reduce
-            // whenever each side alone sits under the threshold but the pair
-            // clears it.
-            let fold_et = |acc: Result<E, AkitaError>, block_claim: usize| {
+            let fold_e = |acc: Result<E, AkitaError>, block_claim: usize| {
                 let e_start = block_claim
                     .checked_mul(e_stride)
                     .ok_or(AkitaError::InvalidProof)?;
@@ -128,21 +100,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                     .zip(direct_opening_gadget)
                     .fold(E::zero(), |sum, (&eq, &gadget)| sum + eq * gadget);
 
-                let t_start = block_claim
-                    .checked_mul(t_stride)
-                    .ok_or(AkitaError::InvalidProof)?;
-                let t_eq =
-                    checked_slice(&weights.t, t_start, t_stride, "structured direct T slice")?;
-                let t = t_eq
-                    .chunks_exact(t_row_stride)
-                    .zip(group.a_row_weights.iter())
-                    .fold(E::zero(), |sum, (row, &row_weight)| {
-                        sum + row_weight
-                            * row
-                                .iter()
-                                .zip(direct_commitment_gadget)
-                                .fold(E::zero(), |inner, (&eq, &gadget)| inner + eq * gadget)
-                    });
                 let block_challenge = *block_challenges
                     .get(block_claim)
                     .ok_or(AkitaError::InvalidProof)?;
@@ -151,22 +108,19 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                 } else {
                     E::zero()
                 };
-                Ok(acc? + block_challenge * (consistency + t))
+                Ok(acc? + block_challenge * consistency)
             };
             const PARALLEL_THRESHOLD: usize = 1 << 14;
-            let et_work = e_len
-                .checked_add(t_len)
-                .ok_or_else(|| AkitaError::InvalidSetup("structured E/T width overflow".into()))?;
-            let run_et = || -> Result<E, AkitaError> {
-                if et_work >= PARALLEL_THRESHOLD {
+            let run_e = || -> Result<E, AkitaError> {
+                if e_len >= PARALLEL_THRESHOLD {
                     cfg_fold_reduce!(
                         0..block_claims,
                         || Ok(E::zero()),
-                        fold_et,
+                        fold_e,
                         |lhs: Result<E, AkitaError>, rhs: Result<E, AkitaError>| Ok(lhs? + rhs?)
                     )
                 } else {
-                    (0..block_claims).fold(Ok(E::zero()), fold_et)
+                    (0..block_claims).fold(Ok(E::zero()), fold_e)
                 }
             };
             let fold_z = |acc: Result<E, AkitaError>, position: usize| {
@@ -201,25 +155,25 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                     (0..group.num_positions_per_block).fold(Ok(E::zero()), fold_z)
                 }
             };
-            // Running E/T against Z costs one `rayon::join`, and that cost
+            // Running E against Z costs one `rayon::join`, and that cost
             // grows with the pool size, so it has to be repaid by both sides
             // at once. Requiring the smaller of the two to clear the same
             // threshold its own reduce uses keeps the fork on groups where
             // each side is independently worth a parallel reduce; a group
             // with one large and one small side runs them in sequence.
-            let (et, z) = if et_work.min(z_cols) >= PARALLEL_THRESHOLD {
-                let (et, z) = cfg_join!(run_et, run_z);
-                (et?, z?)
+            let (e, z) = if e_len.min(z_cols) >= PARALLEL_THRESHOLD {
+                let (e, z) = cfg_join!(run_e, run_z);
+                (e?, z?)
             } else {
-                (run_et()?, run_z()?)
+                (run_e()?, run_z()?)
             };
             // Z carries the group's consistency weight on every position;
             // applying it once after reduction drops one field multiplication
             // per position and leaves the contracted equation auditable.
             return Ok(if uses_evaluation_trace_consistency {
-                et + group.consistency_weight * z
+                e + group.consistency_weight * z
             } else {
-                et
+                e
             });
         }
 
@@ -228,7 +182,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             .relation_address_geometry
             .relation_coefficient_block_len();
         let opening_low = opening_scales.as_deref().unwrap_or(&[]);
-        let outer_low = outer_scales.as_deref().unwrap_or(&[]);
         let projected_digits = |gadget: &[E], ratio: usize| -> Result<Option<Vec<E>>, AkitaError> {
             if ratio == 1 {
                 return Ok(None);
@@ -243,10 +196,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
         };
         let projected_opening = projected_digits(&opening_gadget, group.d_relation_ratio)?;
         let opening_digits = projected_opening.as_deref().unwrap_or(&opening_gadget);
-        let projected_commitment = projected_digits(&commitment_gadget, group.b_relation_ratio)?;
-        let commitment_digits = projected_commitment
-            .as_deref()
-            .unwrap_or(&commitment_gadget);
 
         if group.num_claims == 0 || group.num_live_blocks == 0 {
             return Err(AkitaError::InvalidSetup(
@@ -288,17 +237,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                 .d_tensors
                 .get(tensor_index)
                 .ok_or(AkitaError::InvalidProof)?;
-            let b_tensor = if group.physical_b.logical_rows()? == 0 {
-                None
-            } else {
-                Some(
-                    group
-                        .physical_b
-                        .relation_tensors
-                        .get(tensor_index)
-                        .ok_or(AkitaError::InvalidProof)?,
-                )
-            };
             let unit = group
                 .active_unit_ranges
                 .get(unit_index)
@@ -313,12 +251,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                 .checked_mul(e_stride)
                 .ok_or(AkitaError::InvalidProof)?;
             debug_assert_eq!(d_tensor.left_offset, expected_d_offset);
-            if let Some(b_tensor) = b_tensor {
-                let expected_b_offset = setup_block
-                    .checked_mul(t_stride)
-                    .ok_or(AkitaError::InvalidProof)?;
-                debug_assert_eq!(b_tensor.left_offset, expected_b_offset);
-            }
             let claim_start = claim
                 .checked_mul(group.num_live_blocks)
                 .ok_or(AkitaError::InvalidProof)?;
@@ -334,7 +266,7 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             let e_live_len = unit_blocks
                 .checked_mul(opening_subcolumns)
                 .ok_or(AkitaError::InvalidProof)?;
-            let mut contribution = if uses_evaluation_trace_consistency {
+            let contribution = if uses_evaluation_trace_consistency {
                 group.consistency_weight
                     * eval_affine_digit_intervals(
                         point,
@@ -352,30 +284,6 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                 E::zero()
             };
 
-            if let Some(b_tensor) = b_tensor {
-                let t_high_weights =
-                    AffineWeightProduct::new(claim_challenges, &group.a_row_weights)?;
-                let t_outer_start = global_block_start
-                    .checked_mul(group.n_a)
-                    .and_then(|start| start.checked_mul(outer_subcolumns))
-                    .ok_or(AkitaError::InvalidProof)?;
-                let t_live_len = unit_blocks
-                    .checked_mul(group.n_a)
-                    .and_then(|len| len.checked_mul(outer_subcolumns))
-                    .ok_or(AkitaError::InvalidProof)?;
-                contribution += eval_affine_digit_intervals(
-                    point,
-                    &[b_tensor.right_offset],
-                    t_outer_start,
-                    t_live_len,
-                    commitment_digits.len(),
-                    1,
-                    commitment_digits,
-                    &t_high_weights,
-                    outer_low,
-                    &[],
-                )?;
-            }
             Ok(acc? + contribution)
         };
         let evaluation = if family_count == 1 {

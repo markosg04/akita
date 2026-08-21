@@ -61,6 +61,12 @@ const FP128_DIRECT_RELATION_TWO_ROUND_PREFIX_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_two_round_prefix_partials";
 const FP128_DIRECT_RELATION_TWO_ROUND_PREFIX_REDUCE_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_two_round_prefix_reduce";
+const FP128_DIRECT_RELATION_LINEAR_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_direct_relation_linear_fold";
+const FP128_DIRECT_RELATION_SETUP_SOURCE_KERNEL_NAME: &str =
+    "akita_fp128_direct_relation_setup_source";
+const FP128_DIRECT_RELATION_SPARSE_SOURCE_KERNEL_NAME: &str =
+    "akita_fp128_direct_relation_sparse_source";
 const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const FP128_D512_TASKS_PER_STREAM: usize = 32;
@@ -294,6 +300,8 @@ const _: [(); 16] = [(); size_of::<D512LinearNttPrime>()];
 pub(crate) struct DirectRangeParams {
     pub(crate) live_len: u64,
     pub(crate) current_len: u64,
+    pub(crate) current_live_len: u64,
+    pub(crate) input_live_len: u64,
     pub(crate) pair_count: u64,
     pub(crate) num_first: u64,
     pub(crate) num_second: u64,
@@ -303,13 +311,15 @@ pub(crate) struct DirectRangeParams {
     pub(crate) materialize_prefix: u64,
 }
 
-const _: [(); 72] = [(); size_of::<DirectRangeParams>()];
+const _: [(); 88] = [(); size_of::<DirectRangeParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DirectRelationParams {
     pub(crate) live_len: u64,
     pub(crate) current_len: u64,
+    pub(crate) current_live_len: u64,
+    pub(crate) input_live_len: u64,
     pub(crate) pair_count: u64,
     pub(crate) num_first: u64,
     pub(crate) num_second: u64,
@@ -324,7 +334,7 @@ pub(crate) struct DirectRelationParams {
     pub(crate) fold_lane_weights: u64,
 }
 
-const _: [(); 112] = [(); size_of::<DirectRelationParams>()];
+const _: [(); 128] = [(); size_of::<DirectRelationParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -357,11 +367,80 @@ pub(crate) struct DirectRelationLinearSegment {
     pub(crate) factor: Fp128Limbs,
     pub(crate) source_index: u32,
     pub(crate) target_lane_start: u32,
+    pub(crate) target_lane_stride: u32,
     pub(crate) source_lane_start: u32,
+    pub(crate) source_lane_stride: u32,
     pub(crate) lane_count: u32,
 }
 
-const _: [(); 32] = [(); size_of::<DirectRelationLinearSegment>()];
+const _: [(); 48] = [(); size_of::<DirectRelationLinearSegment>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DirectRelationLinearFoldParams {
+    current_coeff_count: u64,
+    source_lane_count: u64,
+    current_live_lane_count: u64,
+    output_len: u64,
+    mode: u64,
+}
+
+const _: [(); 40] = [(); size_of::<DirectRelationLinearFoldParams>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DirectRelationReducedSourceParams {
+    ring_dimension: u64,
+    row_count: u64,
+    item_count: u64,
+    reserved: u64,
+    alpha: Fp128Limbs,
+    wrap_correction: Fp128Limbs,
+}
+
+const _: [(); 64] = [(); size_of::<DirectRelationReducedSourceParams>()];
+
+pub(crate) enum DirectRelationLinearSourceInput {
+    Values(Vec<Fp128Limbs>),
+    ReducedSetup {
+        matrix: Buffer,
+        ring_dimension: usize,
+        row_count: usize,
+        column_count: usize,
+        row_weights: Vec<Fp128Limbs>,
+        alpha_powers: Vec<Fp128Limbs>,
+        alpha: Fp128Limbs,
+        wrap_correction: Fp128Limbs,
+    },
+    ReducedSparse {
+        ring_dimension: usize,
+        challenge_count: usize,
+        term_offsets: Vec<u32>,
+        positions: Vec<u32>,
+        coefficients: Vec<i8>,
+        alpha_powers: Vec<Fp128Limbs>,
+        alpha: Fp128Limbs,
+        wrap_correction: Fp128Limbs,
+    },
+}
+
+impl DirectRelationLinearSourceInput {
+    fn element_len(&self) -> Option<usize> {
+        match self {
+            Self::Values(values) => Some(values.len()),
+            Self::ReducedSetup {
+                ring_dimension,
+                column_count,
+                ..
+            } => ring_dimension.checked_mul(*column_count),
+            Self::ReducedSparse {
+                ring_dimension,
+                challenge_count,
+                ..
+            } => ring_dimension.checked_mul(*challenge_count),
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -493,6 +572,7 @@ pub(crate) struct DirectRangeSession {
     final_output: Buffer,
     live_len: usize,
     current_len: usize,
+    current_live_len: usize,
     current_table: Option<usize>,
     compact_prefix_rounds: usize,
     rounds_folded: usize,
@@ -503,9 +583,6 @@ pub(crate) struct DirectRelationRoundData<'a> {
     pub(crate) e_first: &'a [Fp128Limbs],
     pub(crate) e_second: &'a [Fp128Limbs],
     pub(crate) alpha: &'a [Fp128Limbs],
-    pub(crate) linear_values: &'a [Fp128Limbs],
-    pub(crate) source_offsets: &'a [u32],
-    pub(crate) linear_mode: usize,
     pub(crate) additional_pairs: &'a [DirectRelationAdditionalPair],
     pub(crate) scalars: DirectRelationScalars,
     pub(crate) live_lane_count: usize,
@@ -537,6 +614,7 @@ pub(crate) struct DirectRelationAdvanceOutcome {
     pub(crate) next_additional_coefficients:
         Option<[Fp128Limbs; FP128_DIRECT_RELATION_STORED_COEFFICIENTS]>,
     pub(crate) final_evaluation: Option<Fp128Limbs>,
+    pub(crate) final_linear_evaluation: Option<Fp128Limbs>,
     pub(crate) timings: DispatchTimings,
     pub(crate) allocation_bytes: usize,
 }
@@ -548,15 +626,24 @@ pub(crate) struct DirectRelationSession {
     round_output: Buffer,
     additional_output: Buffer,
     final_output: Buffer,
+    linear_final_output: Buffer,
     linear_segments: Buffer,
     lane_offsets: Buffer,
     lane_segments: Buffer,
+    linear_source_lane_offsets: Buffer,
+    linear_tables: [Buffer; 2],
+    current_linear_table: usize,
+    linear_mode: usize,
+    linear_source_lane_count: usize,
+    linear_current_coeff_count: usize,
+    linear_current_live_lane_count: usize,
     lane_weight_tables: [Buffer; 2],
     two_round_prefix_partials: Buffer,
     two_round_prefix_output: Buffer,
     two_round_prefix_max_workgroups: usize,
     live_len: usize,
     current_len: usize,
+    current_live_len: usize,
     current_table: Option<usize>,
     current_lane_weight_table: usize,
     current_lane_count: usize,
@@ -570,8 +657,6 @@ struct DirectRelationRoundBuffers {
     e_first: Buffer,
     e_second: Buffer,
     alpha: Buffer,
-    linear_values: Buffer,
-    source_offsets: Buffer,
     allocation_bytes: usize,
 }
 
@@ -650,6 +735,9 @@ pub(crate) struct MetalRuntime {
     fp128_direct_relation_additional_field_pipeline: ComputePipelineState,
     fp128_direct_relation_two_round_prefix_pipeline: ComputePipelineState,
     fp128_direct_relation_two_round_prefix_reduce_pipeline: ComputePipelineState,
+    fp128_direct_relation_linear_fold_pipeline: ComputePipelineState,
+    fp128_direct_relation_setup_source_pipeline: ComputePipelineState,
+    fp128_direct_relation_sparse_source_pipeline: ComputePipelineState,
 }
 
 fn pow_mod(mut base: i64, mut exponent: i64, modulus: i64) -> i64 {
@@ -968,6 +1056,15 @@ impl MetalRuntime {
             )?,
             fp128_direct_relation_two_round_prefix_reduce_pipeline: pipeline(
                 FP128_DIRECT_RELATION_TWO_ROUND_PREFIX_REDUCE_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_linear_fold_pipeline: pipeline(
+                FP128_DIRECT_RELATION_LINEAR_FOLD_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_setup_source_pipeline: pipeline(
+                FP128_DIRECT_RELATION_SETUP_SOURCE_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_sparse_source_pipeline: pipeline(
+                FP128_DIRECT_RELATION_SPARSE_SOURCE_KERNEL_NAME,
             )?,
             device,
         })
@@ -2305,8 +2402,15 @@ impl MetalRuntime {
         }
         let setup_start = Instant::now();
         let compact_digits = self.shared_buffer_from_slice(digits)?;
-        let first_table_len = domain_len >> compact_prefix_rounds;
-        let second_table_len = first_table_len / 2;
+        let compact_prefix_size = 1usize
+            .checked_shl(u32::try_from(compact_prefix_rounds).map_err(|_| {
+                MetalCommitError::ShapeOverflow("direct range compact prefix width")
+            })?)
+            .ok_or(MetalCommitError::ShapeOverflow(
+                "direct range compact prefix size",
+            ))?;
+        let first_table_len = digits.len().div_ceil(compact_prefix_size).max(1);
+        let second_table_len = first_table_len.div_ceil(2).max(1);
         let first_table_bytes = first_table_len.checked_mul(size_of::<Fp128Limbs>()).ok_or(
             MetalCommitError::ShapeOverflow("direct range first table bytes"),
         )?;
@@ -2319,7 +2423,7 @@ impl MetalRuntime {
             self.private_buffer(first_table_bytes)?,
             self.private_buffer(second_table_bytes)?,
         ];
-        let maximum_pairs = domain_len / 2;
+        let maximum_pairs = digits.len().div_ceil(2);
         let maximum_workgroups = direct_range_workgroups(maximum_pairs);
         let partial_bytes = maximum_workgroups
             .checked_mul(FP128_DIRECT_RANGE_STORED_COEFFICIENTS)
@@ -2355,6 +2459,7 @@ impl MetalRuntime {
                 final_output,
                 live_len: digits.len(),
                 current_len: domain_len,
+                current_live_len: digits.len(),
                 current_table: None,
                 compact_prefix_rounds,
                 rounds_folded: 0,
@@ -2372,11 +2477,11 @@ impl MetalRuntime {
         basis: usize,
     ) -> Result<DirectRangeRoundOutcome, MetalCommitError> {
         autoreleasepool(|| {
-            let pair_count = session.current_len / 2;
             let params = direct_range_params(
                 session.live_len,
                 session.current_len,
-                pair_count,
+                session.current_live_len,
+                session.current_live_len,
                 e_first,
                 e_second,
                 basis,
@@ -2440,6 +2545,7 @@ impl MetalRuntime {
                 ));
             }
             let next_len = session.current_len / 2;
+            let next_live_len = session.current_live_len.div_ceil(2);
             if next_len == 1 {
                 if next_eq.is_some() {
                     return Err(MetalCommitError::UnsupportedShape(
@@ -2459,6 +2565,7 @@ impl MetalRuntime {
                 encoder.set_buffer(0, Some(&session.tables[current_table]), 0);
                 encoder.set_buffer(1, Some(&session.final_output), 0);
                 set_inline_bytes(encoder, 2, &challenge);
+                set_inline_bytes(encoder, 3, &(session.current_live_len as u64));
                 encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
                 encoder.end_encoding();
                 let (command_wall, gpu) = complete_command(command)?;
@@ -2468,6 +2575,7 @@ impl MetalRuntime {
                     unsafe { *session.final_output.contents().cast::<Fp128Limbs>() };
                 let readback_copy = readback_start.elapsed();
                 session.current_len = 1;
+                session.current_live_len = next_live_len;
                 return Ok(DirectRangeAdvanceOutcome {
                     next_coefficients: None,
                     final_evaluation: Some(final_evaluation),
@@ -2486,11 +2594,11 @@ impl MetalRuntime {
                     "non-final direct range fold is missing equality factors".into(),
                 )
             })?;
-            let pair_count = next_len / 2;
             let mut params = direct_range_params(
                 session.live_len,
                 next_len,
-                pair_count,
+                next_live_len,
+                session.current_live_len,
                 e_first,
                 e_second,
                 basis,
@@ -2563,6 +2671,7 @@ impl MetalRuntime {
                 session.current_table = Some(output_table);
             }
             session.current_len = next_len;
+            session.current_live_len = next_live_len;
             session.rounds_folded += 1;
             Ok(DirectRangeAdvanceOutcome {
                 next_coefficients: Some(coefficients),
@@ -2601,7 +2710,9 @@ impl MetalRuntime {
         linear_segments: &[DirectRelationLinearSegment],
         lane_offsets: &[u32],
         lane_segments: &[u32],
-    ) -> Result<(DirectRelationSession, Duration), MetalCommitError> {
+        linear_sources: &[DirectRelationLinearSourceInput],
+        linear_dense_values: &[Fp128Limbs],
+    ) -> Result<(DirectRelationSession, DispatchTimings), MetalCommitError> {
         let coefficient_count = 1usize
             .checked_shl(u32::try_from(coefficient_rounds).map_err(|_| {
                 MetalCommitError::ShapeOverflow("direct relation coefficient rounds")
@@ -2609,6 +2720,59 @@ impl MetalRuntime {
             .ok_or(MetalCommitError::ShapeOverflow(
                 "direct relation coefficient count",
             ))?;
+        let live_lane_count = digits.len() / coefficient_count;
+        let linear_source_elements = linear_sources.iter().try_fold(0usize, |total, source| {
+            total
+                .checked_add(source.element_len().ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation linear source length",
+                ))?)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation linear source length",
+                ))
+        })?;
+        let linear_source_lane_count = linear_source_elements
+            .checked_div(coefficient_count)
+            .filter(|_| linear_source_elements.is_multiple_of(coefficient_count))
+            .ok_or(MetalCommitError::UnsupportedShape(
+                "factored linear source does not match the coefficient geometry".into(),
+            ))?;
+        let mut linear_source_lane_offsets = Vec::with_capacity(linear_sources.len() + 1);
+        linear_source_lane_offsets.push(0u32);
+        let mut source_lane_cursor = 0usize;
+        for source in linear_sources {
+            let source_elements = source.element_len().ok_or(MetalCommitError::ShapeOverflow(
+                "direct relation linear source length",
+            ))?;
+            let source_lanes = source_elements
+                .checked_div(coefficient_count)
+                .filter(|_| source_elements.is_multiple_of(coefficient_count))
+                .ok_or(MetalCommitError::UnsupportedShape(
+                    "direct relation source is not coefficient aligned".into(),
+                ))?;
+            source_lane_cursor = source_lane_cursor.checked_add(source_lanes).ok_or(
+                MetalCommitError::ShapeOverflow("direct relation linear source lanes"),
+            )?;
+            linear_source_lane_offsets.push(u32::try_from(source_lane_cursor).map_err(|_| {
+                MetalCommitError::ShapeOverflow("direct relation linear source lanes")
+            })?);
+        }
+        let linear_mode = if !linear_dense_values.is_empty() {
+            2
+        } else if !linear_sources.is_empty() {
+            1
+        } else {
+            0
+        };
+        let linear_shape_is_valid = match linear_mode {
+            0 => linear_dense_values.is_empty(),
+            1 => linear_source_elements != 0 && linear_dense_values.is_empty(),
+            2 => {
+                linear_sources.is_empty()
+                    && coefficient_count == 1
+                    && linear_dense_values.len() == live_lane_count
+            }
+            _ => false,
+        };
         if domain_len < 16
             || !domain_len.is_power_of_two()
             || digits.len() > domain_len
@@ -2620,6 +2784,7 @@ impl MetalRuntime {
             || !lane_weights.len().is_power_of_two()
             || coefficient_count.checked_mul(lane_weights.len()) != Some(domain_len)
             || lane_offsets.is_empty()
+            || !linear_shape_is_valid
         {
             return Err(MetalCommitError::UnsupportedShape(
                 "direct relation proof has malformed resident geometry".into(),
@@ -2627,8 +2792,15 @@ impl MetalRuntime {
         }
         let setup_start = Instant::now();
         let compact_digits = self.shared_buffer_from_slice(digits)?;
-        let first_table_len = domain_len >> compact_prefix_rounds;
-        let second_table_len = first_table_len / 2;
+        let compact_prefix_size = 1usize
+            .checked_shl(u32::try_from(compact_prefix_rounds).map_err(|_| {
+                MetalCommitError::ShapeOverflow("direct relation compact prefix width")
+            })?)
+            .ok_or(MetalCommitError::ShapeOverflow(
+                "direct relation compact prefix size",
+            ))?;
+        let first_table_len = digits.len().div_ceil(compact_prefix_size).max(1);
+        let second_table_len = first_table_len.div_ceil(2).max(1);
         let first_table_bytes = first_table_len.checked_mul(size_of::<Fp128Limbs>()).ok_or(
             MetalCommitError::ShapeOverflow("direct relation first table bytes"),
         )?;
@@ -2651,7 +2823,7 @@ impl MetalRuntime {
             self.shared_buffer_from_slice(lane_weights)?,
             self.private_buffer(second_lane_bytes)?,
         ];
-        let maximum_workgroups = direct_range_workgroups(domain_len / 2);
+        let maximum_workgroups = direct_range_workgroups(digits.len().div_ceil(2));
         let partial_bytes = maximum_workgroups
             .checked_mul(FP128_DIRECT_RELATION_STORED_COEFFICIENTS)
             .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>()))
@@ -2667,7 +2839,7 @@ impl MetalRuntime {
         let round_output = self.shared_buffer(output_bytes)?;
         let additional_output = self.shared_buffer(output_bytes)?;
         let final_output = self.shared_buffer(size_of::<Fp128Limbs>())?;
-        let live_lane_count = digits.len() / coefficient_count;
+        let linear_final_output = self.shared_buffer(size_of::<Fp128Limbs>())?;
         let two_round_prefix_max_workgroups =
             live_lane_count.div_ceil(FP128_DIRECT_RANGE_THREADS).max(1);
         let two_round_prefix_partial_bytes = two_round_prefix_max_workgroups
@@ -2688,7 +2860,9 @@ impl MetalRuntime {
             factor: Fp128Limbs::default(),
             source_index: 0,
             target_lane_start: 0,
+            target_lane_stride: 1,
             source_lane_start: 0,
+            source_lane_stride: 1,
             lane_count: 0,
         };
         let zero_u32 = 0u32;
@@ -2708,6 +2882,197 @@ impl MetalRuntime {
         } else {
             lane_segments
         })?;
+        let linear_source_lane_offsets_buffer =
+            self.shared_buffer_from_slice(if linear_source_lane_offsets.is_empty() {
+                std::slice::from_ref(&zero_u32)
+            } else {
+                &linear_source_lane_offsets
+            })?;
+        let linear_capacity = linear_source_elements
+            .max(linear_dense_values.len())
+            .max(live_lane_count)
+            .max(1);
+        let linear_table_bytes = linear_capacity.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+            MetalCommitError::ShapeOverflow("direct relation linear table bytes"),
+        )?;
+        let linear_tables = [
+            self.private_buffer(linear_table_bytes)?,
+            self.private_buffer(linear_table_bytes)?,
+        ];
+        let command = self.queue.new_command_buffer();
+        command.set_label("Akita resident direct relation linear source construction");
+        let mut command_needed = false;
+        let mut source_input_bytes = 0usize;
+        let mut source_element_offset = 0usize;
+        if !linear_dense_values.is_empty() {
+            let staging = self.shared_buffer_from_slice(linear_dense_values)?;
+            let encoder = command.new_blit_command_encoder();
+            encoder.copy_from_buffer(
+                &staging,
+                0,
+                &linear_tables[0],
+                0,
+                size_of_val(linear_dense_values) as u64,
+            );
+            encoder.end_encoding();
+            command_needed = true;
+            source_input_bytes = size_of_val(linear_dense_values);
+        }
+        for source in linear_sources {
+            let destination_offset = source_element_offset
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation linear source offset",
+                ))?;
+            match source {
+                DirectRelationLinearSourceInput::Values(values) => {
+                    let staging = self.shared_buffer_from_slice(values)?;
+                    let encoder = command.new_blit_command_encoder();
+                    encoder.copy_from_buffer(
+                        &staging,
+                        0,
+                        &linear_tables[0],
+                        destination_offset as u64,
+                        size_of_val(values.as_slice()) as u64,
+                    );
+                    encoder.end_encoding();
+                    source_input_bytes = source_input_bytes
+                        .checked_add(size_of_val(values.as_slice()))
+                        .ok_or(MetalCommitError::ShapeOverflow(
+                            "direct relation source input bytes",
+                        ))?;
+                }
+                DirectRelationLinearSourceInput::ReducedSetup {
+                    matrix,
+                    ring_dimension,
+                    row_count,
+                    column_count,
+                    row_weights,
+                    alpha_powers,
+                    alpha,
+                    wrap_correction,
+                } => {
+                    if *ring_dimension < 32
+                        || *ring_dimension > 512
+                        || !ring_dimension.is_multiple_of(32)
+                        || row_weights.len() != *row_count
+                        || alpha_powers.len() != *ring_dimension
+                    {
+                        return Err(MetalCommitError::UnsupportedShape(
+                            "reduced setup source geometry is unsupported".into(),
+                        ));
+                    }
+                    let weights = self.shared_buffer_from_slice(row_weights)?;
+                    let powers = self.shared_buffer_from_slice(alpha_powers)?;
+                    let params = DirectRelationReducedSourceParams {
+                        ring_dimension: *ring_dimension as u64,
+                        row_count: *row_count as u64,
+                        item_count: *column_count as u64,
+                        reserved: 0,
+                        alpha: *alpha,
+                        wrap_correction: *wrap_correction,
+                    };
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 reduced setup source");
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_setup_source_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(matrix), 0);
+                    encoder.set_buffer(1, Some(&weights), 0);
+                    encoder.set_buffer(2, Some(&powers), 0);
+                    encoder.set_buffer(3, Some(&linear_tables[0]), destination_offset as u64);
+                    set_inline_bytes(encoder, 4, &params);
+                    encoder.dispatch_thread_groups(
+                        MTLSize::new(*column_count as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    encoder.end_encoding();
+                    source_input_bytes = source_input_bytes
+                        .checked_add(size_of_val(row_weights.as_slice()))
+                        .and_then(|bytes| bytes.checked_add(size_of_val(alpha_powers.as_slice())))
+                        .ok_or(MetalCommitError::ShapeOverflow(
+                            "direct relation source input bytes",
+                        ))?;
+                }
+                DirectRelationLinearSourceInput::ReducedSparse {
+                    ring_dimension,
+                    challenge_count,
+                    term_offsets,
+                    positions,
+                    coefficients,
+                    alpha_powers,
+                    alpha,
+                    wrap_correction,
+                } => {
+                    if *ring_dimension < 32
+                        || *ring_dimension > 512
+                        || !ring_dimension.is_multiple_of(32)
+                        || term_offsets.len() != challenge_count + 1
+                        || positions.len() != coefficients.len()
+                        || term_offsets.last().copied().map(|offset| offset as usize)
+                            != Some(positions.len())
+                        || positions
+                            .iter()
+                            .any(|position| *position as usize >= *ring_dimension)
+                        || alpha_powers.len() != *ring_dimension
+                    {
+                        return Err(MetalCommitError::UnsupportedShape(
+                            "reduced sparse source geometry is unsupported".into(),
+                        ));
+                    }
+                    let offsets = self.shared_buffer_from_slice(term_offsets)?;
+                    let positions_buffer = self.shared_buffer_from_slice(positions)?;
+                    let coefficients_buffer = self.shared_buffer_from_slice(coefficients)?;
+                    let powers = self.shared_buffer_from_slice(alpha_powers)?;
+                    let params = DirectRelationReducedSourceParams {
+                        ring_dimension: *ring_dimension as u64,
+                        row_count: 0,
+                        item_count: *challenge_count as u64,
+                        reserved: 0,
+                        alpha: *alpha,
+                        wrap_correction: *wrap_correction,
+                    };
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 reduced sparse source");
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_sparse_source_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&offsets), 0);
+                    encoder.set_buffer(1, Some(&positions_buffer), 0);
+                    encoder.set_buffer(2, Some(&coefficients_buffer), 0);
+                    encoder.set_buffer(3, Some(&powers), 0);
+                    encoder.set_buffer(4, Some(&linear_tables[0]), destination_offset as u64);
+                    set_inline_bytes(encoder, 5, &params);
+                    encoder.dispatch_thread_groups(
+                        MTLSize::new(*challenge_count as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                    encoder.end_encoding();
+                    source_input_bytes = source_input_bytes
+                        .checked_add(size_of_val(term_offsets.as_slice()))
+                        .and_then(|bytes| bytes.checked_add(size_of_val(positions.as_slice())))
+                        .and_then(|bytes| bytes.checked_add(size_of_val(coefficients.as_slice())))
+                        .and_then(|bytes| bytes.checked_add(size_of_val(alpha_powers.as_slice())))
+                        .ok_or(MetalCommitError::ShapeOverflow(
+                            "direct relation source input bytes",
+                        ))?;
+                }
+            }
+            source_element_offset = source_element_offset
+                .checked_add(source.element_len().ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation linear source length",
+                ))?)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation linear source length",
+                ))?;
+            command_needed = true;
+        }
+        let buffer_setup = setup_start.elapsed();
+        let (command_wall, gpu) = if command_needed {
+            complete_command(command)?
+        } else {
+            (Duration::ZERO, None)
+        };
         let allocation_bytes = digits
             .len()
             .checked_add(first_table_bytes)
@@ -2715,13 +3080,17 @@ impl MetalRuntime {
             .and_then(|bytes| bytes.checked_add(partial_bytes))
             .and_then(|bytes| bytes.checked_add(2 * output_bytes))
             .and_then(|bytes| bytes.checked_add(size_of::<Fp128Limbs>()))
+            .and_then(|bytes| bytes.checked_add(size_of::<Fp128Limbs>()))
             .and_then(|bytes| bytes.checked_add(segment_bytes))
             .and_then(|bytes| bytes.checked_add(size_of_val(lane_offsets)))
             .and_then(|bytes| bytes.checked_add(size_of_val(lane_segments)))
+            .and_then(|bytes| bytes.checked_add(size_of_val(linear_source_lane_offsets.as_slice())))
+            .and_then(|bytes| bytes.checked_add(2 * linear_table_bytes))
             .and_then(|bytes| bytes.checked_add(size_of_val(lane_weights)))
             .and_then(|bytes| bytes.checked_add(second_lane_bytes))
             .and_then(|bytes| bytes.checked_add(two_round_prefix_partial_bytes))
             .and_then(|bytes| bytes.checked_add(two_round_prefix_output_bytes))
+            .and_then(|bytes| bytes.checked_add(source_input_bytes))
             .ok_or(MetalCommitError::ShapeOverflow(
                 "direct relation resident allocation bytes",
             ))?;
@@ -2733,15 +3102,24 @@ impl MetalRuntime {
                 round_output,
                 additional_output,
                 final_output,
+                linear_final_output,
                 linear_segments,
                 lane_offsets: lane_offsets_buffer,
                 lane_segments: lane_segments_buffer,
+                linear_source_lane_offsets: linear_source_lane_offsets_buffer,
+                linear_tables,
+                current_linear_table: 0,
+                linear_mode,
+                linear_source_lane_count,
+                linear_current_coeff_count: coefficient_count,
+                linear_current_live_lane_count: live_lane_count,
                 lane_weight_tables,
                 two_round_prefix_partials,
                 two_round_prefix_output,
                 two_round_prefix_max_workgroups,
                 live_len: digits.len(),
                 current_len: domain_len,
+                current_live_len: digits.len(),
                 current_table: None,
                 current_lane_weight_table: 0,
                 current_lane_count: lane_weights.len(),
@@ -2750,7 +3128,12 @@ impl MetalRuntime {
                 rounds_folded: 0,
                 allocation_bytes,
             },
-            setup_start.elapsed(),
+            DispatchTimings {
+                buffer_setup,
+                command_wall,
+                gpu,
+                readback_copy: Duration::ZERO,
+            },
         ))
     }
 
@@ -2770,7 +3153,7 @@ impl MetalRuntime {
                 || coefficient_count < 4
                 || !coefficient_count.is_power_of_two()
                 || norm_omitted_corner >= 4
-                || !matches!(round.linear_mode, 0 | 1)
+                || !matches!(session.linear_mode, 0 | 1)
             {
                 return Err(MetalCommitError::UnsupportedShape(
                     "direct relation two-round prefix state is malformed".into(),
@@ -2840,7 +3223,7 @@ impl MetalRuntime {
                 })?,
                 lanes_per_thread: lanes_per_thread as u64,
                 norm_omitted_corner: norm_omitted_corner as u64,
-                linear_mode: round.linear_mode as u64,
+                linear_mode: session.linear_mode as u64,
             };
             let mut additional_params = direct_relation_params(
                 session,
@@ -2879,8 +3262,12 @@ impl MetalRuntime {
                 Some(&session.lane_weight_tables[session.current_lane_weight_table]),
                 0,
             );
-            encoder.set_buffer(5, Some(&buffers.linear_values), 0);
-            encoder.set_buffer(6, Some(&buffers.source_offsets), 0);
+            encoder.set_buffer(
+                5,
+                Some(&session.linear_tables[session.current_linear_table]),
+                0,
+            );
+            encoder.set_buffer(6, Some(&session.linear_source_lane_offsets), 0);
             encoder.set_buffer(7, Some(&session.lane_offsets), 0);
             encoder.set_buffer(8, Some(&session.lane_segments), 0);
             encoder.set_buffer(9, Some(&session.linear_segments), 0);
@@ -2956,46 +3343,48 @@ impl MetalRuntime {
 
     pub(crate) fn dispatch_fp128_direct_relation_additional_compact_only(
         &self,
-        session: &DirectRelationSession,
+        session: &mut DirectRelationSession,
+        challenge: Fp128Limbs,
         current_len: usize,
         prefix_weights: &[Fp128Limbs],
         round: DirectRelationRoundData<'_>,
     ) -> Result<DirectRelationAdditionalOutcome, MetalCommitError> {
         autoreleasepool(|| {
-            if round.additional_pairs.is_empty() {
-                return Ok(DirectRelationAdditionalOutcome {
-                    coefficients: [Fp128Limbs::default();
-                        FP128_DIRECT_RELATION_STORED_COEFFICIENTS],
-                    timings: DispatchTimings::default(),
-                    allocation_bytes: 0,
-                });
-            }
-            let mut params = direct_relation_params(
-                session,
-                current_len,
-                session.current_lane_count,
-                false,
-                &round,
-            )?;
-            params.prefix_size = u64::try_from(prefix_weights.len()).map_err(|_| {
-                MetalCommitError::ShapeOverflow("direct relation additional prefix")
-            })?;
             let buffer_start = Instant::now();
             let prefix = self.shared_buffer_from_slice(prefix_weights)?;
-            let pairs = self.shared_buffer_from_slice(round.additional_pairs)?;
+            let pairs = (!round.additional_pairs.is_empty())
+                .then(|| self.shared_buffer_from_slice(round.additional_pairs))
+                .transpose()?;
             let buffer_setup = buffer_start.elapsed();
             let command = self.queue.new_command_buffer();
-            self.encode_direct_relation_additional_compact(
-                command,
-                session,
-                &prefix,
-                &pairs,
-                &round.scalars,
-                &params,
-            );
+            self.encode_direct_relation_linear_fold(command, session, challenge)?;
+            if let Some(pairs) = &pairs {
+                let mut params = direct_relation_params(
+                    session,
+                    current_len,
+                    session.current_lane_count,
+                    false,
+                    &round,
+                )?;
+                params.prefix_size = u64::try_from(prefix_weights.len()).map_err(|_| {
+                    MetalCommitError::ShapeOverflow("direct relation additional prefix")
+                })?;
+                self.encode_direct_relation_additional_compact(
+                    command,
+                    session,
+                    &prefix,
+                    pairs,
+                    &round.scalars,
+                    &params,
+                );
+            }
             let (command_wall, gpu) = complete_command(command)?;
             let readback_start = Instant::now();
-            let coefficients = read_direct_relation_coefficients(&session.additional_output);
+            let coefficients = if pairs.is_some() {
+                read_direct_relation_coefficients(&session.additional_output)
+            } else {
+                [Fp128Limbs::default(); FP128_DIRECT_RELATION_STORED_COEFFICIENTS]
+            };
             let readback_copy = readback_start.elapsed();
             Ok(DirectRelationAdditionalOutcome {
                 coefficients,
@@ -3017,6 +3406,7 @@ impl MetalRuntime {
     pub(crate) fn dispatch_fp128_direct_relation_resume_after_two_round_prefix(
         &self,
         session: &mut DirectRelationSession,
+        challenge: Fp128Limbs,
         prefix_weights: &[Fp128Limbs],
         round: DirectRelationRoundData<'_>,
     ) -> Result<DirectRelationRoundOutcome, MetalCommitError> {
@@ -3030,6 +3420,9 @@ impl MetalRuntime {
                 ));
             }
             let current_len = session.current_len / 4;
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 direct relation resume after two-round prefix");
+            self.encode_direct_relation_linear_fold(command, session, challenge)?;
             let mut params = direct_relation_params(
                 session,
                 current_len,
@@ -3047,8 +3440,6 @@ impl MetalRuntime {
                 Some(self.shared_buffer_from_slice(round.additional_pairs)?)
             };
             let buffer_setup = buffer_start.elapsed();
-            let command = self.queue.new_command_buffer();
-            command.set_label("Akita fp128 direct relation resume after two-round prefix");
             let encoder = command.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.fp128_direct_relation_initial_pipeline);
             encoder.set_buffer(0, Some(&session.compact_digits), 0);
@@ -3095,6 +3486,7 @@ impl MetalRuntime {
             };
             let readback_copy = readback_start.elapsed();
             session.current_len = current_len;
+            session.current_live_len = params.current_live_len as usize;
             session.rounds_folded = 2;
             Ok(DirectRelationRoundOutcome {
                 coefficients,
@@ -3231,24 +3623,45 @@ impl MetalRuntime {
                 })?;
                 let command = self.queue.new_command_buffer();
                 command.set_label("Akita fp128 direct relation final fold");
+                self.encode_direct_relation_linear_fold(command, session, challenge)?;
                 let encoder = command.new_compute_command_encoder();
                 encoder.set_compute_pipeline_state(&self.fp128_direct_range_finalize_pipeline);
                 encoder.set_buffer(0, Some(&session.tables[current_table]), 0);
                 encoder.set_buffer(1, Some(&session.final_output), 0);
                 set_inline_bytes(encoder, 2, &challenge);
+                set_inline_bytes(encoder, 3, &(session.current_live_len as u64));
                 encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
                 encoder.end_encoding();
+                if session.linear_mode != 0 {
+                    let encoder = command.new_blit_command_encoder();
+                    encoder.copy_from_buffer(
+                        &session.linear_tables[session.current_linear_table],
+                        0,
+                        &session.linear_final_output,
+                        0,
+                        size_of::<Fp128Limbs>() as u64,
+                    );
+                    encoder.end_encoding();
+                }
                 let (command_wall, gpu) = complete_command(command)?;
                 let readback_start = Instant::now();
                 // SAFETY: `final_output` contains one initialized fp128 value.
                 let final_evaluation =
                     unsafe { *session.final_output.contents().cast::<Fp128Limbs>() };
+                let final_linear_evaluation = if session.linear_mode == 0 {
+                    Fp128Limbs::default()
+                } else {
+                    // SAFETY: the final command copied one initialized fp128 value.
+                    unsafe { *session.linear_final_output.contents().cast::<Fp128Limbs>() }
+                };
                 let readback_copy = readback_start.elapsed();
                 session.current_len = 1;
+                session.current_live_len = session.current_live_len.div_ceil(2);
                 return Ok(DirectRelationAdvanceOutcome {
                     next_coefficients: None,
                     next_additional_coefficients: None,
                     final_evaluation: Some(final_evaluation),
+                    final_linear_evaluation: Some(final_linear_evaluation),
                     timings: DispatchTimings {
                         buffer_setup: Duration::ZERO,
                         command_wall,
@@ -3280,6 +3693,9 @@ impl MetalRuntime {
             } else {
                 session.current_lane_weight_table
             };
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 direct relation fold and next round");
+            self.encode_direct_relation_linear_fold(command, session, challenge)?;
             let mut params = direct_relation_params(
                 session,
                 next_len,
@@ -3321,8 +3737,6 @@ impl MetalRuntime {
                 Some(self.shared_buffer_from_slice(round.additional_pairs)?)
             };
             let buffer_setup = buffer_start.elapsed();
-            let command = self.queue.new_command_buffer();
-            command.set_label("Akita fp128 direct relation fold and next round");
             let encoder = command.new_compute_command_encoder();
             if let Some(current_table) = session.current_table {
                 encoder.set_compute_pipeline_state(&self.fp128_direct_relation_field_fold_pipeline);
@@ -3407,6 +3821,7 @@ impl MetalRuntime {
                 session.current_table = Some(output_table);
             }
             session.current_len = next_len;
+            session.current_live_len = params.current_live_len as usize;
             session.rounds_folded += 1;
             if fold_lane_weights {
                 session.current_lane_weight_table = next_lane_weight_table;
@@ -3416,6 +3831,7 @@ impl MetalRuntime {
                 next_coefficients: Some(coefficients),
                 next_additional_coefficients: Some(additional_coefficients),
                 final_evaluation: None,
+                final_linear_evaluation: None,
                 timings: DispatchTimings {
                     buffer_setup,
                     command_wall,
@@ -3436,27 +3852,97 @@ impl MetalRuntime {
         session.allocation_bytes
     }
 
+    fn encode_direct_relation_linear_fold(
+        &self,
+        command: &CommandBufferRef,
+        session: &mut DirectRelationSession,
+        challenge: Fp128Limbs,
+    ) -> Result<(), MetalCommitError> {
+        if session.linear_mode == 0 {
+            return Ok(());
+        }
+        let folding_coefficients = session.rounds_folded < session.coefficient_rounds;
+        let (mode, output_len, next_coeff_count, next_live_lane_count) = if folding_coefficients {
+            if session.linear_mode != 1 || session.linear_current_coeff_count < 2 {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "factored direct relation source is not coefficient-foldable".into(),
+                ));
+            }
+            let next_coeff_count = session.linear_current_coeff_count / 2;
+            let output_len = session
+                .linear_source_lane_count
+                .checked_mul(next_coeff_count)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "direct relation folded linear source",
+                ))?;
+            (
+                1usize,
+                output_len,
+                next_coeff_count,
+                session.linear_current_live_lane_count,
+            )
+        } else {
+            if session.linear_current_coeff_count != 1
+                || session.linear_current_live_lane_count == 0
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "direct relation linear lane source is not foldable".into(),
+                ));
+            }
+            let next_live_lane_count = session.linear_current_live_lane_count.div_ceil(2);
+            let mode = if session.linear_mode == 1 { 2 } else { 3 };
+            (mode, next_live_lane_count, 1, next_live_lane_count)
+        };
+        let params = DirectRelationLinearFoldParams {
+            current_coeff_count: u64::try_from(session.linear_current_coeff_count)
+                .map_err(|_| MetalCommitError::ShapeOverflow("direct relation linear width"))?,
+            source_lane_count: u64::try_from(session.linear_source_lane_count).map_err(|_| {
+                MetalCommitError::ShapeOverflow("direct relation linear source lanes")
+            })?,
+            current_live_lane_count: u64::try_from(session.linear_current_live_lane_count)
+                .map_err(|_| MetalCommitError::ShapeOverflow("direct relation linear lanes"))?,
+            output_len: u64::try_from(output_len).map_err(|_| {
+                MetalCommitError::ShapeOverflow("direct relation folded linear output")
+            })?,
+            mode: mode as u64,
+        };
+        let output_table = 1 - session.current_linear_table;
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_label("Akita fp128 resident direct relation linear fold");
+        encoder.set_compute_pipeline_state(&self.fp128_direct_relation_linear_fold_pipeline);
+        encoder.set_buffer(
+            0,
+            Some(&session.linear_tables[session.current_linear_table]),
+            0,
+        );
+        encoder.set_buffer(1, Some(&session.linear_tables[output_table]), 0);
+        encoder.set_buffer(2, Some(&session.linear_source_lane_offsets), 0);
+        encoder.set_buffer(3, Some(&session.lane_offsets), 0);
+        encoder.set_buffer(4, Some(&session.lane_segments), 0);
+        encoder.set_buffer(5, Some(&session.linear_segments), 0);
+        set_inline_bytes(encoder, 6, &challenge);
+        set_inline_bytes(encoder, 7, &params);
+        encoder.dispatch_threads(
+            MTLSize::new(params.output_len, 1, 1),
+            MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+        );
+        encoder.end_encoding();
+        session.current_linear_table = output_table;
+        session.linear_current_coeff_count = next_coeff_count;
+        session.linear_current_live_lane_count = next_live_lane_count;
+        if !folding_coefficients {
+            session.linear_mode = 2;
+        }
+        Ok(())
+    }
+
     fn direct_relation_round_buffers(
         &self,
         round: &DirectRelationRoundData<'_>,
     ) -> Result<DirectRelationRoundBuffers, MetalCommitError> {
-        let zero_field = Fp128Limbs::default();
-        let zero_u32 = 0u32;
-        let linear_values = if round.linear_values.is_empty() {
-            std::slice::from_ref(&zero_field)
-        } else {
-            round.linear_values
-        };
-        let source_offsets = if round.source_offsets.is_empty() {
-            std::slice::from_ref(&zero_u32)
-        } else {
-            round.source_offsets
-        };
         let allocation_bytes = size_of_val(round.e_first)
             .checked_add(size_of_val(round.e_second))
             .and_then(|bytes| bytes.checked_add(size_of_val(round.alpha)))
-            .and_then(|bytes| bytes.checked_add(size_of_val(linear_values)))
-            .and_then(|bytes| bytes.checked_add(size_of_val(source_offsets)))
             .ok_or(MetalCommitError::ShapeOverflow(
                 "direct relation round allocation bytes",
             ))?;
@@ -3464,8 +3950,6 @@ impl MetalRuntime {
             e_first: self.shared_buffer_from_slice(round.e_first)?,
             e_second: self.shared_buffer_from_slice(round.e_second)?,
             alpha: self.shared_buffer_from_slice(round.alpha)?,
-            linear_values: self.shared_buffer_from_slice(linear_values)?,
-            source_offsets: self.shared_buffer_from_slice(source_offsets)?,
             allocation_bytes,
         })
     }
@@ -3482,8 +3966,12 @@ impl MetalRuntime {
         encoder.set_buffer(start + 1, Some(&buffers.e_second), 0);
         encoder.set_buffer(start + 2, Some(&buffers.alpha), 0);
         encoder.set_buffer(start + 3, Some(lane_weights), 0);
-        encoder.set_buffer(start + 4, Some(&buffers.linear_values), 0);
-        encoder.set_buffer(start + 5, Some(&buffers.source_offsets), 0);
+        encoder.set_buffer(
+            start + 4,
+            Some(&session.linear_tables[session.current_linear_table]),
+            0,
+        );
+        encoder.set_buffer(start + 5, Some(&session.linear_source_lane_offsets), 0);
         encoder.set_buffer(start + 6, Some(&session.lane_offsets), 0);
         encoder.set_buffer(start + 7, Some(&session.lane_segments), 0);
         encoder.set_buffer(start + 8, Some(&session.linear_segments), 0);
@@ -3875,11 +4363,14 @@ fn direct_range_workgroups(pair_count: usize) -> usize {
 fn direct_range_params(
     live_len: usize,
     current_len: usize,
-    pair_count: usize,
+    current_live_len: usize,
+    input_live_len: usize,
     e_first: &[Fp128Limbs],
     e_second: &[Fp128Limbs],
     basis: usize,
 ) -> Result<DirectRangeParams, MetalCommitError> {
+    let domain_pair_count = current_len / 2;
+    let pair_count = current_live_len.div_ceil(2);
     let equality_entries =
         e_first
             .len()
@@ -3892,7 +4383,9 @@ fn direct_range_params(
         || e_second.is_empty()
         || !e_first.len().is_power_of_two()
         || !e_second.len().is_power_of_two()
-        || equality_entries != pair_count
+        || equality_entries != domain_pair_count
+        || current_live_len > current_len
+        || pair_count > domain_pair_count
     {
         return Err(MetalCommitError::UnsupportedShape(
             "direct range equality factors do not match the round geometry".into(),
@@ -3903,6 +4396,10 @@ fn direct_range_params(
             .map_err(|_| MetalCommitError::ShapeOverflow("direct range live length"))?,
         current_len: u64::try_from(current_len)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct range current length"))?,
+        current_live_len: u64::try_from(current_live_len)
+            .map_err(|_| MetalCommitError::ShapeOverflow("direct range current live length"))?,
+        input_live_len: u64::try_from(input_live_len)
+            .map_err(|_| MetalCommitError::ShapeOverflow("direct range input live length"))?,
         pair_count: u64::try_from(pair_count)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct range pair count"))?,
         num_first: u64::try_from(e_first.len())
@@ -3929,7 +4426,16 @@ fn direct_relation_params(
             "direct relation round length is malformed".into(),
         ));
     }
-    let pair_count = current_len / 2;
+    let domain_pair_count = current_len / 2;
+    let current_live_len = round.alpha.len().checked_mul(round.live_lane_count).ok_or(
+        MetalCommitError::ShapeOverflow("direct relation current live length"),
+    )?;
+    let active_pair_count = current_live_len.div_ceil(2);
+    let pair_count = if fold_lane_weights {
+        domain_pair_count
+    } else {
+        active_pair_count
+    };
     let equality_entries = round
         .e_first
         .len()
@@ -3945,29 +4451,37 @@ fn direct_relation_params(
             .ok_or(MetalCommitError::ShapeOverflow(
                 "direct relation rank-one entries",
             ))?;
-    let linear_is_valid = match round.linear_mode {
+    let linear_is_valid = match session.linear_mode {
         0 => true,
-        1 => !round.source_offsets.is_empty(),
-        2 => round.alpha.len() == 1 && round.linear_values.len() == round.live_lane_count,
+        1 => {
+            session.linear_source_lane_count != 0
+                && session.linear_current_coeff_count == round.alpha.len()
+        }
+        2 => {
+            round.alpha.len() == 1
+                && session.linear_current_live_lane_count == round.live_lane_count
+        }
         _ => false,
     };
     if round.e_first.is_empty()
         || round.e_second.is_empty()
         || !round.e_first.len().is_power_of_two()
         || !round.e_second.len().is_power_of_two()
-        || equality_entries != pair_count
+        || equality_entries != domain_pair_count
         || round.alpha.is_empty()
         || !round.alpha.len().is_power_of_two()
         || lane_count == 0
         || !lane_count.is_power_of_two()
         || relation_entries != current_len
+        || current_live_len > current_len
+        || active_pair_count > domain_pair_count
         || round.live_lane_count > lane_count
         || (fold_lane_weights && round.alpha.len() != 1)
         || !linear_is_valid
         || round
             .additional_pairs
             .iter()
-            .any(|pair| pair.parent >= pair_count as u64)
+            .any(|pair| pair.parent >= domain_pair_count as u64)
     {
         return Err(MetalCommitError::UnsupportedShape(
             "direct relation factors do not match the round geometry".into(),
@@ -3983,6 +4497,10 @@ fn direct_relation_params(
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation live length"))?,
         current_len: u64::try_from(current_len)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation current length"))?,
+        current_live_len: u64::try_from(current_live_len)
+            .map_err(|_| MetalCommitError::ShapeOverflow("direct relation current live length"))?,
+        input_live_len: u64::try_from(session.current_live_len)
+            .map_err(|_| MetalCommitError::ShapeOverflow("direct relation input live length"))?,
         pair_count: u64::try_from(pair_count)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation pair count"))?,
         num_first: u64::try_from(round.e_first.len())
@@ -3998,7 +4516,7 @@ fn direct_relation_params(
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation live lanes"))?,
         prefix_size: 1,
         materialize_prefix: 0,
-        linear_mode: round.linear_mode as u64,
+        linear_mode: session.linear_mode as u64,
         additional_pair_count: u64::try_from(round.additional_pairs.len()).map_err(|_| {
             MetalCommitError::ShapeOverflow("direct relation additional pair count")
         })?,
@@ -4151,4 +4669,204 @@ fn completed_commands_gpu_span(
         return None;
     }
     Some(Duration::from_secs_f64(end - start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use akita_algebra::ring::eval_flat_negacyclic_shift_sequence_into;
+
+    #[test]
+    fn packed_d512_decompose_fold_matches_cpu() {
+        const POSITIONS: usize = 9;
+        const BLOCKS_PER_COLUMN: usize = 2;
+        const COLUMNS: usize = 3;
+        const CHALLENGE_WEIGHT: usize = 4;
+        let runtime = MetalRuntime::new().unwrap();
+        let num_rows = 2 * POSITIONS * BLOCKS_PER_COLUMN;
+        let lanes = (0..num_rows * COLUMNS)
+            .map(|index| match index % 11 {
+                0 => 0,
+                1 => 255,
+                _ => 1 + ((17 * index + 29) % 254) as u8,
+            })
+            .collect::<Vec<_>>();
+        let mut challenge_positions = Vec::new();
+        let mut challenge_coefficients = Vec::new();
+        for challenge in 0..COLUMNS * BLOCKS_PER_COLUMN {
+            for term in 0..CHALLENGE_WEIGHT {
+                challenge_positions.push(((97 * challenge + 131 * term) % 512) as u16);
+                challenge_coefficients.push([1, -2, 3, -4][term]);
+            }
+        }
+        let params = PackedDecomposeFoldParams {
+            num_rows: num_rows as u64,
+            num_columns: COLUMNS as u64,
+            lane_stride: COLUMNS as u64,
+            num_positions: POSITIONS as u64,
+            blocks_per_column: BLOCKS_PER_COLUMN as u64,
+            challenge_weight: CHALLENGE_WEIGHT as u64,
+            output_coefficients: (POSITIONS * 512) as u64,
+        };
+        let actual = runtime
+            .dispatch_packed_fp128_d512_decompose_fold(
+                &lanes,
+                &challenge_positions,
+                &challenge_coefficients,
+                params,
+            )
+            .unwrap()
+            .centered_coefficients;
+
+        let mut expected = vec![0i32; POSITIONS * 512];
+        for position in 0..POSITIONS {
+            for trace_block in 0..BLOCKS_PER_COLUMN {
+                for column in 0..COLUMNS {
+                    for row_in_ring in 0..2 {
+                        let ring = trace_block * POSITIONS + position;
+                        let row = 2 * ring + row_in_ring;
+                        let hot = usize::from(lanes[row * COLUMNS + column]);
+                        if hot == 0 {
+                            continue;
+                        }
+                        let source_coefficient = row_in_ring * 256 + hot;
+                        let challenge = column * BLOCKS_PER_COLUMN + trace_block;
+                        let challenge_start = challenge * CHALLENGE_WEIGHT;
+                        for term in 0..CHALLENGE_WEIGHT {
+                            let mut destination = source_coefficient
+                                + usize::from(challenge_positions[challenge_start + term]);
+                            let mut value =
+                                i32::from(challenge_coefficients[challenge_start + term]);
+                            if destination >= 512 {
+                                destination -= 512;
+                                value = -value;
+                            }
+                            expected[position * 512 + destination] += value;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reduced_linear_sources_match_cpu_recurrence() {
+        const D: usize = 64;
+        let runtime = MetalRuntime::new().unwrap();
+        let alpha = F::from_i64(7);
+        let row_weights = [F::from_i64(3), F::from_i64(-5)];
+        let matrix = (0..2 * D)
+            .map(|index| F::from_i64((index as i64 % 19) - 9))
+            .collect::<Vec<_>>();
+        let matrix_limbs = matrix
+            .iter()
+            .copied()
+            .map(Fp128Limbs::from_field)
+            .collect::<Vec<_>>();
+        let matrix_buffer = runtime.shared_buffer_from_slice(&matrix_limbs).unwrap();
+        let mut power = F::one();
+        let mut alpha_powers = Vec::with_capacity(D);
+        for _ in 0..D {
+            alpha_powers.push(Fp128Limbs::from_field(power));
+            power *= alpha;
+        }
+        let alpha_limbs = Fp128Limbs::from_field(alpha);
+        let wrap_correction = Fp128Limbs::from_field(power + F::one());
+        let sources = vec![
+            DirectRelationLinearSourceInput::ReducedSetup {
+                matrix: matrix_buffer,
+                ring_dimension: D,
+                row_count: 2,
+                column_count: 1,
+                row_weights: row_weights
+                    .into_iter()
+                    .map(Fp128Limbs::from_field)
+                    .collect(),
+                alpha_powers: alpha_powers.clone(),
+                alpha: alpha_limbs,
+                wrap_correction,
+            },
+            DirectRelationLinearSourceInput::ReducedSparse {
+                ring_dimension: D,
+                challenge_count: 1,
+                term_offsets: vec![0, 3],
+                positions: vec![0, 11, 63],
+                coefficients: vec![1, -2, 3],
+                alpha_powers,
+                alpha: alpha_limbs,
+                wrap_correction,
+            },
+        ];
+        let segments = [
+            DirectRelationLinearSegment {
+                factor: Fp128Limbs::from_field(F::one()),
+                source_index: 0,
+                target_lane_start: 0,
+                target_lane_stride: 1,
+                source_lane_start: 0,
+                source_lane_stride: 1,
+                lane_count: 1,
+            },
+            DirectRelationLinearSegment {
+                factor: Fp128Limbs::from_field(F::one()),
+                source_index: 1,
+                target_lane_start: 0,
+                target_lane_stride: 1,
+                source_lane_start: 0,
+                source_lane_stride: 1,
+                lane_count: 1,
+            },
+        ];
+        let (session, _) = runtime
+            .begin_fp128_direct_relation(
+                &[0i8; D],
+                D,
+                3,
+                D.trailing_zeros() as usize,
+                &[Fp128Limbs::from_field(F::zero())],
+                &segments,
+                &[0, 2],
+                &[0, 1],
+                &sources,
+                &[],
+            )
+            .unwrap();
+        let output = runtime
+            .shared_buffer(2 * D * size_of::<Fp128Limbs>())
+            .unwrap();
+        let command = runtime.queue.new_command_buffer();
+        let encoder = command.new_blit_command_encoder();
+        encoder.copy_from_buffer(
+            &session.linear_tables[0],
+            0,
+            &output,
+            0,
+            (2 * D * size_of::<Fp128Limbs>()) as u64,
+        );
+        encoder.end_encoding();
+        complete_command(command).unwrap();
+        let actual =
+            unsafe { std::slice::from_raw_parts(output.contents().cast::<Fp128Limbs>(), 2 * D) }
+                .iter()
+                .enumerate()
+                .map(|(index, value)| value.into_field(index).unwrap())
+                .collect::<Vec<_>>();
+
+        let combined = (0..D)
+            .map(|coefficient| {
+                row_weights[0] * matrix[coefficient] + row_weights[1] * matrix[D + coefficient]
+            })
+            .collect::<Vec<_>>();
+        let mut expected_setup = vec![F::zero(); D];
+        eval_flat_negacyclic_shift_sequence_into(&combined, alpha, &mut expected_setup);
+        let mut sparse = vec![F::zero(); D];
+        sparse[0] = F::from_i64(1);
+        sparse[11] = F::from_i64(-2);
+        sparse[63] = F::from_i64(3);
+        let mut expected_sparse = vec![F::zero(); D];
+        eval_flat_negacyclic_shift_sequence_into(&sparse, alpha, &mut expected_sparse);
+        assert_eq!(actual[..D], expected_setup);
+        assert_eq!(actual[D..], expected_sparse);
+    }
 }

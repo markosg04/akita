@@ -18,8 +18,9 @@ pub use digit_range::{
 pub(crate) use relation_range_image::AdditionalRelationTerms;
 pub use relation_range_image::{
     DirectAdditionalPair, DirectAdditionalRound, DirectLinearLayout, DirectLinearRound,
-    DirectLinearSegment, DirectRelationRangeProofBackend, DirectRelationRangeProofState,
-    DirectRelationTwoRoundPrefixData, DirectRelationTwoRoundPrefixState, RelationRangeImageProver,
+    DirectLinearSegment, DirectLinearSource, DirectRelationRangeProofBackend,
+    DirectRelationRangeProofState, DirectRelationTwoRoundPrefixData,
+    DirectRelationTwoRoundPrefixState, DirectSparseLinearSource, RelationRangeImageProver,
 };
 
 // --- Shared helpers ------------------------------------------------------

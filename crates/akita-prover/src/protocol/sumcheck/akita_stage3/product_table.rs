@@ -36,9 +36,10 @@ pub(super) struct RectangularSetupProductTerm<'a, F: FieldCore, E: FieldCore> {
     coefficient_rounds: usize,
     total_rounds: usize,
     coefficient_challenges: Vec<E>,
-    coefficient_table: Vec<E>,
-    coefficient_factor: Vec<E>,
+    coefficient_tables: Vec<Vec<E>>,
+    coefficient_factors: Vec<Vec<E>>,
     index_table: Option<Vec<E>>,
+    index_factors: Vec<Vec<E>>,
     index_factor: Vec<E>,
     input_claim: E,
 }
@@ -48,26 +49,50 @@ where
     F: FieldCore,
     E: FieldCore + FromPrimitiveInt + MulBaseUnreduced<F>,
 {
+    #[cfg(test)]
     pub(super) fn new(
         setup: &'a [F],
         required_rows: usize,
         index_factor: Vec<E>,
         coefficient_factor: Vec<E>,
     ) -> Result<Self, AkitaError> {
+        Self::new_ranked(
+            setup,
+            required_rows,
+            vec![index_factor],
+            vec![coefficient_factor],
+        )
+    }
+
+    pub(super) fn new_ranked(
+        setup: &'a [F],
+        required_rows: usize,
+        index_factors: Vec<Vec<E>>,
+        coefficient_factors: Vec<Vec<E>>,
+    ) -> Result<Self, AkitaError> {
+        let row_capacity = index_factors.first().map_or(0, Vec::len);
+        let coefficient_len = coefficient_factors.first().map_or(0, Vec::len);
         if required_rows == 0
-            || index_factor.is_empty()
-            || coefficient_factor.is_empty()
-            || !index_factor.len().is_power_of_two()
-            || !coefficient_factor.len().is_power_of_two()
-            || required_rows > index_factor.len()
+            || index_factors.is_empty()
+            || index_factors.len() != coefficient_factors.len()
+            || row_capacity == 0
+            || coefficient_len == 0
+            || !row_capacity.is_power_of_two()
+            || !coefficient_len.is_power_of_two()
+            || required_rows > row_capacity
+            || index_factors
+                .iter()
+                .any(|factor| factor.len() != row_capacity)
+            || coefficient_factors
+                .iter()
+                .any(|factor| factor.len() != coefficient_len)
         {
             return Err(AkitaError::InvalidInput(
                 "rectangular setup-product dimensions are invalid".into(),
             ));
         }
-        let source_len = index_factor
-            .len()
-            .checked_mul(coefficient_factor.len())
+        let source_len = row_capacity
+            .checked_mul(coefficient_len)
             .ok_or_else(|| AkitaError::InvalidSetup("setup source length overflow".into()))?;
         if setup.len() < source_len {
             return Err(AkitaError::InvalidSize {
@@ -75,68 +100,92 @@ where
                 actual: setup.len(),
             });
         }
-
-        let coefficient_len = coefficient_factor.len();
-        let coefficient_table = {
+        let term_count = index_factors.len();
+        let coefficient_tables = {
             let _span = tracing::info_span!(
                 "stage3_setup_coefficient_pass",
                 kernel = "rectangular_base_field",
                 source_pass = 1u64,
                 source_rows = required_rows as u64,
                 coefficient_len = coefficient_len as u64,
+                term_count = term_count as u64,
                 base_to_extension_lifts = 0u64,
-                setup_table_state_elements = (coefficient_len + index_factor.len()) as u64,
+                setup_table_state_elements = (term_count * (coefficient_len + row_capacity)) as u64,
             )
             .entered();
             let accumulators = cfg_fold_reduce!(
                 0..required_rows,
-                || (0..coefficient_len)
+                || (0..term_count)
                     .map(|_| {
-                        <E as akita_field::unreduced::HasUnreducedOps>::ProductAccum::zero()
+                        (0..coefficient_len)
+                            .map(|_| {
+                                <E as akita_field::unreduced::HasUnreducedOps>::ProductAccum::zero()
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>(),
                 |mut accumulators, setup_index| {
                     let row_start = setup_index * coefficient_len;
-                    let factor = index_factor[setup_index];
-                    for (accumulator, &coefficient) in accumulators
+                    let row = &setup[row_start..row_start + coefficient_len];
+                    for ((term_accumulators, index_factor), _) in accumulators
                         .iter_mut()
-                        .zip(&setup[row_start..row_start + coefficient_len])
+                        .zip(&index_factors)
+                        .zip(&coefficient_factors)
                     {
-                        *accumulator += factor.mul_base_to_product_accum(coefficient);
+                        let factor = index_factor[setup_index];
+                        if factor.is_zero() {
+                            continue;
+                        }
+                        for (accumulator, &coefficient) in term_accumulators.iter_mut().zip(row) {
+                            *accumulator += factor.mul_base_to_product_accum(coefficient);
+                        }
                     }
                     accumulators
                 },
                 |mut left, right| {
-                    for (left, right) in left.iter_mut().zip(right) {
-                        *left += right;
+                    for (left_term, right_term) in left.iter_mut().zip(right) {
+                        for (left, right) in left_term.iter_mut().zip(right_term) {
+                            *left += right;
+                        }
                     }
                     left
                 }
             );
             accumulators
                 .into_iter()
-                .map(E::reduce_product_accum)
+                .map(|term| {
+                    term.into_iter()
+                        .map(E::reduce_product_accum)
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>()
         };
-        let input_claim = coefficient_table
-            .iter()
-            .zip(&coefficient_factor)
-            .fold(E::zero(), |acc, (&value, &factor)| acc + value * factor);
+        let input_claim = coefficient_tables.iter().zip(&coefficient_factors).fold(
+            E::zero(),
+            |claim, (table, factor)| {
+                claim
+                    + table
+                        .iter()
+                        .zip(factor)
+                        .fold(E::zero(), |sum, (&value, &weight)| sum + value * weight)
+            },
+        );
         let coefficient_rounds = coefficient_len.trailing_zeros() as usize;
-        let total_rounds = coefficient_rounds + index_factor.len().trailing_zeros() as usize;
+        let total_rounds = coefficient_rounds + row_capacity.trailing_zeros() as usize;
 
         let mut term = Self {
             setup,
             required_rows,
-            row_capacity: index_factor.len(),
+            row_capacity,
             coefficient_len,
             coefficient_rounds,
             total_rounds,
             coefficient_challenges: Vec::with_capacity(coefficient_rounds),
-            coefficient_table,
-            coefficient_factor,
+            coefficient_tables,
+            coefficient_factors,
             index_table: None,
-            index_factor,
+            index_factors,
+            index_factor: Vec::new(),
             input_claim,
         };
         // A one-coefficient setup view has no coefficient-round challenge to
@@ -144,7 +193,7 @@ where
         // construction so the first index round (or a zero-round final value)
         // consumes the same canonical table as every other geometry.
         if coefficient_rounds == 0 {
-            term.materialize_index_table();
+            term.materialize_index_state();
         }
         Ok(term)
     }
@@ -159,14 +208,21 @@ where
 
     pub(super) fn compute_round_univariate(&self, round: usize) -> UniPoly<E> {
         let (constant, linear, quadratic) = if round < self.coefficient_rounds {
-            accumulate_left_round(&self.coefficient_table, &self.coefficient_factor, E::one())
+            self.coefficient_tables
+                .iter()
+                .zip(&self.coefficient_factors)
+                .map(|(table, factor)| accumulate_left_round(table, factor, E::one()))
+                .fold(
+                    (E::zero(), E::zero(), E::zero()),
+                    |(c0, c1, c2), (t0, t1, t2)| (c0 + t0, c1 + t1, c2 + t2),
+                )
         } else {
             accumulate_left_round(
                 self.index_table
                     .as_deref()
                     .expect("setup index table exists after coefficient rounds"),
                 &self.index_factor,
-                self.coefficient_factor[0],
+                E::one(),
             )
         };
         UniPoly::from_coeffs(vec![constant, linear, quadratic])
@@ -175,10 +231,14 @@ where
     pub(super) fn ingest_challenge(&mut self, round: usize, challenge: E) {
         if round < self.coefficient_rounds {
             self.coefficient_challenges.push(challenge);
-            fold_dense_left_round(&mut self.coefficient_table, challenge);
-            fold_factor_in_place(&mut self.coefficient_factor, challenge);
+            for table in &mut self.coefficient_tables {
+                fold_dense_left_round(table, challenge);
+            }
+            for factor in &mut self.coefficient_factors {
+                fold_factor_in_place(factor, challenge);
+            }
             if round + 1 == self.coefficient_rounds {
-                self.materialize_index_table();
+                self.materialize_index_state();
             }
         } else {
             fold_dense_left_round(
@@ -191,7 +251,18 @@ where
         }
     }
 
-    fn materialize_index_table(&mut self) {
+    fn materialize_index_state(&mut self) {
+        let mut index_factor = vec![E::zero(); self.row_capacity];
+        for (term_factor, coefficient_factor) in
+            self.index_factors.iter().zip(&self.coefficient_factors)
+        {
+            let scalar = coefficient_factor[0];
+            for (combined, &factor) in index_factor.iter_mut().zip(term_factor) {
+                *combined += scalar * factor;
+            }
+        }
+        self.index_factor = index_factor;
+        self.index_factors.clear();
         let coefficient_eq = EqPolynomial::evals(&self.coefficient_challenges)
             .expect("validated power-of-two setup coefficient domain");
         debug_assert_eq!(coefficient_eq.len(), self.coefficient_len);

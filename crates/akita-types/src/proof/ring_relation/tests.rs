@@ -464,6 +464,7 @@ fn multi_group_segment_layout_total_matches_next_w_len() {
     let quotient_coeff_len = layout
         .r_rows()
         .iter()
+        .flatten()
         .map(|row| row.geometry().physical_coefficient_width() * quotient_depth)
         .sum::<usize>();
 
@@ -655,6 +656,10 @@ fn multi_group_segment_layout_resolves_group_shard_product() {
     }
     let quotient_depth = r_decomp_levels::<F>(lp.log_basis_open);
     for (row_index, row) in layout.r_rows().iter().enumerate() {
+        let Some(row) = row else {
+            assert!(layout.r_coefficient_index(row_index, 0, 0, 0).is_err());
+            continue;
+        };
         for digit in 0..quotient_depth {
             for coefficient in 0..row.geometry().polynomial_modulus_dimension() {
                 let address = layout
@@ -793,7 +798,10 @@ fn packing_instance_emits_all_physical_e_coordinate_planes() {
     let packing_r_row = layout
         .r_rows()
         .iter()
-        .position(|row| row.geometry() == unit.e_geometry())
+        .position(|row| {
+            row.as_ref()
+                .is_some_and(|row| row.geometry() == unit.e_geometry())
+        })
         .expect("packing consistency quotient row");
     let plane_zero = layout
         .r_coefficient_index(packing_r_row, 0, 0, 0)

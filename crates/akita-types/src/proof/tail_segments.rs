@@ -1272,7 +1272,7 @@ pub fn emit_witness_r_planes<const D: usize>(
     quotient_depth: usize,
     planes: &[[i8; D]],
 ) -> Result<(), AkitaError> {
-    if layout.r_rows().iter().any(|row| {
+    if layout.r_rows().iter().flatten().any(|row| {
         row.geometry().polynomial_modulus_dimension() != D
             || row.geometry().coordinate_plane_count() != 1
     }) || quotient_depth != layout.quotient_depth()
@@ -1283,7 +1283,9 @@ pub fn emit_witness_r_planes<const D: usize>(
     }
     let expected = layout
         .r_rows()
-        .len()
+        .iter()
+        .flatten()
+        .count()
         .checked_mul(quotient_depth)
         .ok_or_else(|| AkitaError::InvalidSetup("witness R source shape overflow".into()))?;
     if planes.len() != expected {
@@ -1292,14 +1294,19 @@ pub fn emit_witness_r_planes<const D: usize>(
             actual: planes.len(),
         });
     }
+    let mut source_row = 0usize;
     for row in 0..layout.r_rows().len() {
+        if layout.r_rows()[row].is_none() {
+            continue;
+        }
         for digit in 0..quotient_depth {
             write_witness_coefficients(
                 out,
                 layout.r_coefficient_index(row, digit, 0, 0)?,
-                &planes[row * quotient_depth + digit],
+                &planes[source_row * quotient_depth + digit],
             )?;
         }
+        source_row += 1;
     }
     Ok(())
 }

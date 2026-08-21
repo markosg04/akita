@@ -288,6 +288,7 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             d_physical_cols,
             d_weights,
             setup_index_tensors: Vec::new(),
+            non_a_setup_index_tensors: Vec::new(),
             relation_address,
             setup_relation_address,
             relation_base_bridge_point,
@@ -295,7 +296,8 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             projection_geometry,
             direct_scan_alpha: None,
         };
-        plan.setup_index_tensors = plan.prepare_setup_index_tensors(witness_layout)?;
+        plan.setup_index_tensors = plan.prepare_setup_index_tensors(witness_layout, true)?;
+        plan.non_a_setup_index_tensors = plan.prepare_setup_index_tensors(witness_layout, false)?;
         Ok(plan)
     }
 

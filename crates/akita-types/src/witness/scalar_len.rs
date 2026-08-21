@@ -105,6 +105,9 @@ impl WitnessLayout {
             })
             .unwrap_or(row_families.len());
         for row in &row_families[..first_compression_row] {
+            if !row.requires_quotient_witness() {
+                continue;
+            }
             let len = quotient_depth
                 .checked_mul(row.geometry().physical_coefficient_width())
                 .ok_or_else(|| AkitaError::InvalidSetup("witness R width overflow".into()))?;
@@ -408,8 +411,9 @@ mod tests {
                             * 256
                     );
                 }
-                assert_eq!(layout.r_rows()[0].geometry(), opening_geometry);
-                assert_eq!(layout.r_rows()[0].range().len(), 2 * 128);
+                let row = layout.r_rows()[0].as_ref().expect("quotient row");
+                assert_eq!(row.geometry(), opening_geometry);
+                assert_eq!(row.range().len(), 2 * 128);
                 let scalar = WitnessLayout::try_scalar_live_coeff_len(
                     &params,
                     &opening_batch,

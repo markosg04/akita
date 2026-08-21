@@ -9,7 +9,6 @@ mod product_table;
 mod utils;
 
 use akita_algebra::eq_poly::EqPolynomial;
-use akita_algebra::ring::scalar_powers;
 use akita_algebra::uni_poly::UniPoly;
 use akita_field::{
     AkitaError, CanonicalField, FieldCore, FromPrimitiveInt, LiftBase, MulBase, MulBaseUnreduced,
@@ -21,7 +20,7 @@ use akita_types::{
     ensure_setup_envelope, setup_prefix_coverage_eval_len, shared_setup_fold_gadget,
     AkitaExpandedSetup, CommittedGroupParams, FpExtEncoding, PreparedRelationAddress,
     RelationAddressGeometry, RingRelationInstance, SetupContributionGroupInputs,
-    SetupContributionPlan, SetupPrefixProverRegistry, SetupProjectionGeometry,
+    SetupContributionPlan, SetupPrefixProverRegistry, SetupProductFactors, SetupProjectionGeometry,
     SETUP_SUMCHECK_DEGREE,
 };
 use product_table::RectangularSetupProductTerm;
@@ -71,9 +70,11 @@ where
     {
         let setup_coefficient_bits =
             relation_address_geometry.relation_coefficient_variable_count();
-        let setup_x_challenges = stage2_challenges
-            .get(setup_coefficient_bits..)
-            .ok_or(AkitaError::InvalidProof)?;
+        if stage2_challenges.len() < setup_coefficient_bits {
+            return Err(AkitaError::InvalidProof);
+        }
+        let (stage2_coefficient_challenges, setup_x_challenges) =
+            stage2_challenges.split_at(setup_coefficient_bits);
         let setup_term = {
             let _span = tracing::info_span!("stage3_setup_term_prepare").entered();
             build_setup_product_term::<F, E, T>(
@@ -84,6 +85,7 @@ where
                 relation,
                 tau1,
                 alpha,
+                stage2_coefficient_challenges,
                 setup_x_challenges,
                 relation_address_geometry,
                 transcript,
@@ -157,6 +159,7 @@ fn build_setup_product_term<'a, F, E, T>(
     relation: &RingRelationInstance<F>,
     tau1: &[E],
     alpha: E,
+    stage2_coefficient_challenges: &[E],
     x_challenges: &[E],
     relation_address_geometry: RelationAddressGeometry,
     transcript: &mut T,
@@ -166,13 +169,14 @@ where
     E: FpExtEncoding<F> + FromPrimitiveInt + LiftBase<F> + MulBaseUnreduced<F> + AkitaSerialize,
     T: Transcript<F>,
 {
-    let (geometry, mut setup_index_weight, alpha_pows) = {
+    let (geometry, setup_product_factors) = {
         let _span = tracing::info_span!("stage3_setup_weights_prepare").entered();
         prepare_setup_sumcheck_terms::<F, E>(
             lp,
             relation,
             tau1,
             alpha,
+            stage2_coefficient_challenges,
             x_challenges,
             relation_address_geometry,
         )?
@@ -225,7 +229,6 @@ where
         ));
     }
 
-    setup_index_weight.resize(setup_idx_len, E::zero());
     let source_len = setup_idx_len
         .checked_mul(ring_d)
         .ok_or_else(|| AkitaError::InvalidSetup("setup product source length overflow".into()))?;
@@ -234,11 +237,12 @@ where
     })?;
     drop(_source_span);
 
-    RectangularSetupProductTerm::new(
+    let (index_factors, coefficient_factors) = setup_product_factors.into_parts();
+    RectangularSetupProductTerm::new_ranked(
         setup_source,
         active_weight_rows,
-        setup_index_weight,
-        alpha_pows.to_vec(),
+        index_factors,
+        coefficient_factors,
     )
 }
 
@@ -250,9 +254,10 @@ fn prepare_setup_sumcheck_terms<F, E>(
     relation: &RingRelationInstance<F>,
     tau1: &[E],
     alpha: E,
+    stage2_coefficient_challenges: &[E],
     x_challenges: &[E],
     relation_address_geometry: RelationAddressGeometry,
-) -> Result<(SetupProjectionGeometry, Vec<E>, Vec<E>), AkitaError>
+) -> Result<(SetupProjectionGeometry, SetupProductFactors<E>), AkitaError>
 where
     F: FieldCore + CanonicalField,
     E: FpExtEncoding<F> + FromPrimitiveInt + LiftBase<F> + MulBase<F>,
@@ -265,9 +270,9 @@ where
         relation_address_geometry,
     )?;
     let geometry = plan.projection_geometry();
-    let alpha_pows = scalar_powers(alpha, geometry.alpha_power_len());
-    let setup_index_weight = plan.materialize_setup_index_weights(alpha)?;
-    Ok((geometry, setup_index_weight, alpha_pows.to_vec()))
+    let factors =
+        plan.materialize_setup_product_factors::<F>(alpha, stage2_coefficient_challenges)?;
+    Ok((geometry, factors))
 }
 
 /// Build the stage-3 setup-contribution plan from local prover inputs.

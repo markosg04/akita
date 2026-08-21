@@ -30,6 +30,7 @@ mod test_oracle;
 mod types;
 
 pub(crate) use types::validate_setup_inputs;
+pub use types::SetupProductFactors;
 pub(crate) use types::{
     DirectScanWeights, PhysicalBSetupPlan, SetupContributionGroupPlan, SetupUnitRange,
 };

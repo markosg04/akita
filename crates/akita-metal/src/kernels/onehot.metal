@@ -172,6 +172,8 @@ struct D512LinearNttPrime {
 struct DirectRangeParams {
     ulong live_len;
     ulong current_len;
+    ulong current_live_len;
+    ulong input_live_len;
     ulong pair_count;
     ulong num_first;
     ulong num_second;
@@ -184,6 +186,8 @@ struct DirectRangeParams {
 struct DirectRelationParams {
     ulong live_len;
     ulong current_len;
+    ulong current_live_len;
+    ulong input_live_len;
     ulong pair_count;
     ulong num_first;
     ulong num_second;
@@ -209,6 +213,27 @@ struct DirectRelationTwoRoundPrefixParams {
     ulong linear_mode;
 };
 
+struct DirectRelationLinearFoldParams {
+    ulong current_coeff_count;
+    ulong source_lane_count;
+    ulong current_live_lane_count;
+    ulong output_len;
+    ulong mode;
+};
+
+static_assert(sizeof(DirectRelationLinearFoldParams) == 40);
+
+struct DirectRelationReducedSourceParams {
+    ulong ring_dimension;
+    ulong row_count;
+    ulong item_count;
+    ulong reserved;
+    AkitaFp128 alpha;
+    AkitaFp128 wrap_correction;
+};
+
+static_assert(sizeof(DirectRelationReducedSourceParams) == 64);
+
 struct DirectRelationScalars {
     AkitaFp128 l_at_0;
     AkitaFp128 l_at_1;
@@ -219,9 +244,13 @@ struct DirectRelationLinearSegment {
     AkitaFp128 factor;
     uint source_index;
     uint target_lane_start;
+    uint target_lane_stride;
     uint source_lane_start;
+    uint source_lane_stride;
     uint lane_count;
 };
+
+static_assert(sizeof(DirectRelationLinearSegment) == 48);
 
 struct DirectRelationAdditionalPair {
     ulong parent;
@@ -1809,18 +1838,21 @@ kernel void akita_fp128_direct_range_compact_fold_partials(
         AkitaFp128 values[2];
         for (uint side = 0u; side < 2u; ++side) {
             ulong output_index = pair * 2ul + (ulong)side;
-            ulong input_start = output_index * params.prefix_size;
             AkitaFp128 value = akita_zero();
-            for (ulong prefix = 0ul; prefix < params.prefix_size; ++prefix) {
-                ulong input_index = input_start + prefix;
-                int digit = input_index < params.live_len ? (int)digits[input_index] : 0;
-                long range_image = (long)digit * (long)(digit + 1);
-                value = akita_add(
-                    value,
-                    akita_mul_signed_small(prefix_weights[prefix], range_image));
+            if (output_index < params.current_live_len) {
+                ulong input_start = output_index * params.prefix_size;
+                for (ulong prefix = 0ul; prefix < params.prefix_size; ++prefix) {
+                    ulong input_index = input_start + prefix;
+                    int digit = input_index < params.live_len ? (int)digits[input_index] : 0;
+                    long range_image = (long)digit * (long)(digit + 1);
+                    value = akita_add(
+                        value,
+                        akita_mul_signed_small(prefix_weights[prefix], range_image));
+                }
             }
             values[side] = value;
-            if (params.materialize_prefix != 0ul) {
+            if (params.materialize_prefix != 0ul
+                && output_index < params.current_live_len) {
                 folded[output_index] = value;
             }
         }
@@ -1889,13 +1921,21 @@ kernel void akita_fp128_direct_range_field_fold_partials(
         AkitaFp128 values[2];
         for (uint side = 0u; side < 2u; ++side) {
             ulong output_index = pair * 2ul + (ulong)side;
-            ulong input_index = output_index * 2ul;
-            AkitaFp128 left = input[input_index];
-            AkitaFp128 right = input[input_index + 1ul];
-            values[side] = akita_add(
-                left,
-                akita_mul(challenge, akita_sub(right, left)));
-            folded[output_index] = values[side];
+            AkitaFp128 value = akita_zero();
+            if (output_index < params.current_live_len) {
+                ulong input_index = output_index * 2ul;
+                AkitaFp128 left = input_index < params.input_live_len
+                    ? input[input_index]
+                    : akita_zero();
+                AkitaFp128 right = input_index + 1ul < params.input_live_len
+                    ? input[input_index + 1ul]
+                    : akita_zero();
+                value = akita_add(
+                    left,
+                    akita_mul(challenge, akita_sub(right, left)));
+                folded[output_index] = value;
+            }
+            values[side] = value;
         }
         AkitaFp128 q0;
         AkitaFp128 q2;
@@ -1940,11 +1980,12 @@ kernel void akita_fp128_direct_range_field_fold_partials(
 kernel void akita_fp128_direct_range_finalize(
     device const AkitaFp128 *input [[buffer(0)]],
     device AkitaFp128 *output [[buffer(1)]],
-    constant AkitaFp128 &challenge [[buffer(2)]])
+    constant AkitaFp128 &challenge [[buffer(2)]],
+    constant ulong &input_live_len [[buffer(3)]])
 {
-    output[0] = akita_add(
-        input[0],
-        akita_mul(challenge, akita_sub(input[1], input[0])));
+    AkitaFp128 left = input_live_len != 0ul ? input[0] : akita_zero();
+    AkitaFp128 right = input_live_len > 1ul ? input[1] : akita_zero();
+    output[0] = akita_add(left, akita_mul(challenge, akita_sub(right, left)));
 }
 
 inline int akita_stage2_prefix_integer_point(
@@ -2063,10 +2104,13 @@ kernel void akita_fp128_direct_relation_two_round_prefix_partials(
                 uint end = lane_offsets[lane + 1ul];
                 for (uint cursor = begin; cursor < end; ++cursor) {
                     DirectRelationLinearSegment segment = segments[lane_segments[cursor]];
+                    ulong lane_offset = (lane - (ulong)segment.target_lane_start)
+                        / (ulong)segment.target_lane_stride;
                     ulong source_lane = (ulong)segment.source_lane_start
-                        + lane - (ulong)segment.target_lane_start;
-                    ulong source_base = (ulong)source_offsets[segment.source_index]
-                        + source_lane * params.coefficient_count;
+                        + lane_offset * (ulong)segment.source_lane_stride;
+                    ulong source_base =
+                        ((ulong)source_offsets[segment.source_index] + source_lane)
+                        * params.coefficient_count;
                     AkitaFp128 segment_inner = akita_zero();
                     for (ulong y_quad = 0ul; y_quad < params.y_quads; ++y_quad) {
                         ulong offset = source_base + 4ul * y_quad;
@@ -2163,6 +2207,34 @@ inline AkitaFp128 akita_direct_relation_compact_value(
     return value;
 }
 
+inline AkitaFp128 akita_direct_relation_factored_linear_value(
+    ulong lane,
+    ulong coefficient,
+    ulong current_coeff_count,
+    device const AkitaFp128 *linear_values,
+    device const uint *source_offsets,
+    device const uint *lane_offsets,
+    device const uint *lane_segments,
+    device const DirectRelationLinearSegment *segments)
+{
+    AkitaFp128 value = akita_zero();
+    uint begin = lane_offsets[lane];
+    uint end = lane_offsets[lane + 1ul];
+    for (uint cursor = begin; cursor < end; ++cursor) {
+        DirectRelationLinearSegment segment = segments[lane_segments[cursor]];
+        ulong lane_offset = (lane - (ulong)segment.target_lane_start)
+            / (ulong)segment.target_lane_stride;
+        ulong source_lane = (ulong)segment.source_lane_start
+            + lane_offset * (ulong)segment.source_lane_stride;
+        ulong source_index = ((ulong)source_offsets[segment.source_index] + source_lane)
+            * current_coeff_count + coefficient;
+        value = akita_add(
+            value,
+            akita_mul(segment.factor, linear_values[source_index]));
+    }
+    return value;
+}
+
 inline AkitaFp128 akita_direct_relation_linear_value(
     ulong index,
     device const AkitaFp128 *linear_values,
@@ -2182,23 +2254,229 @@ inline AkitaFp128 akita_direct_relation_linear_value(
     if (params.linear_mode == 2ul) {
         return linear_values[lane];
     }
-
     ulong coefficient = index - lane * params.current_coeff_count;
-    AkitaFp128 value = akita_zero();
-    uint begin = lane_offsets[lane];
-    uint end = lane_offsets[lane + 1ul];
-    for (uint cursor = begin; cursor < end; ++cursor) {
-        DirectRelationLinearSegment segment = segments[lane_segments[cursor]];
-        ulong source_lane = (ulong)segment.source_lane_start
-            + lane - (ulong)segment.target_lane_start;
-        ulong source_index = (ulong)source_offsets[segment.source_index]
-            + source_lane * params.current_coeff_count
-            + coefficient;
-        value = akita_add(
-            value,
-            akita_mul(segment.factor, linear_values[source_index]));
+    return akita_direct_relation_factored_linear_value(
+        lane,
+        coefficient,
+        params.current_coeff_count,
+        linear_values,
+        source_offsets,
+        lane_offsets,
+        lane_segments,
+        segments);
+}
+
+kernel void akita_fp128_direct_relation_linear_fold(
+    device const AkitaFp128 *input [[buffer(0)]],
+    device AkitaFp128 *output [[buffer(1)]],
+    device const uint *source_offsets [[buffer(2)]],
+    device const uint *lane_offsets [[buffer(3)]],
+    device const uint *lane_segments [[buffer(4)]],
+    device const DirectRelationLinearSegment *segments [[buffer(5)]],
+    constant AkitaFp128 &challenge [[buffer(6)]],
+    constant DirectRelationLinearFoldParams &params [[buffer(7)]],
+    uint thread_index [[thread_position_in_grid]])
+{
+    ulong index = (ulong)thread_index;
+    if (index >= params.output_len) {
+        return;
     }
-    return value;
+    if (params.mode == 1ul) {
+        ulong next_coeff_count = params.current_coeff_count / 2ul;
+        ulong source_lane = index / next_coeff_count;
+        ulong coefficient = index - source_lane * next_coeff_count;
+        ulong input_index = source_lane * params.current_coeff_count + 2ul * coefficient;
+        AkitaFp128 left = input[input_index];
+        output[index] = akita_add(
+            left,
+            akita_mul(challenge, akita_sub(input[input_index + 1ul], left)));
+        return;
+    }
+
+    ulong left_lane = 2ul * index;
+    AkitaFp128 left;
+    AkitaFp128 right = akita_zero();
+    if (params.mode == 2ul) {
+        left = akita_direct_relation_factored_linear_value(
+            left_lane, 0ul, 1ul, input, source_offsets, lane_offsets, lane_segments, segments);
+        if (left_lane + 1ul < params.current_live_lane_count) {
+            right = akita_direct_relation_factored_linear_value(
+                left_lane + 1ul,
+                0ul,
+                1ul,
+                input,
+                source_offsets,
+                lane_offsets,
+                lane_segments,
+                segments);
+        }
+    } else {
+        left = input[left_lane];
+        if (left_lane + 1ul < params.current_live_lane_count) {
+            right = input[left_lane + 1ul];
+        }
+    }
+    output[index] = akita_add(left, akita_mul(challenge, akita_sub(right, left)));
+}
+
+inline void akita_emit_reduced_shift_sequence(
+    threadgroup const AkitaFp128 *coefficients,
+    device const AkitaFp128 *alpha_powers,
+    device AkitaFp128 *output,
+    ulong output_start,
+    AkitaFp128 initial_evaluation,
+    constant DirectRelationReducedSourceParams &params,
+    uint thread_index)
+{
+    if (thread_index >= 32u) {
+        return;
+    }
+    uint lane = thread_index;
+    ulong chunk = params.ring_dimension / 32ul;
+    ulong shift_start = (ulong)lane * chunk;
+    AkitaFp128 multiplier = alpha_powers[chunk];
+    AkitaFp128 bias = akita_zero();
+    for (ulong local = 0ul; local < chunk; ++local) {
+        ulong coefficient = params.ring_dimension - 1ul - shift_start - local;
+        bias = akita_sub(
+            akita_mul(params.alpha, bias),
+            akita_mul(params.wrap_correction, coefficients[coefficient]));
+    }
+
+    AkitaFp128 prefix_multiplier = multiplier;
+    AkitaFp128 prefix_bias = bias;
+    for (uint offset = 1u; offset < 32u; offset <<= 1u) {
+        uint source_lane = lane >= offset ? lane - offset : 0u;
+        AkitaFp128 previous_multiplier =
+            akita_simd_shuffle_fp128(prefix_multiplier, source_lane);
+        AkitaFp128 previous_bias = akita_simd_shuffle_fp128(prefix_bias, source_lane);
+        if (lane >= offset) {
+            prefix_bias = akita_add(
+                akita_mul(prefix_multiplier, previous_bias), prefix_bias);
+            prefix_multiplier = akita_mul(prefix_multiplier, previous_multiplier);
+        }
+    }
+
+    AkitaFp128 evaluation = initial_evaluation;
+    uint previous_lane = lane == 0u ? 0u : lane - 1u;
+    AkitaFp128 previous_multiplier =
+        akita_simd_shuffle_fp128(prefix_multiplier, previous_lane);
+    AkitaFp128 previous_bias = akita_simd_shuffle_fp128(prefix_bias, previous_lane);
+    if (lane != 0u) {
+        evaluation = akita_add(
+            akita_mul(previous_multiplier, initial_evaluation), previous_bias);
+    }
+    for (ulong local = 0ul; local < chunk; ++local) {
+        ulong shift = shift_start + local;
+        output[output_start + shift] = evaluation;
+        AkitaFp128 wrapped = akita_mul(
+            params.wrap_correction,
+            coefficients[params.ring_dimension - 1ul - shift]);
+        evaluation = akita_sub(akita_mul(params.alpha, evaluation), wrapped);
+    }
+}
+
+kernel void akita_fp128_direct_relation_setup_source(
+    device const AkitaFp128 *matrix [[buffer(0)]],
+    device const AkitaFp128 *row_weights [[buffer(1)]],
+    device const AkitaFp128 *alpha_powers [[buffer(2)]],
+    device AkitaFp128 *output [[buffer(3)]],
+    constant DirectRelationReducedSourceParams &params [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup AkitaFp128 coefficients[512];
+    threadgroup AkitaFp128 reduction[256];
+    ulong column = (ulong)threadgroup_index.x;
+    for (ulong coefficient = (ulong)thread_index;
+         coefficient < params.ring_dimension;
+         coefficient += 256ul) {
+        AkitaFp128 combined = akita_zero();
+        for (ulong row = 0ul; row < params.row_count; ++row) {
+            ulong index = ((row * params.item_count + column) * params.ring_dimension)
+                + coefficient;
+            combined = akita_add(combined, akita_mul(row_weights[row], matrix[index]));
+        }
+        coefficients[coefficient] = combined;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    AkitaFp128 sum = akita_zero();
+    for (ulong coefficient = (ulong)thread_index;
+         coefficient < params.ring_dimension;
+         coefficient += 256ul) {
+        sum = akita_add(sum, akita_mul(coefficients[coefficient], alpha_powers[coefficient]));
+    }
+    reduction[thread_index] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint width = 128u; width != 0u; width >>= 1u) {
+        if (thread_index < width) {
+            reduction[thread_index] = akita_add(
+                reduction[thread_index], reduction[thread_index + width]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    akita_emit_reduced_shift_sequence(
+        coefficients,
+        alpha_powers,
+        output,
+        column * params.ring_dimension,
+        reduction[0],
+        params,
+        thread_index);
+}
+
+kernel void akita_fp128_direct_relation_sparse_source(
+    device const uint *term_offsets [[buffer(0)]],
+    device const uint *positions [[buffer(1)]],
+    device const char *sparse_coefficients [[buffer(2)]],
+    device const AkitaFp128 *alpha_powers [[buffer(3)]],
+    device AkitaFp128 *output [[buffer(4)]],
+    constant DirectRelationReducedSourceParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup AkitaFp128 coefficients[512];
+    threadgroup AkitaFp128 reduction[256];
+    ulong challenge = (ulong)threadgroup_index.x;
+    for (ulong coefficient = (ulong)thread_index;
+         coefficient < params.ring_dimension;
+         coefficient += 256ul) {
+        coefficients[coefficient] = akita_zero();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint start = term_offsets[challenge];
+    uint end = term_offsets[challenge + 1ul];
+    for (uint term = start + thread_index; term < end; term += 256u) {
+        uint position = positions[term];
+        coefficients[position] = akita_mul_signed_small(
+            akita_from_u32(1u), (long)sparse_coefficients[term]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    AkitaFp128 sum = akita_zero();
+    for (ulong coefficient = (ulong)thread_index;
+         coefficient < params.ring_dimension;
+         coefficient += 256ul) {
+        sum = akita_add(sum, akita_mul(coefficients[coefficient], alpha_powers[coefficient]));
+    }
+    reduction[thread_index] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint width = 128u; width != 0u; width >>= 1u) {
+        if (thread_index < width) {
+            reduction[thread_index] = akita_add(
+                reduction[thread_index], reduction[thread_index + width]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    akita_emit_reduced_shift_sequence(
+        coefficients,
+        alpha_powers,
+        output,
+        challenge * params.ring_dimension,
+        reduction[0],
+        params,
+        thread_index);
 }
 
 inline AkitaFp128 akita_direct_relation_p_value(
@@ -2407,13 +2685,21 @@ kernel void akita_fp128_direct_relation_compact_fold_partials(
     ulong stride = params.workgroups * 256ul;
     for (ulong pair = global_thread; pair < params.pair_count; pair += stride) {
         ulong left_index = 2ul * pair;
-        AkitaFp128 left = akita_direct_relation_compact_value(
-            digits, prefix_weights, left_index, params);
-        AkitaFp128 right = akita_direct_relation_compact_value(
-            digits, prefix_weights, left_index + 1ul, params);
+        AkitaFp128 left = left_index < params.current_live_len
+            ? akita_direct_relation_compact_value(
+                digits, prefix_weights, left_index, params)
+            : akita_zero();
+        AkitaFp128 right = left_index + 1ul < params.current_live_len
+            ? akita_direct_relation_compact_value(
+                digits, prefix_weights, left_index + 1ul, params)
+            : akita_zero();
         if (params.materialize_prefix != 0ul) {
-            folded[left_index] = left;
-            folded[left_index + 1ul] = right;
+            if (left_index < params.current_live_len) {
+                folded[left_index] = left;
+            }
+            if (left_index + 1ul < params.current_live_len) {
+                folded[left_index + 1ul] = right;
+            }
         }
         akita_direct_relation_coefficients(
             left, right, pair, e_first, e_second, alpha, lane_weights,
@@ -2458,12 +2744,20 @@ kernel void akita_fp128_direct_relation_field_fold_partials(
         AkitaFp128 values[2];
         for (uint side = 0u; side < 2u; ++side) {
             ulong output_index = 2ul * pair + (ulong)side;
-            ulong input_index = 2ul * output_index;
-            AkitaFp128 left = input[input_index];
-            AkitaFp128 right = input[input_index + 1ul];
-            values[side] = akita_add(
-                left, akita_mul(challenge, akita_sub(right, left)));
-            folded[output_index] = values[side];
+            AkitaFp128 value = akita_zero();
+            if (output_index < params.current_live_len) {
+                ulong input_index = 2ul * output_index;
+                AkitaFp128 left = input_index < params.input_live_len
+                    ? input[input_index]
+                    : akita_zero();
+                AkitaFp128 right = input_index + 1ul < params.input_live_len
+                    ? input[input_index + 1ul]
+                    : akita_zero();
+                value = akita_add(
+                    left, akita_mul(challenge, akita_sub(right, left)));
+                folded[output_index] = value;
+            }
+            values[side] = value;
             if (params.fold_lane_weights != 0ul) {
                 ulong lane_input_index = 2ul * output_index;
                 AkitaFp128 lane_left = lane_weights_input[lane_input_index];
@@ -2566,8 +2860,13 @@ kernel void akita_fp128_direct_relation_additional_field_partials(
     ulong stride = params.additional_workgroups * 256ul;
     for (ulong index = global_thread; index < params.additional_pair_count; index += stride) {
         DirectRelationAdditionalPair pair = pairs[index];
-        AkitaFp128 left = input[2ul * pair.parent];
-        AkitaFp128 right = input[2ul * pair.parent + 1ul];
+        ulong left_index = 2ul * pair.parent;
+        AkitaFp128 left = left_index < params.current_live_len
+            ? input[left_index]
+            : akita_zero();
+        AkitaFp128 right = left_index + 1ul < params.current_live_len
+            ? input[left_index + 1ul]
+            : akita_zero();
         akita_direct_relation_additional_coefficients(
             left, right, pair, scalars, sum_0, sum_2, sum_3);
     }

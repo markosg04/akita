@@ -322,11 +322,14 @@ where
         let setup_coefficient_bits = rs
             .relation_address_geometry
             .relation_coefficient_variable_count();
-        let setup_x_challenges = sumcheck_challenges
-            .get(setup_coefficient_bits..)
-            .ok_or(AkitaError::InvalidProof)?;
+        if sumcheck_challenges.len() < setup_coefficient_bits {
+            return Err(AkitaError::InvalidProof);
+        }
+        let (stage2_coefficient_challenges, setup_x_challenges) =
+            sumcheck_challenges.split_at(setup_coefficient_bits);
         let verifier = SetupSumcheckVerifier::new::<F>(
             &rs.relation_matrix_evaluator,
+            stage2_coefficient_challenges,
             setup_x_challenges,
             rs.alpha,
         )?;

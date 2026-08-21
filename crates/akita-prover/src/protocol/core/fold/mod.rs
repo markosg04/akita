@@ -560,6 +560,7 @@ where
     let mut rs = ring_switch.output;
     let relation_range_image_plan = ring_switch.relation_plan;
     let opening_semantics = ring_switch.opening_semantics;
+    let negacyclic_setup_linear_terms = ring_switch.negacyclic_setup_linear_terms;
 
     let relation_rhs_layout = relation_range_image_plan
         .relation_witness_geometry()
@@ -613,7 +614,7 @@ where
             .relation_coefficient_block_len(),
     )
     .entered();
-    let (linear_terms, scalar_opening_claim) = match opening_semantics {
+    let (mut linear_terms, scalar_opening_claim) = match opening_semantics {
         OpeningFamily::SubringCoefficientPacking(batch) => {
             let mut combined_terms: Option<PreparedProverLinearTerms<E>> = None;
             let mut authenticated_opening = E::zero();
@@ -697,6 +698,9 @@ where
             )
         }
     };
+    linear_terms.merge(PreparedProverLinearTerms::from_negacyclic_setup(
+        negacyclic_setup_linear_terms,
+    )?)?;
     drop(opening_preparation_span);
     let relation_address_geometry = rs.relation_address_geometry;
     let tau1 = rs.tau1.clone();

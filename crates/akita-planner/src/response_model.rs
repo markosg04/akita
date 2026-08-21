@@ -854,7 +854,7 @@ pub(crate) fn next_source_moment(
         }
     }
 
-    for row in layout.r_rows() {
+    for row in layout.r_rows().iter().flatten() {
         let scalar_count = row.range().len() / quotient_depth;
         if scalar_count != 0 {
             let (energy, peak) = field_digit_moments(

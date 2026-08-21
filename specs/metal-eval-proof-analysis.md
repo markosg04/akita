@@ -2121,6 +2121,314 @@ root decompose 0.565363 s + root relation 0.559026 s + Stage 1 0.317381 s +
 Stage 2 0.427185 s = 1.868955 s. Those phases alone exceed the 1.390292 s goal
 by 478.7 ms, so unchanged-protocol microkernels cannot establish five times.
 
+### Quotient-free committed A relations
+
+The measured phase floor admits a protocol change, and the 559 ms A-quotient
+is the first protocol-created cost. Recursive folds currently commit
+`[Z | E | T | R]`, where the A row of `R` is the high half of the ordinary
+polynomial product. After that commitment is absorbed, the transcript samples
+`alpha` and Stage 2 checks
+
+```text
+A(alpha) * z(alpha) - c(alpha) * t(alpha)
+    - (alpha^D + 1) * r(alpha) = 0.
+```
+
+The quotient only converts a reduced-ring equation into an ordinary-polynomial
+identity. Akita's terminal verifier already checks the corresponding A equation
+directly in `F[X]/(X^D+1)` without quotient rows. At a recursive level, retain
+the existing load-bearing order--commit the next witness before sampling
+`alpha`--and apply the random linear functional
+
+```text
+L_alpha(sum_k p_k X^k) = sum_k p_k alpha^k
+```
+
+to the reduced A-row residual. A nonzero residual of degree below `D` passes
+with probability at most `(D-1)/|F|`, no worse than the current degree-below-
+`2D` quotient identity. The verifier derives the same weights from public
+setup, challenges, and `alpha`; no prover-supplied quotient evaluation is
+admitted.
+
+For a public ring `a`, all coefficient weights needed for a private ring `z`
+are obtained in linear work. If
+
+```text
+s_j = L_alpha(a * X^j mod (X^D + 1)),
+```
+
+then
+
+```text
+s_0 = a(alpha)
+s_(j+1) = alpha * s_j - (alpha^D + 1) * a_(D-1-j).
+```
+
+The same recurrence applies to each sparse fold challenge on the T side. For
+the T25 rank-one root this replaces 65,536 six-prime padded D512 quotient
+products with about 67 million exact fp128 multiply-adds and 512 MiB of
+coefficient weights. Those weights are per-proof because `alpha` is sampled
+after the witness binding. Generate them into resident Metal storage and
+consume them in Stage 2; a host `Vec<F>` materialization is outside the design.
+
+The production representation should encode reduced A rows in the checked
+relation layout and omit their R rows. A temporary zero R slot is acceptable
+only for a focused prototype and cannot be promoted: it leaves dead committed
+coordinates and obscures the protocol. Consistency, B, D, and compression rows
+remain on their current quotient semantics in the first cut. CPU and Metal
+must produce identical proofs under the new public schedule/protocol digest,
+so the old CPU anchor becomes invalid only when this cutover is enabled.
+
+Pre-register the protocol mechanism at 0.12--0.24 s for reduced-weight
+construction and at most 0.30 s for the complete relation replacement. Reject
+it if direct weights require a dense host allocation, are sampled before the
+next-witness binding, add a free prover-selected scalar, raise Stage 2 by more
+than 0.12 s, or leave the complete-call projection above 1.50 s after the
+factored-sumcheck and serial-tail budgets below are applied. The independent
+correctness gate compares the recurrence against direct cyclotomic products
+for every supported A dimension before any full treatment.
+
+### Pair-coalesced factored equality rounds
+
+The direct Stage-1 Metal kernels currently form
+
+```text
+weight(low, high) = E_first[low] * E_second[high]
+```
+
+for every pair and then multiply that weight by four range-polynomial
+coefficients. Akita's CPU prover uses the equivalent but cheaper order: for
+each fixed `high`, reduce `E_first[low] * q_k(low, high)` over `low`, then
+multiply each of the four totals by `E_second[high]` once. The T25 direct domain
+has 29 variables, so the initial split is `2^14 x 2^14`. The initial Metal
+round therefore performs 268,435,456 avoidable full fp128 equality
+multiplications; the factored form performs 65,536 full outer multiplications
+and retains the same four signed-small products per pair.
+
+Map one 256-thread group to one high bucket. Threads walk the contiguous low
+range, retain four accumulators, reduce exactly as the parent, and let the
+group leader apply the high factor. This preserves pair-coalesced digit and
+field reads, unlike the rejected thread-per-lane Stage-2 suffix. Use the
+factored path while `num_first >= 512`; the first six geometric rounds then
+take it, while small late rounds retain the flat kernel. T25 needs 16,384
+partial groups and T28 at most 32,768, only 1--2 MiB of partial storage.
+
+This kernel is an implementation slice of the quotient-free architecture, not
+a claim that unchanged protocol can reach five times. Pre-register one
+factored-shape CPU/Metal parity test and one unchanged T25 treatment. Predict
+Stage 1 at 0.20--0.25 s, aggregate GPU-active improvement of at least 55 ms,
+and a complete improvement of at least 70 ms from the 2.726 s parent. Promote
+the kernel only if Stage 1 is at most 0.26 s, GPU-active improves by at least
+45 ms, the complete call improves by at least 60 ms, and proof, transcript,
+evaluation, verifier, schedule, routes, and memory remain exact. Restore the
+flat kernels without a repeat treatment on any miss.
+
+The single T25 treatment measured 2.601689 s complete, 0.701325 s GPU-active,
+and 0.268577 s for Stage 1. It preserved evaluation, proof, transcript,
+verifier, schedule, routes, and memory. The 124.453 ms complete improvement and
+90.337 ms GPU-active improvement cleared their gates, but Stage 1 missed its
+260 ms absolute ceiling by 8.577 ms. The candidate was therefore rejected and
+the flat kernels restored without remeasurement. The result still validates
+equality factorization as a useful operation count reduction; it does not
+justify retaining this one-threadgroup-per-high mapping.
+
+The combined post-cutover target budget is 0.565 s root decompose, at most
+0.30 s direct A relation, 0.20--0.25 s Stage 1, 0.27--0.32 s Stage 2, and at
+most 0.25 s for the remaining serialized tail. Its midpoint is about 1.43 s,
+so quotient removal and equality factoring are necessary but not sufficient;
+the direct-weight Stage-2 path and the 0.857 s residual tail retain independent
+falsifiers rather than being hidden behind an optimistic aggregate.
+
+### Resident reduced-source folding
+
+The first quotient-free treatment accidentally rebuilt, converted, and
+uploaded the complete reduced sources before every direct Stage-2 proof. At
+T25 these were a 512 MiB setup source and a 64 MiB sparse-challenge source.
+Keeping the two source tables resident and folding them in the same command
+stream as the witness removed that repeated host path. Exact CPU parity,
+transcript agreement, and verification all held. Stage 2 fell from 1.131 s to
+0.621 s and the complete Metal opening fell from 3.377 s to 2.950 s. The
+matching post-cutover CPU opening is 7.599 s, for 2.58x. GPU-active time was
+0.713 s and the complete proof remained 265,189 bytes.
+
+The retained implementation still constructs those 576 MiB in a host
+`Vec<F>` and then blits them once. This costs 185 ms in the separately measured
+Stage-2 preparation span and 155 ms of reported upload. Replace the values with
+a typed source plan: the setup source carries `(D, rows, columns, row weights,
+alpha)`, and the sparse source carries checked term offsets, positions, small
+coefficients, and `alpha`. The Metal backend reads its already-prepared setup,
+builds each negacyclic shift sequence directly into the resident table, and
+reports that command as GPU work. The CPU backend materializes the same plan
+through the canonical recurrence.
+
+Pre-register exact proof, transcript, evaluation, and verifier parity. Predict
+Stage-2 preparation below 20 ms, total upload below 80 ms, and complete T25 at
+most 2.82 s. Reject the first kernel mapping if Stage 2 is at least 0.62 s or
+the complete opening does not improve by 100 ms from 2.950 s. Independently of
+that mapping, retain the typed plan if parity holds: it removes a backend-
+neutral 576 MiB intermediate and is required for a max-buffer-safe T28 design.
+Do not run T28 until the initial two-round prefix can consume the semantic
+sources without allocating the full pre-fold table.
+
+The first device generator preserved exact parity and reduced peak RSS from
+8.62 GiB to 6.84 GiB, but failed its wall-time gates. Stage 2 reached 0.580 s,
+upload reached 113 ms, and complete opening reached 2.922 s, only 28 ms below
+the resident host-generated parent. GPU-active time increased from 0.713 s to
+0.791 s because one thread in each source-column group executed all 512
+dependent recurrence steps. Stage-2 preparation remained 192 ms; this exposed
+a separate dense lane-to-segment layout cost rather than source generation.
+
+Treat the recurrence as an affine prefix scan. Each of 32 SIMD lanes owns 16
+consecutive shifts, computes its local affine transform, scans the 32 block
+transforms with SIMD shuffles, then replays its 16 outputs from the resulting
+start state. The setup dot product and exact recurrence are unchanged. A
+focused setup-plus-sparse generator test must match the CPU recurrence before
+measurement. Predict generator GPU depth to fall by at least eightfold, Stage 2
+at most 0.55 s, aggregate GPU-active time at most 0.75 s, and complete opening
+at most 2.87 s. Reject the SIMD mapping if Stage 2 is at least 0.57 s,
+GPU-active improvement is below 30 ms, or complete improvement from 2.922 s is
+below 40 ms. Keep the semantic source plan independently of this mapping.
+
+The SIMD treatment remained exact. Stage 2 fell from 0.580 s to 0.532 s and
+the complete opening fell from 2.922 s to 2.850 s, but aggregate GPU-active
+time improved by only 10 ms, from 0.791 s to 0.781 s. It therefore missed the
+pre-registered 30 ms GPU gate. Root decomposition and Stage 1 moved by 22 ms
+and 17 ms in the opposite direction during the treatment, so the aggregate
+counter cannot isolate the generator. Do not promote this mapping from that
+run. Add dedicated source-construction command and GPU counters, and restore
+the sequential generator while testing the independent host-layout change.
+
+The remaining 0.19 s Stage-2 preparation path represented lane support three
+times: first as a per-lane `Option`, then as overlap entries in a `BTreeMap`,
+and finally as Metal CSR offsets. Replace these with one canonical CSR map
+(`segments`, `lane_offsets`, `lane_segments`) at preparation time. Packing
+merge concatenates segments and rebuilds the canonical map; Metal layout
+clones it without another support expansion. This preserves the checked
+strided segment representation and changes neither source values nor proof
+arithmetic.
+
+Pre-register the five focused evaluation-trace tests and direct-relation
+CPU/Metal parity before one sequential-generator T25 treatment. The treatment
+must preserve evaluation, proof, transcript, verifier, schedule, routes, and
+memory shape. Predict Stage-2 preparation at most 80 ms and complete opening
+at most 2.82 s. Reject the CSR implementation if preparation is at least
+120 ms or complete improvement is below 60 ms from the 2.922 s sequential
+device-generator parent. Report dedicated source command/GPU time so a later
+SIMD treatment can be judged without unrelated-kernel noise.
+
+The isolated CSR treatment passed. All five evaluation-trace tests and the
+focused CPU/Metal direct-relation proof passed first. At T25 the proof digest,
+transcript, evaluation, verifier, schedule, routes, and proof size remained
+exact. Stage-2 preparation fell from 192 ms to 93 ms, Stage 2 from 580 ms to
+503 ms, and the complete opening from 2.922 s to 2.723 s. The preparation
+result missed the 80 ms prediction but cleared the 120 ms rejection boundary;
+the 199 ms complete improvement cleared the 60 ms promotion gate. Peak RSS was
+7.21 GiB. Dedicated sequential source construction measured 86 ms command
+wall and 70 ms GPU-active, establishing the isolated ceiling for any successor
+generator mapping.
+
+### Register-distributed root histogram
+
+The retained packed D512 root fold launches one 256-thread group per output
+position. Its eight SIMDgroups issue 19.126 billion signed additions into one
+shared 512-bin atomic histogram. An earlier eight-position mapping retained
+eight separate shared atomic histograms, consumed 16 KiB of threadgroup memory,
+and lost occupancy; that result does not test register ownership.
+
+Assign one output position to each SIMDgroup and distribute its 512 bins as 16
+private `i32` accumulators per lane. For each batch of 32 contributions, route
+the packed `(destination, signed value)` from each source lane with
+`simd_shuffle`; only the lane owning `destination mod 32` updates its register.
+Each lane finally writes its 16 disjoint coefficients. This keeps selector and
+challenge reads, signed negacyclic rotation, arithmetic count, output order,
+and transcript unchanged, while removing all histogram atomics, threadgroup
+storage, and full-threadgroup barriers. Eight positions share a threadgroup
+only as eight independent SIMDgroups.
+
+Pre-register independent packed-fold CPU/Metal parity before one T25 treatment.
+Predict root decompose-fold at 0.22--0.32 s and complete opening at most 2.50 s.
+Promote if exact proof, transcript, evaluation, verifier, schedule, and routes
+hold, root decompose-fold is below 0.40 s, and complete gain from the 2.723 s
+CSR parent is at least 120 ms. Reject immediately on a Metal compile failure,
+focused mismatch, root time at least 0.40 s, or complete gain below 120 ms.
+
+The focused independent oracle and full proof remained exact, but the treatment
+was decisively rejected. Root decompose-fold took 10.937 s and complete opening
+took 13.146 s. Routing a batch of 32 contributions requires 32 SIMD broadcasts
+and comparisons; across 19.126 billion contributions this was about 20 times
+slower than the shared atomic parent. Restore the atomic kernel without a repeat
+treatment and close register-distributed histogramming on M4. The focused root
+oracle remains useful coverage for the specialized kernel.
+
+### Isolated affine source scan
+
+With canonical CSR retained, the sequential reduced-source generator now has a
+clean baseline of 86 ms command wall and 70 ms GPU-active. Reapply the exact
+32-lane affine prefix scan, without changing the accepted layout or any other
+kernel. The existing setup-plus-sparse recurrence oracle is the correctness
+gate. Run one T25 treatment and promote only if source GPU time improves by at
+least 20 ms, Stage 2 improves by at least 25 ms from 503 ms, complete opening
+does not regress from 2.723 s, and all proof/transcript/verifier/schedule guards
+remain exact. Reject without repeat measurement on any miss.
+
+The isolated affine scan passed every gate. Source construction fell from
+86 ms to 34 ms command wall and from 70 ms to 21 ms GPU-active. Stage 2 fell
+from 503 ms to 456 ms and complete opening fell from 2.723 s to 2.690 s. The
+proof digest, transcript, evaluation, verifier, schedule, route counters,
+265,189-byte proof size, and memory envelope remained exact. Retain the SIMD
+scan; its remaining 21 ms device cost is no longer a material target.
+
+### Live-prefix direct sumchecks
+
+The T38 root emits 337,224,640 live coefficients into a `2^29` sumcheck
+domain. Removing every remaining quotient and compression witness saves only
+109,520 coefficients in total, so neither change can cross the `2^28`
+boundary. The useful backend invariant is instead that the remaining
+199,646,272 entries form one zero suffix. After binding a low variable, a
+live prefix of length `L` remains a live prefix of length `ceil(L / 2)`.
+
+Both direct sumchecks may omit pairs outside that prefix without changing a
+round polynomial. Stage 1's range image is zero on a zero digit. In Stage 2,
+the virtual range term and the ordinary or reduced linear relation terms all
+contain the witness value or its pair delta, so a zero/zero pair contributes
+zero even when its equality, alpha, or lane weights are nonzero. Sparse
+additional pairs remain explicit; field-table reads outside the live prefix
+must return zero. The transcript domain, round count, round order, proof, and
+verifier are unchanged.
+
+Across all rounds, active pair work falls asymptotically from `2^29` to
+337,224,640, a ratio of 0.628. Allocate the two resident fp128 tables from the
+live length after the three compact-prefix rounds, track the live length
+separately from the protocol domain, and dispatch only
+`ceil(live_length / 2)` pairs. Existing non-power-of-two CPU/Metal parity tests
+are the focused gate. Run one T25 treatment after they pass. Predict Stage 1
+at 0.20--0.24 s, Stage 2 at 0.29--0.36 s, and complete opening at 2.35--2.48 s.
+Promote only with exact proof, transcript, evaluation, verifier, schedule, and
+routes, Stage 1 below 0.27 s, Stage 2 below 0.40 s, at least 100 ms complete
+gain from 2.690 s, and no memory regression.
+
+The first integrated attempt failed the Stage-2 final-claim check at a D64
+suffix. A new nonzero-relation focused case reproduced it. Skipping witness
+zeroes is sound during coefficient rounds, but the nonzero relation-lane weight
+table must still fold over its complete padded domain during later lane rounds;
+otherwise a future boundary pair reads a weight that was never produced.
+Restoring only those late full-domain weight folds fixed the regression. The
+ordinary virtual-only case, the nonzero relation case, and Stage 1 then all
+matched CPU.
+
+The corrected T25 treatment preserved the proof digest, transcript,
+evaluation, verifier, schedule, routes, and 265,189-byte proof. Complete
+opening fell from 2.690 s to 2.561 s, Stage 1 from 328 ms to 250 ms, Stage 2
+from 456 ms to 414 ms, GPU-active time from 771 ms to 661 ms, command wall
+from 914 ms to 787 ms, and reported allocation from 6.35 GB to 5.14 GB. Stage
+1 and the 100 ms complete-gain gate passed; Stage 2 missed its 400 ms ceiling
+by 14 ms. The discrepancy is analytical: the existing two-round prefix had
+already restricted the two dominant Stage-2 coefficient rounds to live lanes,
+so this change could only trim the remaining quarter of its geometric work.
+Retain the exact implementation and its memory reduction as the working
+parent, but record the Stage-2 prediction as missed rather than claiming a
+full gate pass.
+
 ## Claim-to-code map
 
 | Claim | Current code seam | Intended change |

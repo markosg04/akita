@@ -268,7 +268,9 @@ pub struct DirectLinearSegment<E: FieldCore> {
     pub factor: E,
     pub source_index: usize,
     pub target_lane_start: usize,
+    pub target_lane_stride: usize,
     pub source_lane_start: usize,
+    pub source_lane_stride: usize,
     pub lane_count: usize,
 }
 
@@ -281,11 +283,53 @@ pub struct DirectLinearLayout<E: FieldCore> {
     pub source_count: usize,
 }
 
-/// Current structured-linear source values or their dense lane-folded form.
+/// One compact sparse reduced-ring source.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DirectSparseLinearSource<E: FieldCore> {
+    pub ring_dimension: usize,
+    pub challenge_count: usize,
+    pub term_offsets: Vec<u32>,
+    pub positions: Vec<u32>,
+    pub coefficients: Vec<i8>,
+    pub alpha: E,
+}
+
+/// Source representation for a structured-linear Stage-2 term.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum DirectLinearSource<E: FieldCore> {
+    Values(Vec<E>),
+    ReducedSetup {
+        ring_dimension: usize,
+        row_count: usize,
+        column_count: usize,
+        row_weights: Vec<E>,
+        alpha: E,
+    },
+    ReducedSparse(DirectSparseLinearSource<E>),
+}
+
+impl<E: FieldCore> DirectLinearSource<E> {
+    pub fn element_len(&self) -> Option<usize> {
+        match self {
+            Self::Values(values) => Some(values.len()),
+            Self::ReducedSetup {
+                ring_dimension,
+                column_count,
+                ..
+            } => ring_dimension.checked_mul(*column_count),
+            Self::ReducedSparse(source) => {
+                source.ring_dimension.checked_mul(source.challenge_count)
+            }
+        }
+    }
+}
+
+/// Current structured-linear sources or their dense lane-folded form.
 #[doc(hidden)]
 pub struct DirectLinearRound<E: FieldCore> {
-    pub source_values: Vec<E>,
-    pub source_offsets: Vec<usize>,
+    pub sources: Vec<DirectLinearSource<E>>,
     pub dense_values: Option<Vec<E>>,
 }
 
@@ -393,7 +437,10 @@ mod round_flow;
 
 pub(crate) use additional_terms::AdditionalRelationTerms;
 pub(in crate::protocol) use coefficient_packing_terms::prepare_coefficient_packing_linear_terms;
-pub(crate) use evaluation_trace::{build_evaluation_trace_weights, PreparedProverLinearTerms};
+pub(crate) use evaluation_trace::{
+    build_evaluation_trace_weights, NegacyclicSetupLinearSegment, NegacyclicSetupLinearTerms,
+    PreparedProverLinearTerms,
+};
 #[cfg(test)]
 pub(crate) use evaluation_trace::{
     StructuredLinearSegment, StructuredLinearTerm, StructuredLinearWeights,

@@ -306,12 +306,45 @@ pub struct SetupContributionPlan<E: FieldCore> {
     pub(crate) d_physical_cols: usize,
     pub(crate) d_weights: Arc<[E]>,
     pub(crate) setup_index_tensors: Vec<ProjectedEqPairTensor<E>>,
+    pub(crate) non_a_setup_index_tensors: Vec<ProjectedEqPairTensor<E>>,
     pub(crate) relation_address: PreparedRelationAddress<E>,
     pub(crate) setup_relation_address: PreparedRelationAddress<E>,
     pub(crate) relation_base_bridge_point: Arc<[E]>,
     pub(crate) relation_address_geometry: crate::RelationAddressGeometry,
     pub(crate) projection_geometry: SetupProjectionGeometry,
     pub(crate) direct_scan_alpha: Option<E>,
+}
+
+/// Rank-N setup-product factors consumed by the recursive Stage-3 prover.
+pub struct SetupProductFactors<E: FieldCore> {
+    index_factors: Vec<Vec<E>>,
+    coefficient_factors: Vec<Vec<E>>,
+}
+
+impl<E: FieldCore> SetupProductFactors<E> {
+    pub(crate) fn new(
+        index_factors: Vec<Vec<E>>,
+        coefficient_factors: Vec<Vec<E>>,
+    ) -> Result<Self, AkitaError> {
+        if index_factors.is_empty()
+            || index_factors.len() != coefficient_factors.len()
+            || index_factors.iter().any(Vec::is_empty)
+            || coefficient_factors.iter().any(Vec::is_empty)
+        {
+            return Err(AkitaError::InvalidSetup(
+                "setup-product factor family is malformed".into(),
+            ));
+        }
+        Ok(Self {
+            index_factors,
+            coefficient_factors,
+        })
+    }
+
+    /// Consume the checked family as parallel index/coefficient factor lists.
+    pub fn into_parts(self) -> (Vec<Vec<E>>, Vec<Vec<E>>) {
+        (self.index_factors, self.coefficient_factors)
+    }
 }
 
 pub(crate) struct ProjectedEqPairTensor<E: FieldCore> {

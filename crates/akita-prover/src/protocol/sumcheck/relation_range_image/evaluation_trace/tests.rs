@@ -261,12 +261,18 @@ fn coefficient_folds_reuse_prepared_source_buffers() {
     let one_round_allocations = one_round
         .sources
         .iter()
-        .map(|source| (source.values.as_ptr(), source.values.capacity()))
+        .map(|source| match &source.source {
+            DirectLinearSource::Values(values) => (values.as_ptr(), values.capacity()),
+            _ => panic!("test source should be materialized"),
+        })
         .collect::<Vec<_>>();
     one_round.fold_coefficients(r0);
     for (source, &(pointer, capacity)) in one_round.sources.iter().zip(&one_round_allocations) {
-        assert_eq!(source.values.as_ptr(), pointer);
-        assert_eq!(source.values.capacity(), capacity);
+        let DirectLinearSource::Values(values) = &source.source else {
+            panic!("test source should be materialized");
+        };
+        assert_eq!(values.as_ptr(), pointer);
+        assert_eq!(values.capacity(), capacity);
     }
     let expected_one_round = dense
         .chunks_exact(coeff_count)
@@ -282,12 +288,18 @@ fn coefficient_folds_reuse_prepared_source_buffers() {
     let two_round_allocations = two_round
         .sources
         .iter()
-        .map(|source| (source.values.as_ptr(), source.values.capacity()))
+        .map(|source| match &source.source {
+            DirectLinearSource::Values(values) => (values.as_ptr(), values.capacity()),
+            _ => panic!("test source should be materialized"),
+        })
         .collect::<Vec<_>>();
     two_round.fold_two_coefficients(r0, r1);
     for (source, &(pointer, capacity)) in two_round.sources.iter().zip(&two_round_allocations) {
-        assert_eq!(source.values.as_ptr(), pointer);
-        assert_eq!(source.values.capacity(), capacity);
+        let DirectLinearSource::Values(values) = &source.source else {
+            panic!("test source should be materialized");
+        };
+        assert_eq!(values.as_ptr(), pointer);
+        assert_eq!(values.capacity(), capacity);
     }
     let expected_two_round = dense
         .chunks_exact(coeff_count)

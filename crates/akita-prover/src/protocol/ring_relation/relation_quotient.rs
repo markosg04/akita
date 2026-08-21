@@ -2,8 +2,7 @@ use super::*;
 use crate::api::commitment::for_each_outer_slice_input;
 use crate::backend::RingSwitchRelationView;
 use crate::compute::{
-    OperationCtx, RingSwitchProveBackend, RingSwitchRelationKernel, RingSwitchRelationPlan,
-    RuntimeRingSwitchProveBackend,
+    OperationCtx, RingSwitchRelationKernel, RingSwitchRelationPlan, RuntimeRingSwitchProveBackend,
 };
 use crate::protocol::ring_relation::{CompressionSourceId, CompressionWitnessMaterialization};
 use crate::protocol::ring_switch::PreparedRingSwitchGroup;
@@ -90,16 +89,23 @@ pub(crate) struct RelationQuotientRow<F: FieldCore> {
 /// the flat recursive witness.
 #[derive(Clone)]
 pub(crate) struct RelationQuotientOutput<F: FieldCore> {
-    rows: Vec<RelationQuotientRow<F>>,
+    rows: Vec<Option<RelationQuotientRow<F>>>,
 }
 
 impl<F: FieldCore> RelationQuotientOutput<F> {
-    fn from_slots(slots: Vec<Option<RelationQuotientRow<F>>>) -> Result<Self, AkitaError> {
-        let mut rows = Vec::with_capacity(slots.len());
-        for (index, row) in slots.into_iter().enumerate() {
-            rows.push(row.ok_or_else(|| {
-                AkitaError::InvalidInput(format!("relation quotient row {index} was not built"))
-            })?);
+    fn from_slots(
+        rows: Vec<Option<RelationQuotientRow<F>>>,
+        row_families: &[akita_types::RelationRowFamily],
+    ) -> Result<Self, AkitaError> {
+        if rows.len() != row_families.len() {
+            return Err(AkitaError::InvalidProof);
+        }
+        for (index, (row, family)) in rows.iter().zip(row_families).enumerate() {
+            if family.requires_quotient_witness() != row.is_some() {
+                return Err(AkitaError::InvalidInput(format!(
+                    "relation quotient row {index} has the wrong presence"
+                )));
+            }
         }
         Ok(Self { rows })
     }
@@ -126,7 +132,7 @@ impl<F: FieldCore> RelationQuotientOutput<F> {
         Ok(RelationQuotientRow { geometry, coeffs })
     }
 
-    pub(crate) fn rows(&self) -> &[RelationQuotientRow<F>] {
+    pub(crate) fn rows(&self) -> &[Option<RelationQuotientRow<F>>] {
         &self.rows
     }
 }
@@ -216,14 +222,12 @@ where
     Ok(CyclotomicRing::from_coefficients(high_half))
 }
 
-fn compute_group_a_relation_quotients<F, B, const D: usize>(
-    ring_switch_ctx: &OperationCtx<'_, F, B>,
+fn compute_group_consistency_quotient<F, const D: usize>(
     group: &PreparedRingSwitchGroup<'_, F>,
     group_opening: &RingRelationGroupOpening<F>,
-) -> Result<(RelationQuotientRow<F>, Vec<RelationQuotientRow<F>>), AkitaError>
+) -> Result<RelationQuotientRow<F>, AkitaError>
 where
     F: FieldCore + CanonicalField + FromPrimitiveInt + HalvingField,
-    B: RingSwitchProveBackend<F, D>,
 {
     if group.role_dims.d_a() != D {
         return Err(AkitaError::InvalidSize {
@@ -231,45 +235,12 @@ where
             actual: D,
         });
     }
-    let backend = ring_switch_ctx.backend();
-    let prepared = ring_switch_ctx.prepared();
-    let n_a = group.params.a_rows_len();
     let inner_width = group.params.a_col_len();
-    let log_basis_outer = group.params.log_basis_outer();
-    let log_basis_open = group.params.log_basis_open();
     let challenges = group_opening.ambient_a_challenges();
-    let recomposed_inner_rows = group.recomposed_inner_rows.as_ring_slice::<D>()?;
     let (z_centered, z_remainder) = group.z_centered.as_chunks::<D>();
     if !z_remainder.is_empty() || z_centered.len() != inner_width {
         return Err(AkitaError::InvalidProof);
     }
-
-    let relation_rows = RingSwitchRelationKernel::relation_rows(
-        backend,
-        prepared,
-        RingSwitchRelationView {
-            e_hat: &[],
-            t_hat: &[],
-            z_segment: z_centered,
-            z_folded_centered_inf_norm: group.z_inf,
-        },
-        RingSwitchRelationPlan {
-            n_d: 0,
-            n_b: 0,
-            n_a,
-            log_basis_open,
-            log_basis_outer,
-        },
-    )
-    .map_err(|err| AkitaError::InvalidInput(format!("A quotient rows failed: {err:?}")))?;
-    if !relation_rows.d_negacyclic.is_empty()
-        || !relation_rows.d_cyclic.is_empty()
-        || !relation_rows.b_cyclic.is_empty()
-        || relation_rows.a_quotients.len() != n_a
-    {
-        return Err(AkitaError::InvalidProof);
-    }
-    let a_quotients = relation_rows.a_quotients;
 
     let consistency_quotient = match &group.folded_opening {
         OpeningFamily::EvaluationTrace(e_folded)
@@ -313,25 +284,7 @@ where
         }
     };
 
-    let num_live_blocks_per_claim = group.params.num_live_blocks();
-    let mut a_rows = Vec::with_capacity(n_a);
-    for (a_idx, a_q) in a_quotients.iter().enumerate() {
-        let mut quotient = parallel_high_half_accumulate::<F, _, D>(challenges, |i| {
-            let claim_idx = i / num_live_blocks_per_claim;
-            let block_idx = i % num_live_blocks_per_claim;
-            let inner_idx = claim_idx * num_live_blocks_per_claim + block_idx;
-            recomposed_inner_rows
-                .get(inner_idx.checked_mul(n_a)?.checked_add(a_idx)?)
-                .copied()
-        })?;
-        for (dst, src) in quotient.iter_mut().zip(a_q.coefficients()) {
-            *dst -= *src;
-        }
-        a_rows.push(RelationQuotientOutput::row_from_ring(
-            CyclotomicRing::<F, D>::from_slice(&quotient),
-        )?);
-    }
-    Ok((consistency_quotient, a_rows))
+    Ok(consistency_quotient)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -534,17 +487,11 @@ where
             group_dims.d_b(),
         )?;
 
-        let (consistency_quotient, a_quotients) = akita_types::dispatch_for_field!(
+        let consistency_quotient = akita_types::dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Inner),
             F,
             group_dims.d_a(),
-            |D_A| {
-                compute_group_a_relation_quotients::<F, B, D_A>(
-                    ring_switch_ctx,
-                    group,
-                    group_opening,
-                )
-            }
+            |D_A| compute_group_consistency_quotient::<F, D_A>(group, group_opening)
         )?;
         if result
             .get(consistency_row)
@@ -555,12 +502,8 @@ where
         }
         result[consistency_row] = Some(consistency_quotient);
 
-        let a_range = lp.a_row_range(opening_batch, group_index)?;
-        if a_range.len() != n_a || a_quotients.len() != n_a {
+        if lp.a_row_range(opening_batch, group_index)?.len() != n_a {
             return Err(AkitaError::InvalidProof);
-        }
-        for (row_idx, quotient) in a_range.zip(a_quotients) {
-            result[row_idx] = Some(quotient);
         }
 
         y_offset = y_offset
@@ -746,7 +689,7 @@ where
     if y_offset != y.coeff_len() {
         return Err(AkitaError::InvalidProof);
     }
-    RelationQuotientOutput::from_slots(result)
+    RelationQuotientOutput::from_slots(result, &row_families)
 }
 
 #[cfg(test)]

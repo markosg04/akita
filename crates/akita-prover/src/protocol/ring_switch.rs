@@ -33,6 +33,7 @@ pub use commit::{commit_terminal_w, commit_w, NextWitnessState, NextWitnessState
 pub(crate) use commit::{commit_w_with_prefix, prepare_recursive_commit_prefix};
 pub use evals::build_w_evals_compact;
 pub(crate) use finalize::ring_switch_finalize;
+pub(crate) use relation_weights::build_negacyclic_setup_linear_terms;
 pub use relation_weights::{
     build_relation_weight_events, RelationSetupSource, RelationWeightContribution,
     RelationWeightEvent, RelationWeightEventInputs, RelationWeightEvents,
@@ -68,4 +69,6 @@ pub(crate) struct RingSwitchFinalization<E: FieldCore> {
     pub(crate) output: RingSwitchOutput<E>,
     pub(crate) relation_plan: RelationRangeImagePlan,
     pub(crate) opening_semantics: OpeningFamily<(), CoefficientPackingBatchSemantics<E>>,
+    pub(crate) negacyclic_setup_linear_terms:
+        crate::protocol::sumcheck::relation_range_image::NegacyclicSetupLinearTerms<E>,
 }

@@ -184,6 +184,8 @@ where
                 opening_points,
             })?;
         let ordinary = events.factor_common_alpha()?;
+        let negacyclic_setup_linear_terms =
+            build_negacyclic_setup_linear_terms(setup, instance, alpha, lp, &tau1, &relation_plan)?;
         let compression = lp
             .payload_mode
             .is_compressed()
@@ -200,7 +202,12 @@ where
                 )
             })
             .transpose()?;
-        Ok::<_, AkitaError>((ordinary, compression, opening_semantics))
+        Ok::<_, AkitaError>((
+            ordinary,
+            compression,
+            opening_semantics,
+            negacyclic_setup_linear_terms,
+        ))
     };
 
     #[cfg(feature = "parallel")]
@@ -225,10 +232,14 @@ where
         (relation_weight_factorization, w_compact)
     };
 
-    let (relation_weight_factorization, compression_relation_weights, opening_semantics) =
-        relation_weight_factorization_result.map_err(|err| {
-            AkitaError::InvalidInput(format!("relation-weight compilation failed: {err:?}"))
-        })?;
+    let (
+        relation_weight_factorization,
+        compression_relation_weights,
+        opening_semantics,
+        negacyclic_setup_linear_terms,
+    ) = relation_weight_factorization_result.map_err(|err| {
+        AkitaError::InvalidInput(format!("relation-weight compilation failed: {err:?}"))
+    })?;
     let (w_evals_compact, witness_col_bits, witness_ring_bits) = w_result.map_err(|err| {
         AkitaError::InvalidInput(format!("witness opening materialization failed: {err:?}"))
     })?;
@@ -252,5 +263,6 @@ where
         },
         relation_plan,
         opening_semantics,
+        negacyclic_setup_linear_terms,
     })
 }

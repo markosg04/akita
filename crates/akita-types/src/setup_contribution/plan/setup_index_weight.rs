@@ -2,13 +2,19 @@ use super::physical_b::build_group_b_setup_tensors;
 use super::types::{ProjectedEqPairTensor, ProjectedEqPairTensorState};
 use super::*;
 use akita_algebra::{
+    eq_poly::EqPolynomial,
     offset_eq::{
         eval_boolean_pair_tensor_families, materialize_eq_tensor_left, EqPairTensorAxis,
         EqPairTensorFamily, OffsetEqWindow,
     },
-    ring::{evaluate_power_sequence_mle, scalar_powers_with_stride},
+    poly::multilinear_eval,
+    ring::{
+        eval_negacyclic_shift_sequence, evaluate_power_sequence_mle, scalar_powers,
+        scalar_powers_with_stride, CyclotomicRing,
+    },
 };
 use akita_field::fft::field_pow;
+use akita_field::Zero;
 
 struct GroupSetupIndexWeights<E> {
     projection_scales: [Option<Vec<E>>; 3],
@@ -76,6 +82,18 @@ impl<E: FieldCore> SetupContributionPlan<E> {
 
     /// Materialize the dense packed setup-position weight vector.
     pub fn materialize_setup_index_weights(&self, alpha: E) -> Result<Vec<E>, AkitaError> {
+        self.materialize_setup_index_weights_matching(alpha, true)
+    }
+
+    fn materialize_non_a_setup_index_weights(&self, alpha: E) -> Result<Vec<E>, AkitaError> {
+        self.materialize_setup_index_weights_matching(alpha, false)
+    }
+
+    fn materialize_setup_index_weights_matching(
+        &self,
+        alpha: E,
+        include_a: bool,
+    ) -> Result<Vec<E>, AkitaError> {
         // Both power families depend only on the group. Hoist their allocation
         // and exponentiation out of the potentially million-element setup loop.
         let group_weights = self
@@ -113,7 +131,7 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         (0..self.required())
-            .map(|setup_idx| self.setup_index_weight_at(setup_idx, &group_weights))
+            .map(|setup_idx| self.setup_index_weight_at(setup_idx, &group_weights, include_a))
             .collect()
     }
 
@@ -132,6 +150,27 @@ impl<E: FieldCore> SetupContributionPlan<E> {
         rho_setup_idx: &[E],
         alpha: E,
     ) -> Result<E, AkitaError> {
+        self.evaluate_setup_index_tensor_family(&self.setup_index_tensors, rho_setup_idx, alpha)
+    }
+
+    fn evaluate_non_a_setup_index_weight_mle(
+        &self,
+        rho_setup_idx: &[E],
+        alpha: E,
+    ) -> Result<E, AkitaError> {
+        self.evaluate_setup_index_tensor_family(
+            &self.non_a_setup_index_tensors,
+            rho_setup_idx,
+            alpha,
+        )
+    }
+
+    fn evaluate_setup_index_tensor_family(
+        &self,
+        tensors: &[ProjectedEqPairTensor<E>],
+        rho_setup_idx: &[E],
+        alpha: E,
+    ) -> Result<E, AkitaError> {
         let expected = self.projection_geometry.setup_index_len().trailing_zeros() as usize;
         if rho_setup_idx.len() != expected {
             return Err(AkitaError::InvalidSize {
@@ -140,7 +179,7 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             });
         }
         let _span = tracing::info_span!("stage3_setup_index_weight_mle").entered();
-        self.setup_index_tensors
+        tensors
             .iter()
             .try_fold(E::zero(), |evaluation, batch| {
                 let ratio = batch.ratio;
@@ -221,9 +260,290 @@ impl<E: FieldCore> SetupContributionPlan<E> {
             })
     }
 
+    /// Materialize the full Stage-3 product family at one fixed Stage-2 point.
+    pub fn materialize_setup_product_factors<F>(
+        &self,
+        alpha: E,
+        stage2_coefficient_point: &[E],
+    ) -> Result<SetupProductFactors<E>, AkitaError>
+    where
+        F: FieldCore + CanonicalField,
+    {
+        self.validate_stage2_coefficient_point(stage2_coefficient_point)?;
+        let setup_index_len = self.projection_geometry.setup_index_len();
+        let setup_coefficient_len = self.projection_geometry.base_ring_dim();
+        let common_alpha = evaluate_power_sequence_mle(alpha, stage2_coefficient_point);
+
+        let mut normal_index = self.materialize_non_a_setup_index_weights(alpha)?;
+        normal_index.resize(setup_index_len, E::zero());
+        let normal_coefficient = scalar_powers(alpha, setup_coefficient_len)
+            .into_iter()
+            .map(|power| common_alpha * power)
+            .collect::<Vec<_>>();
+        let mut index_factors = vec![normal_index];
+        let mut coefficient_factors = vec![normal_coefficient];
+
+        for group in &self.groups {
+            let group_indices = self.materialize_negacyclic_a_index_factors(group)?;
+            let group_coefficients =
+                self.negacyclic_a_coefficient_factors::<F>(group, alpha, stage2_coefficient_point)?;
+            if group_indices.len() != group_coefficients.len() {
+                return Err(AkitaError::InvalidProof);
+            }
+            index_factors.extend(group_indices);
+            coefficient_factors.extend(group_coefficients);
+        }
+        SetupProductFactors::new(index_factors, coefficient_factors)
+    }
+
+    /// Evaluate the full setup contribution directly at one Stage-2 point.
+    pub fn evaluate_setup_product_direct<F>(
+        &self,
+        setup: &AkitaExpandedSetup<F>,
+        alpha: E,
+        stage2_coefficient_point: &[E],
+    ) -> Result<E, AkitaError>
+    where
+        F: FieldCore + CanonicalField,
+        E: MulBaseUnreduced<F>,
+    {
+        let (index_factors, coefficient_factors) = self
+            .materialize_setup_product_factors::<F>(alpha, stage2_coefficient_point)?
+            .into_parts();
+        let required = self.projection_geometry.required();
+        let coefficient_len = self.projection_geometry.base_ring_dim();
+        let source_len = required
+            .checked_mul(coefficient_len)
+            .ok_or_else(|| AkitaError::InvalidSetup("direct setup source overflow".into()))?;
+        let setup_source = setup
+            .shared_matrix()
+            .as_field_slice()
+            .get(..source_len)
+            .ok_or_else(|| AkitaError::InvalidSetup("direct setup source is too short".into()))?;
+        if index_factors.iter().any(|factor| factor.len() < required)
+            || coefficient_factors
+                .iter()
+                .any(|factor| factor.len() != coefficient_len)
+        {
+            return Err(AkitaError::InvalidProof);
+        }
+        Ok(cfg_fold_reduce!(
+            0..required,
+            E::zero,
+            |sum, setup_index| {
+                let row_start = setup_index * coefficient_len;
+                let row = &setup_source[row_start..row_start + coefficient_len];
+                let mut accumulator =
+                    <E as akita_field::unreduced::HasUnreducedOps>::ProductAccum::zero();
+                for (coefficient, &setup_coefficient) in row.iter().enumerate() {
+                    let factor = index_factors.iter().zip(&coefficient_factors).fold(
+                        E::zero(),
+                        |factor, (index, coefficients)| {
+                            factor + index[setup_index] * coefficients[coefficient]
+                        },
+                    );
+                    accumulator += factor.mul_base_to_product_accum(setup_coefficient);
+                }
+                sum + E::reduce_product_accum(accumulator)
+            },
+            |left, right| left + right
+        ))
+    }
+
+    /// Evaluate the verifier-side sum of Stage-3 factor products.
+    pub fn evaluate_setup_product_factor_sum<F>(
+        &self,
+        alpha: E,
+        stage2_coefficient_point: &[E],
+        stage3_coefficient_point: &[E],
+        stage3_setup_index_point: &[E],
+    ) -> Result<E, AkitaError>
+    where
+        F: FieldCore + CanonicalField,
+    {
+        self.validate_stage2_coefficient_point(stage2_coefficient_point)?;
+        let expected_coefficient_bits = self.projection_geometry.ring_bits();
+        let expected_index_bits =
+            self.projection_geometry.setup_index_len().trailing_zeros() as usize;
+        if stage3_coefficient_point.len() != expected_coefficient_bits
+            || stage3_setup_index_point.len() != expected_index_bits
+        {
+            return Err(AkitaError::InvalidProof);
+        }
+
+        let common_alpha = evaluate_power_sequence_mle(alpha, stage2_coefficient_point);
+        let normal = common_alpha
+            * evaluate_power_sequence_mle(alpha, stage3_coefficient_point)
+            * self.evaluate_non_a_setup_index_weight_mle(stage3_setup_index_point, alpha)?;
+        let mut evaluation = normal;
+        for group in &self.groups {
+            let index_evaluations =
+                self.evaluate_negacyclic_a_index_factor_mles(group, stage3_setup_index_point)?;
+            let coefficient_factors =
+                self.negacyclic_a_coefficient_factors::<F>(group, alpha, stage2_coefficient_point)?;
+            if index_evaluations.len() != coefficient_factors.len() {
+                return Err(AkitaError::InvalidProof);
+            }
+            for (index, coefficient) in index_evaluations.into_iter().zip(coefficient_factors) {
+                evaluation += index * multilinear_eval(&coefficient, stage3_coefficient_point)?;
+            }
+        }
+        Ok(evaluation)
+    }
+
+    fn validate_stage2_coefficient_point(&self, point: &[E]) -> Result<(), AkitaError> {
+        let expected = self
+            .relation_address_geometry
+            .relation_coefficient_variable_count();
+        if point.len() != expected {
+            return Err(AkitaError::InvalidSize {
+                expected,
+                actual: point.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn negacyclic_a_tensor_families(
+        &self,
+        group: &SetupContributionGroupPlan<E>,
+    ) -> Result<Vec<EqPairTensorFamily<E>>, AkitaError> {
+        let lifted = group
+            .a_tensors
+            .iter()
+            .map(|tensor| lift_role_tensor(tensor, 0, group.z_cols, &group.a_row_weights))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut families = compact_affine_unit_families(lifted, 1)?;
+        if group.a_relation_ratio > 1 {
+            factor_aligned_role_tensors(&mut families, group.a_relation_ratio)?;
+        } else if !role_tensors_are_aligned(&families, 1) {
+            return Err(AkitaError::InvalidSetup(
+                "direct A tensors are not relation-lane aligned".into(),
+            ));
+        }
+        Ok(families)
+    }
+
+    fn negacyclic_relation_high_point<'a>(
+        &'a self,
+        group: &SetupContributionGroupPlan<E>,
+    ) -> Result<&'a [E], AkitaError> {
+        let low_bits = group.a_relation_ratio.trailing_zeros() as usize;
+        self.relation_address
+            .point()
+            .get(low_bits..)
+            .ok_or(AkitaError::InvalidProof)
+    }
+
+    fn materialize_negacyclic_a_index_factors(
+        &self,
+        group: &SetupContributionGroupPlan<E>,
+    ) -> Result<Vec<Vec<E>>, AkitaError> {
+        let families = self.negacyclic_a_tensor_families(group)?;
+        let relation_high = self.negacyclic_relation_high_point(group)?;
+        let equality = OffsetEqWindow::new(relation_high)?;
+        let native_len = group
+            .n_a
+            .checked_mul(group.z_cols)
+            .ok_or_else(|| AkitaError::InvalidSetup("direct A footprint overflow".into()))?;
+        let native_weights = materialize_eq_tensor_left(&equality, &families, native_len)?;
+        let setup_index_len = self.projection_geometry.setup_index_len();
+        let mut factors = (0..group.a_ratio)
+            .map(|_| vec![E::zero(); setup_index_len])
+            .collect::<Vec<_>>();
+        for (native_index, &weight) in native_weights.iter().enumerate() {
+            let base = native_index
+                .checked_mul(group.a_ratio)
+                .ok_or_else(|| AkitaError::InvalidSetup("direct A index overflow".into()))?;
+            for (subring, factor) in factors.iter_mut().enumerate() {
+                let setup_index = base
+                    .checked_add(subring)
+                    .ok_or_else(|| AkitaError::InvalidSetup("direct A index overflow".into()))?;
+                *factor
+                    .get_mut(setup_index)
+                    .ok_or(AkitaError::InvalidProof)? = weight;
+            }
+        }
+        Ok(factors)
+    }
+
+    fn evaluate_negacyclic_a_index_factor_mles(
+        &self,
+        group: &SetupContributionGroupPlan<E>,
+        setup_index_point: &[E],
+    ) -> Result<Vec<E>, AkitaError> {
+        let low_bits = group.a_ratio.trailing_zeros() as usize;
+        let setup_low = setup_index_point
+            .get(..low_bits)
+            .ok_or(AkitaError::InvalidProof)?;
+        let setup_high = setup_index_point
+            .get(low_bits..)
+            .ok_or(AkitaError::InvalidProof)?;
+        let families = self.negacyclic_a_tensor_families(group)?;
+        let relation_high = self.negacyclic_relation_high_point(group)?;
+        let base = eval_boolean_pair_tensor_families::<_, false, false>(
+            setup_high,
+            relation_high,
+            &families,
+        )?;
+        Ok(EqPolynomial::evals(setup_low)?
+            .into_iter()
+            .map(|selector| selector * base)
+            .collect())
+    }
+
+    fn negacyclic_a_coefficient_factors<F>(
+        &self,
+        group: &SetupContributionGroupPlan<E>,
+        alpha: E,
+        stage2_coefficient_point: &[E],
+    ) -> Result<Vec<Vec<E>>, AkitaError>
+    where
+        F: FieldCore + CanonicalField,
+    {
+        let low_relation_bits = group.a_relation_ratio.trailing_zeros() as usize;
+        let relation_low = self
+            .relation_address
+            .point()
+            .get(..low_relation_bits)
+            .ok_or(AkitaError::InvalidProof)?;
+        let mut shift_point =
+            Vec::with_capacity(stage2_coefficient_point.len() + low_relation_bits);
+        shift_point.extend_from_slice(stage2_coefficient_point);
+        shift_point.extend_from_slice(relation_low);
+        let expected_shift_bits = group.role_dims.d_a().trailing_zeros() as usize;
+        if shift_point.len() != expected_shift_bits {
+            return Err(AkitaError::InvalidSize {
+                expected: expected_shift_bits,
+                actual: shift_point.len(),
+            });
+        }
+        let shift_weights = EqPolynomial::evals(&shift_point)?;
+        let setup_coefficient_len = self.projection_geometry.base_ring_dim();
+        dispatch_for_field!(
+            akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Inner),
+            F,
+            group.role_dims.d_a(),
+            |D_A| {
+                let shift_ring = CyclotomicRing::<E, D_A>::from_slice(&shift_weights);
+                let coefficient_weights = eval_negacyclic_shift_sequence(&shift_ring, alpha);
+                if coefficient_weights.len() != group.a_ratio * setup_coefficient_len {
+                    return Err(AkitaError::InvalidProof);
+                }
+                Ok::<_, AkitaError>(
+                    coefficient_weights
+                        .chunks_exact(setup_coefficient_len)
+                        .map(<[E]>::to_vec)
+                        .collect(),
+                )
+            }
+        )
+    }
+
     pub(crate) fn prepare_setup_index_tensors(
         &mut self,
         witness_layout: &WitnessLayout,
+        include_a: bool,
     ) -> Result<Vec<ProjectedEqPairTensor<E>>, AkitaError> {
         let relation_geometry = self.relation_address_geometry;
         for group in &mut self.groups {
@@ -239,7 +559,9 @@ impl<E: FieldCore> SetupContributionPlan<E> {
         for group in &self.groups {
             self.append_d_tensors(group, &mut batches)?;
             self.append_b_tensors(group, &mut batches)?;
-            self.append_a_tensors(group, &mut batches)?;
+            if include_a {
+                self.append_a_tensors(group, &mut batches)?;
+            }
         }
         for batch in &mut batches {
             if batch.ratio > 1 && role_tensors_are_aligned(&batch.families, batch.ratio) {
@@ -282,6 +604,7 @@ impl<E: FieldCore> SetupContributionPlan<E> {
         &self,
         setup_idx: usize,
         group_weights: &[GroupSetupIndexWeights<E>],
+        include_a: bool,
     ) -> Result<E, AkitaError> {
         let geometry = self.projection_geometry;
         if setup_idx >= geometry.required() {
@@ -325,19 +648,21 @@ impl<E: FieldCore> SetupContributionPlan<E> {
                     .map_or(term, |scale| scale[setup_idx % group.b_ratio] * term);
             }
 
-            let a_idx = setup_idx / group.a_ratio;
-            let a_footprint = group
-                .n_a
-                .checked_mul(group.z_cols)
-                .ok_or_else(|| AkitaError::InvalidSetup("setup A footprint overflow".into()))?;
-            if a_idx < a_footprint {
-                let a_col = a_idx % group.z_cols;
-                let a_row = a_idx / group.z_cols;
-                let term = group.a_row_weights[a_row]
-                    * *z_eq.get(a_col).ok_or(AkitaError::InvalidProof)?;
-                weight += scales[0]
-                    .as_ref()
-                    .map_or(term, |scale| scale[setup_idx % group.a_ratio] * term);
+            if include_a {
+                let a_idx = setup_idx / group.a_ratio;
+                let a_footprint = group
+                    .n_a
+                    .checked_mul(group.z_cols)
+                    .ok_or_else(|| AkitaError::InvalidSetup("setup A footprint overflow".into()))?;
+                if a_idx < a_footprint {
+                    let a_col = a_idx % group.z_cols;
+                    let a_row = a_idx / group.z_cols;
+                    let term = group.a_row_weights[a_row]
+                        * *z_eq.get(a_col).ok_or(AkitaError::InvalidProof)?;
+                    weight += scales[0]
+                        .as_ref()
+                        .map_or(term, |scale| scale[setup_idx % group.a_ratio] * term);
+                }
             }
         }
         Ok(weight)

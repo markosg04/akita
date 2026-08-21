@@ -6,7 +6,6 @@ use crate::protocol::ring_switch::RelationMatrixEvaluator;
 use akita_algebra::eq_poly::{EqPolynomial, SplitEqEvals};
 #[cfg(test)]
 use akita_algebra::ring::eval_ring_at_pows_fast;
-use akita_algebra::ring::evaluate_power_sequence_mle;
 #[cfg(test)]
 use akita_field::parallel::*;
 use akita_field::{AkitaError, CanonicalField, ExtField, FieldCore, FromPrimitiveInt};
@@ -32,6 +31,7 @@ use akita_types::{
 pub(crate) struct SetupSumcheckVerifier<E: FieldCore> {
     setup_contribution_plan: SetupContributionPlan<E>,
     alpha: E,
+    stage2_coefficient_point: Vec<E>,
     ring_bits: usize,
     rounds: usize,
 }
@@ -46,6 +46,7 @@ impl<E: FieldCore> SetupSumcheckVerifier<E> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new<F>(
         relation_matrix_evaluator: &RelationMatrixEvaluator<E>,
+        stage2_coefficient_point: &[E],
         x_challenges: &[E],
         alpha: E,
     ) -> Result<Self, AkitaError>
@@ -69,6 +70,7 @@ impl<E: FieldCore> SetupSumcheckVerifier<E> {
         Ok(Self {
             setup_contribution_plan: plan,
             alpha,
+            stage2_coefficient_point: stage2_coefficient_point.to_vec(),
             ring_bits: geometry.ring_bits(),
             rounds: geometry.rounds(),
         })
@@ -149,13 +151,17 @@ impl<E: FieldCore> SetupSumcheckVerifier<E> {
             let _span = tracing::info_span!("stage3_setup_prefix", cached = true).entered();
             setup_prefix_eval
         };
-        let setup_index_weight = {
-            let _span = tracing::info_span!("stage3_setup_index_weight_eval").entered();
+        let factor_sum = {
+            let _span = tracing::info_span!("stage3_setup_factor_sum_eval").entered();
             self.setup_contribution_plan
-                .evaluate_setup_index_weight_mle(rho_setup_idx, self.alpha)?
+                .evaluate_setup_product_factor_sum::<F>(
+                    self.alpha,
+                    &self.stage2_coefficient_point,
+                    rho_y,
+                    rho_setup_idx,
+                )?
         };
-        let alpha_val = evaluate_power_sequence_mle(self.alpha, rho_y);
-        let setup_term = setup_val * setup_index_weight * alpha_val;
+        let setup_term = setup_val * factor_sum;
         if final_claim != setup_term {
             return Err(AkitaError::InvalidInput(
                 "Stage 3 setup-product claim disagrees with the projected setup opening".into(),

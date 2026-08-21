@@ -82,8 +82,12 @@ fn layout_indexing_matches_digit_innermost_semantics() {
     );
     assert_eq!(
         layout.r_coefficient_index(2, 1, 0, 0).expect("r"),
-        layout.r_rows()[2].range().start
-            + layout.r_rows()[2].geometry().physical_coefficient_width()
+        layout.r_rows()[2].as_ref().expect("R row").range().start
+            + layout.r_rows()[2]
+                .as_ref()
+                .expect("R row")
+                .geometry()
+                .physical_coefficient_width()
     );
     assert_eq!(opening_batch.num_total_polynomials(), 2);
 }
@@ -126,8 +130,12 @@ fn balanced_chunks_are_exact_and_contiguous() {
                 .expect("H address"),
             layer.h_span().range().start + layer.h_span().map().ring_dimension() + 2
         );
-        let f_quotient = &layout.r_rows()[layer.f_quotient_rows()[0].1];
-        let h_quotient = &layout.r_rows()[layer.h_quotient_row()];
+        let f_quotient = layout.r_rows()[layer.f_quotient_rows()[0].1]
+            .as_ref()
+            .expect("F quotient");
+        let h_quotient = layout.r_rows()[layer.h_quotient_row()]
+            .as_ref()
+            .expect("H quotient");
         assert_eq!(layer.f_quotient_rows()[0].0, 0);
         assert_eq!(f_quotient.range().start, layer.h_span().range().end);
         assert_eq!(h_quotient.range().start, f_quotient.range().end);

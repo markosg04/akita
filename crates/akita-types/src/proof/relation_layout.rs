@@ -238,6 +238,12 @@ impl RelationRowFamily {
             | Self::CompressionH { geometry, .. } => geometry,
         }
     }
+
+    /// Whether this relation row is represented by a quotient in the recursive witness.
+    #[must_use]
+    pub const fn requires_quotient_witness(self) -> bool {
+        !matches!(self, Self::Inner { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

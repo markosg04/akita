@@ -33,6 +33,12 @@ pub struct CpuPreparedSetup<F: FieldCore> {
     pub(super) ntt_slot_build_count: AtomicUsize,
 }
 
+impl<F: FieldCore> CpuPreparedSetup<F> {
+    pub(crate) fn expanded_setup(&self) -> &AkitaExpandedSetup<F> {
+        self.expanded.as_ref()
+    }
+}
+
 pub(super) struct ErasedCpuNttCache {
     pub(super) ring_d: usize,
     pub(super) cache_bytes: usize,

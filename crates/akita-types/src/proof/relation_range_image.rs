@@ -518,13 +518,18 @@ impl RelationRangeImagePlan {
                 "witness layout does not end in one shared quotient range".into(),
             ));
         }
-        let row_geometries = relation_witness_geometry.rhs_layout().row_geometries()?;
-        if witness_layout.r_rows().len() != row_geometries.len()
+        let row_families = relation_witness_geometry.rhs_layout().row_families()?;
+        if witness_layout.r_rows().len() != row_families.len()
             || witness_layout
                 .r_rows()
                 .iter()
-                .zip(row_geometries)
-                .any(|(row, geometry)| row.geometry() != geometry)
+                .zip(row_families)
+                .any(|(row, family)| {
+                    family.requires_quotient_witness() != row.is_some()
+                        || row
+                            .as_ref()
+                            .is_some_and(|row| row.geometry() != family.geometry())
+                })
         {
             return Err(AkitaError::InvalidSetup(
                 "witness quotient rows disagree with relation geometry".into(),
@@ -700,13 +705,17 @@ mod tests {
         }
         let quotient_rows = relation_geometry
             .rhs_layout()
-            .row_geometries()
+            .row_families()
             .unwrap()
             .into_iter()
-            .map(|geometry| {
+            .map(|family| {
+                if !family.requires_quotient_witness() {
+                    return None;
+                }
+                let geometry = family.geometry();
                 let range = cursor..cursor + geometry.physical_coefficient_width();
                 cursor = range.end;
-                WitnessQuotientRowLayout::new_for_test(geometry, range)
+                Some(WitnessQuotientRowLayout::new_for_test(geometry, range))
             })
             .collect();
         WitnessLayout::new_for_test(units, quotient_rows, 1)
@@ -864,10 +873,10 @@ mod tests {
         .unwrap();
 
         let mut wrong_rows = witness_layout.r_rows().to_vec();
-        wrong_rows[0] = WitnessQuotientRowLayout::new_for_test(
+        wrong_rows[0] = Some(WitnessQuotientRowLayout::new_for_test(
             RelationRowGeometry::new(32, 2).unwrap(),
-            wrong_rows[0].range(),
-        );
+            wrong_rows[0].as_ref().unwrap().range(),
+        ));
         let malformed = WitnessLayout::new_for_test(
             witness_layout.units().to_vec(),
             wrong_rows,
@@ -883,10 +892,19 @@ mod tests {
         .is_err());
 
         let mut duplicated_rows = witness_layout.r_rows().to_vec();
-        duplicated_rows[1] = WitnessQuotientRowLayout::new_for_test(
-            duplicated_rows[1].geometry(),
-            duplicated_rows[0].range(),
-        );
+        let present_rows = duplicated_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.is_some().then_some(index))
+            .collect::<Vec<_>>();
+        let first = present_rows[0];
+        let second = present_rows[1];
+        let duplicated_geometry = duplicated_rows[second].as_ref().unwrap().geometry();
+        let duplicated_range = duplicated_rows[first].as_ref().unwrap().range();
+        duplicated_rows[second] = Some(WitnessQuotientRowLayout::new_for_test(
+            duplicated_geometry,
+            duplicated_range,
+        ));
         let malformed = WitnessLayout::new_for_test(
             witness_layout.units().to_vec(),
             duplicated_rows,

@@ -89,7 +89,7 @@ pub struct WitnessLayout {
     units: Vec<WitnessUnitLayout>,
     compression_layers: Vec<CompressionWitnessLayerLayout>,
     compression_alignment_ranges: Vec<Range<usize>>,
-    r_rows: Vec<WitnessQuotientRowLayout>,
+    r_rows: Vec<Option<WitnessQuotientRowLayout>>,
     /// Envelope containing every shared quotient and compression layer.
     r_range: Range<usize>,
     quotient_depth: usize,
@@ -418,16 +418,30 @@ impl CompressionWitnessLayerLayout {
 
 impl WitnessLayout {
     #[cfg(test)]
-    pub(crate) fn new_for_test(
+    pub(crate) fn new_for_test<R>(
         units: Vec<WitnessUnitLayout>,
-        r_rows: Vec<WitnessQuotientRowLayout>,
+        r_rows: Vec<R>,
         quotient_depth: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        R: Into<Option<WitnessQuotientRowLayout>>,
+    {
+        let r_rows = r_rows.into_iter().map(Into::into).collect::<Vec<_>>();
         let r_start = r_rows.first().map_or_else(
             || units.last().map_or(0, |unit| unit.t_range.end),
-            |row| row.range.start,
+            |row| {
+                row.as_ref().map_or_else(
+                    || units.last().map_or(0, |unit| unit.t_range.end),
+                    |row| row.range.start,
+                )
+            },
         );
-        let r_end = r_rows.last().map_or(r_start, |row| row.range.end);
+        let r_end = r_rows
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .map_or(r_start, |row| row.range.end);
         Self {
             units,
             compression_layers: Vec::new(),
@@ -445,7 +459,7 @@ impl WitnessLayout {
             ));
         }
         let mut previous_row_end = None;
-        for row in &self.r_rows {
+        for row in self.r_rows.iter().flatten() {
             let expected_len = self
                 .quotient_depth
                 .checked_mul(row.geometry.physical_coefficient_width())
@@ -464,7 +478,12 @@ impl WitnessLayout {
         for unit in &self.units {
             ranges.extend([unit.z_range(), unit.e_range(), unit.t_range()]);
         }
-        ranges.extend(self.r_rows.iter().map(WitnessQuotientRowLayout::range));
+        ranges.extend(
+            self.r_rows
+                .iter()
+                .flatten()
+                .map(WitnessQuotientRowLayout::range),
+        );
         for layer in &self.compression_layers {
             ranges.extend(layer.f_spans.iter().map(|(_, span)| span.range()));
             ranges.push(layer.h_span.range());
@@ -619,6 +638,9 @@ impl WitnessLayout {
             .unwrap_or(row_families.len());
         let mut r_rows = vec![None; row_families.len()];
         for (row_index, row) in row_families[..first_compression_row].iter().enumerate() {
+            if !row.requires_quotient_witness() {
+                continue;
+            }
             let geometry = row.geometry();
             let len = quotient_depth
                 .checked_mul(geometry.physical_coefficient_width())
@@ -628,17 +650,7 @@ impl WitnessLayout {
             r_rows[row_index] = Some(WitnessQuotientRowLayout { geometry, range });
         }
         if !lp.payload_mode.is_compressed() {
-            let r_rows = r_rows
-                .into_iter()
-                .enumerate()
-                .map(|(row_index, row)| {
-                    row.ok_or_else(|| {
-                        AkitaError::InvalidSetup(format!(
-                            "raw witness quotient row {row_index} was not placed"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            validate_quotient_slots(&row_families, &r_rows)?;
             return Ok(Self {
                 units,
                 compression_layers: Vec::new(),
@@ -803,17 +815,7 @@ impl WitnessLayout {
         if aligned_witness_end != cursor {
             compression_alignment_ranges.push(cursor..aligned_witness_end);
         }
-        let r_rows = r_rows
-            .into_iter()
-            .enumerate()
-            .map(|(row_index, row)| {
-                row.ok_or_else(|| {
-                    AkitaError::InvalidSetup(format!(
-                        "witness quotient row {row_index} was not placed"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        validate_quotient_slots(&row_families, &r_rows)?;
         Ok(Self {
             units,
             compression_layers,
@@ -905,7 +907,8 @@ impl WitnessLayout {
             .coefficient_index(row, coefficient)
     }
 
-    pub fn r_rows(&self) -> &[WitnessQuotientRowLayout] {
+    /// Relation-row-aligned quotient slots. Group A rows intentionally have no slot.
+    pub fn r_rows(&self) -> &[Option<WitnessQuotientRowLayout>] {
         &self.r_rows
     }
 
@@ -999,6 +1002,9 @@ impl WitnessLayout {
         let row = self.r_rows.get(relation_row).ok_or_else(|| {
             AkitaError::InvalidInput("witness R semantic index out of range".into())
         })?;
+        let row = row.as_ref().ok_or_else(|| {
+            AkitaError::InvalidInput("relation row has no quotient witness".into())
+        })?;
         if quotient_digit >= self.quotient_depth {
             return Err(AkitaError::InvalidInput(
                 "witness R semantic index out of range".into(),
@@ -1017,6 +1023,25 @@ impl WitnessLayout {
     pub fn r_offset(&self) -> usize {
         self.r_range.start
     }
+}
+
+fn validate_quotient_slots(
+    row_families: &[RelationRowFamily],
+    r_rows: &[Option<WitnessQuotientRowLayout>],
+) -> Result<(), AkitaError> {
+    if row_families.len() != r_rows.len() {
+        return Err(AkitaError::InvalidSetup(
+            "witness quotient slots disagree with relation rows".into(),
+        ));
+    }
+    for (row_index, (family, row)) in row_families.iter().zip(r_rows).enumerate() {
+        if family.requires_quotient_witness() != row.is_some() {
+            return Err(AkitaError::InvalidSetup(format!(
+                "witness quotient row {row_index} has the wrong presence"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn checked_range(start: usize, len: usize, context: &str) -> Result<Range<usize>, AkitaError> {

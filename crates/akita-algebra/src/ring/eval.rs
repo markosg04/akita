@@ -167,11 +167,70 @@ where
     <E as HasUnreducedOps>::reduce_product_accum(accum)
 }
 
+/// Evaluate every negacyclic shift of `r` at `alpha` in linear time.
+///
+/// Entry `j` is `r * X^j mod (X^D + 1)`, evaluated at `alpha`. If `s_j`
+/// denotes that entry, the recurrence is
+/// `s_{j+1} = alpha * s_j - (alpha^D + 1) * r[D - 1 - j]`.
+pub fn eval_negacyclic_shift_sequence<F, E, const D: usize>(
+    r: &CyclotomicRing<F, D>,
+    alpha: E,
+) -> Vec<E>
+where
+    F: FieldCore,
+    E: FieldCore + MulBase<F>,
+{
+    let mut evaluations = vec![E::zero(); D];
+    eval_negacyclic_shift_sequence_into(r, alpha, &mut evaluations);
+    evaluations
+}
+
+/// Write [`eval_negacyclic_shift_sequence`] into caller-owned storage.
+///
+/// # Panics
+///
+/// Panics in debug builds if `evaluations.len() != D`.
+pub fn eval_negacyclic_shift_sequence_into<F, E, const D: usize>(
+    r: &CyclotomicRing<F, D>,
+    alpha: E,
+    evaluations: &mut [E],
+) where
+    F: FieldCore,
+    E: FieldCore + MulBase<F>,
+{
+    debug_assert_eq!(evaluations.len(), D);
+    eval_flat_negacyclic_shift_sequence_into(r.coefficients(), alpha, evaluations);
+}
+
+/// Runtime-dimension form of [`eval_negacyclic_shift_sequence_into`].
+pub fn eval_flat_negacyclic_shift_sequence_into<F, E>(
+    coefficients: &[F],
+    alpha: E,
+    evaluations: &mut [E],
+) where
+    F: FieldCore,
+    E: FieldCore + MulBase<F>,
+{
+    debug_assert_eq!(evaluations.len(), coefficients.len());
+    let mut evaluation = E::zero();
+    let mut power = E::one();
+    for &coefficient in coefficients {
+        evaluation += power.mul_base(coefficient);
+        power *= alpha;
+    }
+
+    let wrap_correction = power + E::one();
+    for (output, &coefficient) in evaluations.iter_mut().zip(coefficients.iter().rev()) {
+        *output = evaluation;
+        evaluation = alpha * evaluation - wrap_correction.mul_base(coefficient);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::poly::multilinear_eval;
-    use akita_field::Prime128OffsetA7F7;
+    use akita_field::{Ext2, Prime128OffsetA7F7};
 
     type F = Prime128OffsetA7F7;
     const D: usize = 64;
@@ -246,5 +305,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_shift_sequence_matches_direct<E, const RING_DIMENSION: usize>(alpha: E)
+    where
+        E: FieldCore + MulBase<F> + std::fmt::Debug,
+    {
+        let ring: CyclotomicRing<F, RING_DIMENSION> =
+            CyclotomicRing::from_coefficients(std::array::from_fn(|i| {
+                F::from_canonical_u128(
+                    (17u128.wrapping_add(i as u128).wrapping_mul(0x100_0000_01B3))
+                        & ((1u128 << 120) - 1),
+                )
+            }));
+        let alpha_pows = scalar_powers(alpha, RING_DIMENSION);
+        let expected = (0..RING_DIMENSION)
+            .map(|shift| eval_ring_at_pows(&ring.negacyclic_shift(shift), &alpha_pows))
+            .collect::<Vec<_>>();
+        assert_eq!(eval_negacyclic_shift_sequence(&ring, alpha), expected);
+    }
+
+    #[test]
+    fn negacyclic_shift_sequence_matches_direct_evaluation() {
+        let alpha = F::from_canonical_u128(0x1234_5678_9ABC_DEF0);
+        assert_shift_sequence_matches_direct::<_, 64>(alpha);
+        assert_shift_sequence_matches_direct::<_, 128>(alpha);
+        assert_shift_sequence_matches_direct::<_, 512>(alpha);
+
+        let extension_alpha = Ext2::<F>::new(
+            F::from_canonical_u128(0x1234_5678_9ABC_DEF0),
+            F::from_canonical_u128(0x0FED_CBA9_8765_4321),
+        );
+        assert_shift_sequence_matches_direct::<_, 64>(extension_alpha);
     }
 }

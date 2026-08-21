@@ -28,7 +28,6 @@ pub(crate) struct PreparedRingSwitchGroup<'a, F: FieldCore> {
     pub(crate) recomposed_inner_rows: RingVec<F>,
     pub(crate) folded_opening: GroupFoldedOpening<F>,
     pub(crate) z_centered: Vec<i32>,
-    pub(crate) z_inf: u32,
     pub(crate) z_folded_coefficients: FoldChunkCoefficients,
 }
 
@@ -122,7 +121,7 @@ fn trace_witness_source_moments(witness: &[i8], layout: &WitnessLayout, lp: &Com
 
     let mut r_coeffs = 0usize;
     let mut r_l2_sq = 0u128;
-    for row in layout.r_rows() {
+    for row in layout.r_rows().iter().flatten() {
         let range = row.range();
         r_coeffs += range.len();
         r_l2_sq += integer_slice_l2_sq(&witness[range]);
@@ -492,7 +491,6 @@ where
         }
         let recomposed_inner_rows =
             RingVec::from_coeffs_with_ring_dim(inner_coefficients, group_dims.d_a())?;
-        let z_inf = z_folded_rings.centered_inf_norm();
         let DecomposeFoldWitness {
             centered_coeffs_flat: z_centered,
             ..
@@ -505,7 +503,6 @@ where
             recomposed_inner_rows,
             folded_opening,
             z_centered,
-            z_inf,
             z_folded_coefficients,
         });
     }
@@ -697,9 +694,16 @@ fn emit_r_rows<F: CanonicalField>(
     let q = (-F::one()).to_canonical_u128() + 1;
     let decompose_params = BalancedDecomposePow2Params::new(levels, log_basis, q);
     for (row_index, row) in r.rows().iter().enumerate() {
+        let Some(row) = row else {
+            if layout.r_rows().get(row_index).is_some_and(Option::is_some) {
+                return Err(AkitaError::InvalidProof);
+            }
+            continue;
+        };
         let row_layout = layout
             .r_rows()
             .get(row_index)
+            .and_then(Option::as_ref)
             .ok_or(AkitaError::InvalidProof)?;
         let geometry = row_layout.geometry();
         if geometry != row.geometry() {

@@ -391,6 +391,7 @@ fn finalize_test_plan(
             .collect::<Vec<_>>()
             .into(),
         setup_index_tensors: Vec::new(),
+        non_a_setup_index_tensors: Vec::new(),
         relation_address: PreparedRelationAddress::new(&[]).unwrap(),
         setup_relation_address: PreparedRelationAddress::new(&[]).unwrap(),
         relation_base_bridge_point: Vec::new().into(),

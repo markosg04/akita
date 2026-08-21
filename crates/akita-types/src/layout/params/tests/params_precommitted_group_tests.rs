@@ -782,6 +782,14 @@ fn compact_witness_addresses_match_independent_formula_matrix() {
                 .take(ordinary_row_count)
                 .enumerate()
             {
+                let Some(row) = row else {
+                    assert!(matches!(
+                        relation_layout.row_families().expect("row families")[row_index],
+                        crate::RelationRowFamily::Inner { .. }
+                    ));
+                    assert!(layout.r_coefficient_index(row_index, 0, 0, 0).is_err());
+                    continue;
+                };
                 assert_eq!(row.geometry().physical_coefficient_width(), ring_dim);
                 assert_eq!(row.range(), cursor..cursor + quotient_depth * ring_dim);
                 for digit in 0..quotient_depth {
@@ -846,7 +854,7 @@ fn compact_witness_addresses_match_independent_formula_matrix() {
                 assert_eq!(support_interval.end, cursor);
                 for &(group_index, row_index) in layer.f_quotient_rows() {
                     assert!(group_order.contains(&group_index));
-                    let row = &layout.r_rows()[row_index];
+                    let row = layout.r_rows()[row_index].as_ref().expect("F quotient row");
                     assert_eq!(
                         row.range(),
                         cursor
@@ -854,7 +862,9 @@ fn compact_witness_addresses_match_independent_formula_matrix() {
                     );
                     cursor = row.range().end;
                 }
-                let h_row = &layout.r_rows()[layer.h_quotient_row()];
+                let h_row = layout.r_rows()[layer.h_quotient_row()]
+                    .as_ref()
+                    .expect("H quotient row");
                 assert_eq!(
                     h_row.range(),
                     cursor..cursor + quotient_depth * h_row.geometry().physical_coefficient_width()

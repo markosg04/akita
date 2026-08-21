@@ -118,6 +118,7 @@ pub(crate) struct FlatRelationContext {
 
 #[derive(Clone)]
 pub(crate) struct RelationMatrixGroupEvaluator<F: FieldCore> {
+    pub(crate) ambient_challenges: Challenges,
     pub(crate) c_alphas: Vec<F>,
     pub(crate) opening_a_evals: Vec<F>,
     pub(crate) group_id: usize,
@@ -472,6 +473,7 @@ where
         }
 
         groups.push(RelationMatrixGroupEvaluator {
+            ambient_challenges: challenges.clone(),
             c_alphas,
             opening_a_evals,
             group_id: group_index,
@@ -579,6 +581,7 @@ where
         None => vec![E::zero(); num_positions_per_block],
     };
     let group = RelationMatrixGroupEvaluator {
+        ambient_challenges: challenges.clone(),
         c_alphas,
         opening_a_evals,
         group_id: 0,
