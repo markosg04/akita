@@ -2811,6 +2811,15 @@ transcript artifacts remain exact, and no qualified route is reported as a
 fallback. Do not run T28 until the measured split and the remaining phase model
 project at most 4.5 seconds.
 
+The diagnostic CPU record completed the opening in 6.511 seconds and measured
+the isolated root fold at 2.240852 seconds. It therefore clears the 2.35-second
+code gate narrowly. Against the 476.4 ms Metal command, the ideal model assigns
+82.47% of positions to Metal and 17.53% to CPU, predicts 392.9 ms, and exposes
+only 83.5 ms of T25 root improvement. This candidate is marginal at T25 and is
+retained for implementation only because the measured T28 CPU/root projection
+has a much larger overlap term. Any material contention with the streamed
+commitment consumer will reject it at the complete-call gate.
+
 The next ranked mechanisms are deliberately bounded. A D512 challenge family
 with 15 coefficients in `+/-1` and two in `+/-2` has 128.36 bits of raw support,
 the same L1 mass 19, and weight 17; it can remove only 10.5% of root additions
