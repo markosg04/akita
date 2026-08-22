@@ -1,8 +1,8 @@
 //! Fold-l∞ Fiat–Shamir grind: preview off-sponge clones, commit the winning nonce.
 
 use crate::compute::{
-    OpeningBatchKernel, OpeningFoldKernel, RootOpeningSource, RuntimeOpeningProveBackendFor,
-    RuntimeOpeningSource,
+    DecomposeFoldChunkSink, OpeningBatchKernel, OpeningFoldKernel, RootOpeningSource,
+    RuntimeOpeningProveBackendFor, RuntimeOpeningSource,
 };
 use akita_challenges::{Challenges, FoldDraw, LiveFoldDraw, PreviewFoldDraw};
 use akita_field::unreduced::{HasWide, ReduceTo};
@@ -148,6 +148,12 @@ pub(crate) struct FoldProbeOutput<F: FieldCore> {
     pub(crate) challenges: GroupFoldChallenges,
 }
 
+pub(crate) trait FoldProbeSink {
+    fn begin_attempt(&mut self, nonce: u32) -> Result<(), AkitaError>;
+    fn chunk_sink(&mut self) -> &mut dyn DecomposeFoldChunkSink;
+    fn finish_attempt(&mut self, accepted: bool) -> Result<(), AkitaError>;
+}
+
 pub(crate) struct TerminalFoldGrindOutput<F: FieldCore> {
     pub(crate) witness: DecomposeFoldWitness<F>,
     pub(crate) nonce: u32,
@@ -230,6 +236,7 @@ where
                         params.num_positions_per_block,
                         params.num_digits_inner,
                         params.log_basis_inner,
+                        None,
                     )
                 }
             )?;
@@ -328,6 +335,7 @@ pub(in crate::protocol) fn fold_probe_witness_kernel<F, P, B, const D: usize>(
     point_indices: &[usize],
     root_lp: &CommittedGroupParams,
     params: &(impl LevelParamsLike + ?Sized),
+    sink: Option<&mut dyn DecomposeFoldChunkSink>,
 ) -> Result<(DecomposeFoldWitness<F>, FoldChunkCoefficients), AkitaError>
 where
     F: FieldCore + CanonicalField,
@@ -337,6 +345,11 @@ where
         + for<'a> OpeningFoldKernel<P::OpeningView<'a>, F, D>,
 {
     let num_chunks = root_lp.witness_chunk.num_chunks;
+    if sink.is_some() && num_chunks > 1 {
+        return Err(AkitaError::InvalidSetup(
+            "streamed fold probing requires one physical response chunk".into(),
+        ));
+    }
     if num_chunks <= 1 {
         let witness = build_point_decompose_fold_witness::<F, P, B, D>(
             backend,
@@ -347,6 +360,7 @@ where
             params.num_positions_per_block(),
             params.num_digits_inner(),
             params.log_basis_inner(),
+            sink,
         )?;
         return Ok((witness, FoldChunkCoefficients::single()));
     }
@@ -365,6 +379,7 @@ where
                 params.num_positions_per_block(),
                 params.num_digits_inner(),
                 params.log_basis_inner(),
+                None,
             )
         })
         .collect::<Result<Vec<_>, AkitaError>>()?;
@@ -400,6 +415,7 @@ fn sample_multi_group_fold_decompose_witnesses_native<F, E, G, B, T>(
     root_lp: &CommittedGroupParams,
     groups: &[PreparedFoldGrindGroup<'_, '_, G>],
     max_grind_attempts: u32,
+    mut fold_sink: Option<&mut dyn FoldProbeSink>,
 ) -> Result<(Vec<FoldProbeOutput<F>>, u32), AkitaError>
 where
     F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + 'static,
@@ -416,8 +432,16 @@ where
             "fold grind batch has no groups".to_string(),
         ));
     }
+    if fold_sink.is_some() && groups.len() != 1 {
+        return Err(AkitaError::InvalidSetup(
+            "streamed fold probing requires exactly one opening group".into(),
+        ));
+    }
     let (nonce, mut candidate_outputs) =
         first_jointly_accepted_nonce(max_grind_attempts, |nonce| {
+            if let Some(sink) = fold_sink.as_deref_mut() {
+                sink.begin_attempt(nonce)?;
+            }
             let mut candidate_outputs = Vec::with_capacity(groups.len());
             {
                 let mut preview = PreviewFoldDraw::new(transcript);
@@ -430,10 +454,14 @@ where
                         group.group.num_polynomials(),
                         nonce,
                     )?;
-                    let output =
-                        group
-                            .group
-                            .probe_fold(opening_ctx, &challenges, root_lp, group.params)?;
+                    let chunk_sink = fold_sink.as_deref_mut().map(FoldProbeSink::chunk_sink);
+                    let output = group.group.probe_fold(
+                        opening_ctx,
+                        &challenges,
+                        root_lp,
+                        group.params,
+                        chunk_sink,
+                    )?;
                     let observed_l2_sq = {
                         let _span = tracing::info_span!("fold_grind_acceptance_check").entered();
                         accepts_fold_witness_flat(
@@ -443,10 +471,16 @@ where
                         )
                     };
                     let Some(observed_l2_sq) = observed_l2_sq else {
+                        if let Some(sink) = fold_sink.as_deref_mut() {
+                            sink.finish_attempt(false)?;
+                        }
                         return Ok(None);
                     };
                     candidate_outputs.push((output, observed_l2_sq));
                 }
+            }
+            if let Some(sink) = fold_sink.as_deref_mut() {
+                sink.finish_attempt(true)?;
             }
             Ok(Some(candidate_outputs))
         })?;
@@ -540,6 +574,7 @@ pub(crate) fn sample_multi_group_fold_decompose_witnesses<F, E, G, B, T>(
     opening_batch: &OpeningClaimsLayout,
     groups: &[FoldGrindGroup<'_, '_, G>],
     _tail_t_vectors: Option<usize>,
+    fold_sink: Option<&mut dyn FoldProbeSink>,
 ) -> Result<(Vec<FoldProbeOutput<F>>, u32), AkitaError>
 where
     F: FieldCore + CanonicalField + FromPrimitiveInt + HasWide + 'static,
@@ -604,6 +639,7 @@ where
         root_lp,
         &prepared_groups,
         binding.max_grind_attempts,
+        fold_sink,
     )
 }
 

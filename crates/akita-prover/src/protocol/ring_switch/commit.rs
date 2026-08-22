@@ -32,6 +32,45 @@ pub(crate) struct RecursiveCommitPrefix<F: FieldCore> {
     inner: CommitInnerWitness<F>,
 }
 
+impl<F: FieldCore> RecursiveCommitPrefix<F> {
+    pub(crate) const fn coeff_len(&self) -> usize {
+        self.coeff_len
+    }
+}
+
+pub(crate) fn merge_recursive_commit_prefixes<F: FieldCore>(
+    prefixes: Vec<RecursiveCommitPrefix<F>>,
+) -> Result<RecursiveCommitPrefix<F>, AkitaError> {
+    let mut prefixes = prefixes.into_iter();
+    let first = prefixes.next().ok_or_else(|| {
+        AkitaError::InvalidInput("recursive commitment prefix list is empty".into())
+    })?;
+    let ring_dim = first.inner.ring_dim();
+    let known_balanced_log_basis = first.known_balanced_log_basis;
+    let mut coeff_len = first.coeff_len;
+    let mut inner_coefficients = first.inner.into_inner_rows().into_coeffs();
+    for prefix in prefixes {
+        if prefix.known_balanced_log_basis != known_balanced_log_basis
+            || prefix.inner.ring_dim() != ring_dim
+        {
+            return Err(AkitaError::InvalidSetup(
+                "recursive commitment prefixes use inconsistent geometry".into(),
+            ));
+        }
+        coeff_len = coeff_len.checked_add(prefix.coeff_len).ok_or_else(|| {
+            AkitaError::InvalidSetup("recursive commitment prefix length overflow".into())
+        })?;
+        inner_coefficients.extend(prefix.inner.into_inner_rows().into_coeffs());
+    }
+    Ok(RecursiveCommitPrefix {
+        coeff_len,
+        known_balanced_log_basis,
+        inner: CommitInnerWitness {
+            inner_rows: RingVec::from_coeffs_with_ring_dim(inner_coefficients, ring_dim)?,
+        },
+    })
+}
+
 pub(crate) fn prepare_recursive_commit_prefix<Cfg, B>(
     commit_params: &CommittedGroupParams,
     expanded: &AkitaExpandedSetup<Cfg::Field>,
@@ -146,7 +185,7 @@ where
         1,
     )?;
 
-    let (packed_witness, inner_rows, commitment, compression_witness) = dispatch_for_field!(
+    let (packed_witness, inner_rows, commitment, outer_relation_quotients, compression_witness) = dispatch_for_field!(
         ProtocolDispatchSlot::Role(RingRole::Inner),
         Cfg::Field,
         dims.d_a(),
@@ -270,7 +309,7 @@ where
                         commit_params.num_digits_outer,
                         commit_params.log_basis_outer,
                     )?;
-                    let u: Vec<CyclotomicRing<Cfg::Field, D_B>> = commit_outer_slices(
+                    let outer = commit_outer_slices::<Cfg::Field, _, D_B>(
                         backend,
                         prepared,
                         commit_params.outer_commit_matrix.output_rank(),
@@ -278,9 +317,19 @@ where
                         &slice_geometry,
                         commit_params.log_basis_outer,
                     )?;
-                    let source = RingVec::from_ring_elems(&u);
+                    let source = RingVec::from_ring_elems(&outer.rows);
+                    let outer_relation_quotients = outer
+                        .quotients
+                        .as_ref()
+                        .map(|quotients| RingVec::from_ring_elems(quotients));
                     if !commit_params.payload_mode.is_compressed() {
-                        Ok::<_, AkitaError>((packed_witness, inner.into_inner_rows(), source, None))
+                        Ok::<_, AkitaError>((
+                            packed_witness,
+                            inner.into_inner_rows(),
+                            source,
+                            outer_relation_quotients,
+                            None,
+                        ))
                     } else {
                         let plan = CompressionChainPlan::for_complete_source(
                             commit_params
@@ -313,6 +362,7 @@ where
                             packed_witness,
                             inner.into_inner_rows(),
                             payload,
+                            outer_relation_quotients,
                             Some((output.witness, output.quotients)),
                         ))
                     }
@@ -329,7 +379,8 @@ where
             )?
         }
         None => AkitaCommitmentHint::singleton(inner_rows)?,
-    };
+    }
+    .with_outer_relation_quotients(outer_relation_quotients)?;
     Ok(NextWitnessStateOutput {
         witness: packed_witness,
         binding: NextWitnessState::OuterPayload(commitment),
@@ -390,4 +441,39 @@ where
         binding: NextWitnessState::TerminalInnerState,
         hint: AkitaCommitmentHint::singleton(t_state)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use akita_field::Prime128Offset275;
+
+    type F = Prime128Offset275;
+
+    fn prefix(coeff_len: usize, start: i64) -> RecursiveCommitPrefix<F> {
+        let coefficients = (0..64)
+            .map(|offset| F::from_i64(start + offset as i64))
+            .collect();
+        RecursiveCommitPrefix {
+            coeff_len,
+            known_balanced_log_basis: 3,
+            inner: CommitInnerWitness {
+                inner_rows: RingVec::from_coeffs_with_ring_dim(coefficients, 64).unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn recursive_commit_prefix_merge_preserves_block_order() {
+        let merged =
+            merge_recursive_commit_prefixes(vec![prefix(1024, 0), prefix(2048, 100)]).unwrap();
+        assert_eq!(merged.coeff_len, 3072);
+        assert_eq!(merged.known_balanced_log_basis, 3);
+        assert_eq!(merged.inner.ring_dim(), 64);
+        let coefficients = merged.inner.into_inner_rows().into_coeffs();
+        assert_eq!(coefficients[0], F::from_i64(0));
+        assert_eq!(coefficients[63], F::from_i64(63));
+        assert_eq!(coefficients[64], F::from_i64(100));
+        assert_eq!(coefficients[127], F::from_i64(163));
+    }
 }

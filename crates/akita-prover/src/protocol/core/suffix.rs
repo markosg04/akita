@@ -177,6 +177,7 @@ where
             level_params,
             Some(next_params),
             Some(step.output_witness_len),
+            None,
             Some(next_binding),
             prepared_fold,
         )
@@ -536,6 +537,7 @@ where
             || Ok(()),
             level_params,
             BasisMode::Lagrange,
+            None,
         )
     } else {
         prepare_extension_claim_fold::<F, E, T, _, _, C, O, TS, R>(

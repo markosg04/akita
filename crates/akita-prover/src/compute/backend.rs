@@ -1,7 +1,7 @@
 use crate::compute::requirements::RoutedNttRequirement;
 use crate::AkitaProverSetup;
 use akita_algebra::CyclotomicRing;
-use akita_field::{AkitaError, CanonicalField, FieldCore};
+use akita_field::{AkitaError, CanonicalField, FieldCore, HalvingField};
 use akita_types::{AkitaExpandedSetup, NttCacheKey};
 use std::sync::Arc;
 
@@ -149,6 +149,14 @@ pub struct CompressionRowsProducts<F: FieldCore, const D: usize> {
     pub cyclic: Vec<CyclotomicRing<F, D>>,
 }
 
+/// Outer commitment rows and the optional relation quotients produced with them.
+pub struct DigitRowsProducts<F: FieldCore, const D: usize> {
+    /// Negacyclic image used by the commitment.
+    pub negacyclic: Vec<CyclotomicRing<F, D>>,
+    /// High-half convolution rows used by the B relation, when retained.
+    pub quotients: Option<Vec<CyclotomicRing<F, D>>>,
+}
+
 /// Exact-prefix compression matrix operations.
 pub trait CompressionComputeBackend<F>: ComputeBackendSetup<F>
 where
@@ -202,6 +210,33 @@ where
             .iter()
             .map(|digits| self.digit_rows(prepared, row_len, digits, log_basis))
             .collect()
+    }
+
+    /// Same-matrix commitment products with optional retained relation quotients.
+    ///
+    /// The default keeps downstream backends source-compatible and leaves the
+    /// quotient to the opening path. Backends should override this when both
+    /// products can share the commitment's matrix and digit reads.
+    fn digit_rows_products_batch<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        row_len: usize,
+        digit_vectors: &[&[[i8; D]]],
+        log_basis: u32,
+    ) -> Result<Vec<DigitRowsProducts<F, D>>, AkitaError>
+    where
+        F: HalvingField,
+    {
+        self.digit_rows_batch(prepared, row_len, digit_vectors, log_basis)
+            .map(|batches| {
+                batches
+                    .into_iter()
+                    .map(|negacyclic| DigitRowsProducts {
+                        negacyclic,
+                        quotients: None,
+                    })
+                    .collect()
+            })
     }
 }
 

@@ -36,14 +36,16 @@ mod stack;
 
 pub use backend::{
     CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
-    ComputeExecutionDomain, CyclicRowsComputeBackend, DigitRowsComputeBackend, NttCacheOwnerId,
+    ComputeExecutionDomain, CyclicRowsComputeBackend, DigitRowsComputeBackend, DigitRowsProducts,
+    NttCacheOwnerId,
 };
 pub use cpu::{CpuBackend, CpuPreparedSetup, PreparedCrtNttProfile, PreparedNttCacheMetric};
 pub use delegating_cpu::{CommitCluster, OpeningCluster, RingSwitchCluster, TensorCluster};
 pub use kernels::{
-    BatchDecomposeFoldOutcome, OpeningBatchKernel, OpeningFoldKernel, RingSwitchRelationKernel,
-    RootCommitKernel, SubringCoefficientPackingBatchKernel, TensorPackedWitness,
-    TensorProjectionBatchKernel, TensorProjectionKernel,
+    BatchDecomposeFoldOutcome, DecomposeFoldChunk, DecomposeFoldChunkSink, OpeningBatchKernel,
+    OpeningFoldKernel, RingSwitchRelationKernel, RootCommitKernel,
+    SubringCoefficientPackingBatchKernel, TensorPackedWitness, TensorProjectionBatchKernel,
+    TensorProjectionKernel,
 };
 pub use operation_plans::{
     CommitInnerPlan, DecomposeFoldBatchPlan, DecomposeFoldPlan, OpeningFoldOutput, OpeningFoldPlan,

@@ -433,7 +433,13 @@ where
     let num_digits_open = geometry.num_digits_outer;
     let log_basis = geometry.log_basis_outer;
     let n_b = geometry.outer_matrix.output_rank();
-    let (commitment, inner_rows, compression_witness, compression_quotients) = dispatch_for_field!(
+    let (
+        commitment,
+        inner_rows,
+        outer_relation_quotients,
+        compression_witness,
+        compression_quotients,
+    ) = dispatch_for_field!(
         ProtocolDispatchSlot::Role(RingRole::Inner),
         F,
         dims.d_a(),
@@ -459,7 +465,7 @@ where
                         num_digits_open,
                         log_basis,
                     )?;
-                    let u = commit_outer_slices::<F, _, D_B>(
+                    let outer = commit_outer_slices::<F, _, D_B>(
                         backend,
                         prepared,
                         n_b,
@@ -467,7 +473,15 @@ where
                         slice_geometry,
                         log_basis,
                     )?;
-                    let source = RingVec::from_ring_elems(&u);
+                    let source = RingVec::from_ring_elems(&outer.rows);
+                    let outer_relation_quotients = outer
+                        .quotients
+                        .as_ref()
+                        .map(|quotients| RingVec::from_ring_elems(quotients));
+                    let inner_rows = prepared_polynomials
+                        .into_iter()
+                        .map(|(rows, _)| rows)
+                        .collect::<Vec<_>>();
                     let plan = CompressionChainPlan::for_complete_source(
                         geometry.outer_matrix.sis_table_key().modulus_profile,
                         source.coeff_len(),
@@ -494,10 +508,8 @@ where
                     )?;
                     Ok::<_, AkitaError>((
                         Commitment::new(payload),
-                        prepared_polynomials
-                            .into_iter()
-                            .map(|(rows, _)| rows)
-                            .collect::<Vec<_>>(),
+                        inner_rows,
+                        outer_relation_quotients,
                         output.witness,
                         output.quotients,
                     ))
@@ -510,7 +522,8 @@ where
         inner_rows,
         &compression_witness,
         &compression_quotients,
-    )?;
+    )?
+    .with_outer_relation_quotients(outer_relation_quotients)?;
     Ok((commitment, hint))
 }
 

@@ -2429,6 +2429,331 @@ Retain the exact implementation and its memory reduction as the working
 parent, but record the Stage-2 prediction as missed rather than claiming a
 full gate pass.
 
+## Accepted route after the live-prefix treatment
+
+Minor protocol changes are in scope, but the next slice remains a scheduling
+change.  The root fold challenge is selected by Fiat--Shamir grinding, so a
+consumer cannot defer the fold until the winning nonce is known without running
+the expensive decomposition twice.  Instead, each nonce owns a speculative
+prefix accumulator.  Completed Metal position chunks are converted to canonical
+Z digits and committed while later chunks execute.  A rejected nonce drops that
+accumulator; only the accepted nonce's prefix reaches `PreparedFold`, and the
+commitment is still absorbed at the existing transcript position.
+
+The streamed boundary is exact:
+
+* input remains the packed row-major K256 source plus the already-sampled sparse
+  challenges;
+* Metal owns ordered, disjoint D512 position chunks and never rewrites a chunk
+  after signaling it;
+* a chunk contains complete `(position, inner digit, fold digit, coefficient)`
+  Z records in canonical witness order;
+* the CPU consumer accepts only a contiguous prefix ending on a successor
+  commitment-block boundary, commits each block once, and concatenates inner
+  rows in increasing block order;
+* E, T, R, compression, outer commitment, proof bytes, and transcript order stay
+  on their current paths;
+* unqualified geometry uses the ordinary synchronous fold and cannot be reported
+  as a streamed route.
+
+For T25, use eight position chunks unless commitment-block alignment requires a
+larger divisor.  The root currently costs 0.558 s and the overlapping host
+emission/prefix branch is approximately 0.40--0.47 s.  The registered complete
+root-chain target is 0.62--0.68 s including the 0.055 s trailing commitment.
+Reject the mapping if exact chunk parity fails, if the streamed inner rows differ
+from a one-shot commitment, if a rejected grind attempt leaks state into the
+winner, or if the root chain remains above 0.75 s.  One focused chunk/commitment
+parity test precedes one T25 treatment; no T28 run belongs to this slice.
+
+The corrected T25 treatment preserved the proof digest, transcript, evaluation,
+verifier, schedule, routes, and 265,189-byte proof. Complete opening fell from
+2.561 s to 2.522 s. The streamed root plus trailing commitment took 0.709 s,
+clearing the 0.75 s falsifier but missing the 0.62--0.68 s target. Root
+decompose/fold rose from 0.558 s to 0.652 s because the span now includes the
+overlapped host prefix work; `ring_switch_build_w` fell from 0.473 s to 0.401 s
+and the trailing commitment remained 0.057 s. An initial implementation that
+replaced rather than extended the existing prefix pipeline serialized the
+non-Z suffix and regressed to 2.648 s; composing the early Z prefix with the
+ordinary tail prefix removed that serialization. Retain the corrected schedule
+as a small exact win, not as the main route to 5x.
+
+The subsequent committed-witness range/relation treatment was rejected. It
+replaced the staged auxiliary range image with
+
+```text
+rho * eq(tau0, x) * product_{d=-4}^{3}(W(x) - d) + W(x) * R(x).
+```
+
+The focused CPU and Metal sumcheck implementations agreed exactly, but the T25
+pair exposed both a protocol integration defect and a decisive cost-model miss:
+both proofs had the same bytes yet failed verifier replay, while the degree-nine
+Metal sumcheck alone took 1.658 s against the registered 0.55 s rejection bound.
+The complete Metal opening was 3.485 s. The matched CPU opening rose to 13.234 s,
+so the apparent 3.80x ratio does not establish the five-times goal and the
+candidate is not retained.
+
+The analytical error was composing the degree-four range polynomial with
+`W(W+1)` after multilinear folding. That creates a degree-nine round polynomial
+and many generic fp128 products. The existing protocol instead treats the
+pointwise range image as its own multilinear table, keeping Stage 1 at degree
+five and using Stage 2 to prove its product link to `W`. A direct final-point
+check cannot replace that link because, away from Boolean points,
+`MLE(W(W+1))(r) != W(r)(W(r)+1)`. Any successor must retain a genuine product
+argument or pay for a committed auxiliary representation; it cannot claim a
+low-degree one-pass proof by conflating those evaluations. The experimental
+code and wire change were removed, and the accepted staged route remains the
+parent.
+
+### Retained outer-relation quotients
+
+The dominant child of `ring_switch_build_w` recomputes the B-role cyclic
+product from `T` solely to recover the quotient of a product whose negacyclic
+image was already computed during commitment. Folding `T` across commitment
+blocks cannot remove this work: B has independent columns for every
+block/A-row/digit position, so a challenge fold does not commute through the
+current SIS map. Increasing the outer basis is also not a local win. The root
+planner deliberately uses basis eight; basis 64 introduces three range-product
+sumchecks and falls outside the specialized Metal Stage-1 routes.
+
+Retain the B quotient in the prover-only commitment hint instead. The exact
+producer boundary is the outer commitment mat-vec. For output coefficient
+`k`, split convolution terms into non-wrapping and wrapping sets. Negacyclic B
+is `low - high`, cyclic B is `low + high`, and the retained quotient is
+`(cyclic - negacyclic) / 2 = high`. A Metal outer-commit kernel can therefore
+emit the commitment and quotient from the same matrix and digit reads. The
+hint carries one native-D64 quotient row per logical B row; proof bytes,
+transcript, verifier, commitment, and security parameters do not change.
+CPU and unsupported backends may use the existing cyclic computation, but the
+comparison must not count work merely moved outside the measured interval.
+
+At T25, the current complete opening is 2.522 s, `ring_switch_build_w` is
+0.401 s, and its measured relation-quotient child is 0.363 s. The retained
+rows are tiny (logical B rows times 64 field elements), but consistency and
+other relation families remain. Thus 0.363 s is an upper bound, not a predicted
+gain. Promote the slice only if independent commitment/product parity passes,
+the same hint survives serialization, proof/transcript/verifier outputs remain
+exact, eval proof improves by at least 120 ms, and integrated commit plus eval
+improves by at least 80 ms. Reject it if the fused commit overhead consumes
+more than half of the removed eval time. One focused parity run and one T25
+treatment are sufficient; no T28 run belongs to this slice.
+
+The treatment was exact but missed its promotion gate. Commitment parity,
+proof bytes, transcript replay, and verification all passed. The Metal opening
+fell from 2.522 s to 2.420 s, a 102 ms gain against the registered 120 ms
+minimum. The nested quotient span fell from 363 ms to 0.74 ms, but
+`ring_switch_build_w` only fell from 401 ms to 287 ms; the old nested span was
+therefore not a removable-wall estimate. The matched CPU commit/open pair was
+27.131 s + 6.917 s, while Metal was 4.557 s + 2.420 s, for 4.88x combined.
+This is useful evidence and a working-candidate baseline, not a promoted
+production design: the serialized hint surface is too large for a 102 ms eval
+gain unless a later candidate amortizes or supersedes it.
+
+### Basis-32 root schedule candidate
+
+The next candidate changes protocol configuration, not the Jolt PIOP or source
+layout. The current root uses opening/outer basis 8, hence 43 digits for each
+128-bit field value. At T25, its T segment is exactly
+`43 * 2^22 = 180,355,072` coefficients. Basis 32 uses 26 digits, reducing that
+segment to `26 * 2^22 = 109,051,904`. Holding every other segment fixed gives
+an upper bound of 265,921,536 live witness coefficients, below `2^28` by
+2,513,920. Thus the padded Stage-1/Stage-2 domain falls from `2^29` to `2^28`;
+any additional E/D shrink is upside, not required for the cliff.
+
+The security price is explicit. For the root D64 B matrix with eight slices,
+8,192 live blocks, D512 input rows, and one A output row, basis 8 has physical
+width `1024 * 8 * 43 = 352,256`. Its collision bound is 7, rounded to the
+audited bucket 7, and rank one admits 503,495 columns. Basis 32 has physical
+width `1024 * 8 * 26 = 212,992`; its collision bound is 31, whose D64 rank-one
+cutoff is only 18,455, so B must rise to rank two (rank-two cutoff
+57,253,878). Across all slices, the B mat-vec work proxy rises about 21% even
+though T shrinks 40%. This rank change must be included in commit and
+recursive-source measurements; it cannot be reported as a free digit-depth
+win.
+
+Akita's canonical basis-32 range proof has one arity-four product sumcheck and
+one quartic leaf sumcheck. The existing Metal direct route only implements the
+single low-basis leaf. Falling back to CPU or silently timing only one stage is
+disallowed. The implementation candidate is therefore:
+
+1. expose the root opening basis as a config-owned schedule choice and
+   regenerate the Jolt K256 catalog, leaving the PIOP and packed trace layout
+   unchanged;
+2. add D64 signed-small multiplication for basis-32 commitment digits instead
+   of repeated addition;
+3. implement the existing arity-four product plus quartic leaf transcript on
+   Metal, retaining exact child claims and proof shape; and
+4. keep the `2^28` Boolean domain in the evaluator even though its live prefix
+   is slightly smaller.
+
+Pre-registered falsifiers: reject before a large run if the generated T25 row
+does not cross to `2^28`, if any root B/D SIS row lacks an audited rank, if a
+qualified Stage-1 operation falls back to CPU, or if focused CPU/Metal proof
+and commitment parity fail. After those gates, run one T25 CPU/Metal pair.
+Against the 2.420 s working candidate, require at least 250 ms complete-opening
+gain and Stage 1 no slower than 300 ms; against the 2.522 s accepted parent,
+require at least 350 ms. Report fresh matched CPU, Metal commit, and integrated
+commit-plus-open numbers because the security-driven B rank changes. Do not run
+T28 for this slice.
+
+The regenerated catalog passes exact expansion and SIS validation. The selected
+T25 root is more favorable than the conservative digit-only estimate:
+
+```text
+root B/D log basis             3 -> 5
+root opening challenge ring   64 -> 128
+root fold digits               4 -> 2
+outer B rank                   1 -> 2
+outer slices                   8 -> 4
+recursive folds                6 -> 5
+live W               337,224,640 -> 203,531,008
+padded W domain              2^29 -> 2^28
+```
+
+The planner halves the slice count when B rank doubles, so the number of outer
+commitment rows remains eight. Across all slices, B mat-vec work is about 21%
+higher, as predicted. The exact witness is only 75.8% live within the new
+domain and is 39.6% smaller than the old live witness; the extra reduction
+comes from the two-digit fold and changed D/opening geometry. This makes the
+schedule a root-kernel candidate as well as a sumcheck-domain candidate.
+
+The focused basis-32 implementation matched the canonical CPU proof exactly on
+a partially populated Boolean domain, including both tree stages, child claims,
+transcript challenges, final evaluation, and implicit padding. D64 commitment
+rows also matched for signed basis-32 digits, and the generated T25 row passed
+the rank-two SIS audit. The single valid T25 pair nevertheless rejected the
+schedule:
+
+```text
+                                      working b8       b32 treatment
+CPU opening                              6.917 s           6.818 s
+Metal opening                            2.420 s           2.648 s
+Metal Stage 1                            0.243 s           0.501 s
+Metal Stage 2                            0.418 s           0.383 s
+Metal NTT preparation                    0.080 s           0.178 s
+CPU commit                              27.131 s          28.425 s
+Metal commit                             4.557 s           4.967 s
+combined CPU / combined Metal              4.88x             4.63x
+```
+
+The domain cliff was real, but the cost model treated Stage 1 like one halved
+scan. Canonical basis 32 instead performs an arity-four product sumcheck and a
+quartic leaf sumcheck. The product stage materializes four full-field lanes, so
+the two half-domain proofs move and multiply more data than the old single
+basis-eight proof. The security-driven schedule also increased NTT preparation.
+Exactness, commitment parity, verifier replay, and the 90 GiB memory guard all
+passed, but the treatment missed both the 250 ms opening-gain bar and the 300 ms
+Stage-1 ceiling. Remove the forced basis-32 schedule and its production routing;
+do not use the smaller witness domain as a performance proxy.
+
+### Retained outer digit planes
+
+The restored basis-eight root spends 286.6 ms in `ring_switch_build_w` even
+after the retained B quotient makes relation-quotient construction negligible.
+The dominant unbucketed operation is avoidable: commitment already constructs
+the complete `t_hat` decomposition before the outer mat-vec, but its prover hint
+retains only the fp128 inner rows. Opening then decomposes those rows a second
+time. At T25 the discarded/rebuilt value is exactly
+
+```text
+8192 blocks * 1 A row * 43 digits * 512 coefficients
+    = 180,355,072 signed bytes.
+```
+
+Retain the existing `DigitBlocks` values in `AkitaCommitmentHint` by moving their
+allocation after the outer commitment consumes it. Ring switch validates the
+retained stride, block count, and per-block plane count against the public
+schedule before using it; old or unsupported hints retain the canonical
+decomposition fallback. The hint remains prover-only and serializable. This
+changes no commitment, proof message, transcript event, verifier equation, or
+timed-boundary ownership, and it adds no commitment arithmetic. The cost is an
+extra 172 MiB of retained T25 hint memory when callers also keep the fp128 inner
+rows.
+
+Pre-register exact retained-versus-recomputed digit parity, hint serialization
+round-trip, and complete proof/transcript/evaluation/verifier parity. Run one
+T25 CPU/Metal pair only after the focused gate. Predict ring-switch build at
+most 0.16 s and Metal opening at most 2.30 s. Promote if opening improves by at
+least 80 ms from the 2.420 s working parent, Metal commit regresses by at most
+25 ms, combined commit-plus-open improves, and peak memory remains below the
+90 GiB T28 projection. Reject the retained representation on any shape escape,
+copy of the 180 MiB digit body, or correctness mismatch.
+
+The focused parity and serialization gates passed, but the single T25 pair
+rejected the representation:
+
+```text
+                                      working parent      retained T digits
+Metal opening                              2.420 s             2.415 s
+Metal ring-switch build                    0.287 s             0.280 s
+Metal commit                               4.557 s             4.741 s
+fresh CPU commit + opening                       -            33.933 s
+Metal commit + opening                     6.977 s             7.156 s
+fresh combined speedup                           -              4.742x
+```
+
+The retained 180 MiB removed only 6.6 ms from ring-switch construction and
+5.3 ms from the complete Metal opening. Metal commitment was 184.0 ms slower,
+so combined Metal time regressed by 178.8 ms. Proof bytes, transcript replay,
+claimed evaluation, commitment parity, verifier acceptance, and the memory
+guard all passed. The measurement falsifies the assumption that reconstructing
+`t_hat` is a material part of the current ring-switch cost. Remove the retained
+digits from the hint and keep the canonical reconstruction path.
+
+### Non-invasive boundary and SIMD-bucket equality reduction
+
+Further work on the current campaign keeps the proof protocol fixed. In
+particular, quotient-free A relations, mixed-basis range choreography, altered
+fold-challenge distributions, extra witness commitments, and transcript or
+verifier changes are deferred. Permitted changes are kernels, internal prover
+representations, device residency, overlap, and prover-only hint data that do
+not affect a commitment or proof byte.
+
+A focused ring-build audit also closes the apparent unaccounted host pass. In
+two exact T25 Metal openings, reconstructing all T digit planes cost 17.5--22.1
+ms. Moving the retained inner rows was 0.005 ms, layout preparation was 0.059
+ms, wrapping the witness was 18.3 ms, and releasing the large temporary
+materialization was 0.012 ms. The rest of the enclosing ring-build span is
+primarily the prefix commitment already reported in the coefficient-packing and
+NTT buckets. Therefore neither retained T digits nor another host-copy cleanup
+has a material ceiling.
+
+The tested backend-only candidate revisited equality factorization with a mapping
+that was not tested by the rejected one-threadgroup-per-high-bucket kernel. One
+SIMDgroup owns one `E_second` bucket. Its 32 lanes walk consecutive `E_first`
+pairs, retain the four range-polynomial accumulators, and reduce with SIMD
+shuffles. A 256-thread group processes eight independent high buckets, and one
+lane per SIMDgroup applies `E_second` once before writing the bucket partial.
+This preserves coalesced witness and `E_first` reads, keeps all eight SIMDgroups
+useful, and removes the full-threadgroup reduction barriers.
+
+For a field-valued range round, the flat kernel performs one multiplication to
+form `E_first * E_second` and four more to weight the round coefficients per
+pair. The SIMD-bucket form performs the four `E_first` products per pair and
+only four `E_second` products per high bucket. The compact integer round removes
+the per-pair full equality multiplication entirely. Partial storage is four
+field elements per high bucket: at most 1 MiB for the T25 split and 2 MiB for
+T28. The table, round order, transcript, proof, and verifier are unchanged.
+
+The pre-registered focused gate was exact CPU/Metal round parity at a partial
+live prefix. After that, one T25 treatment had to keep proof, transcript, evaluation, schedule,
+routes, and verifier exact; reduce Stage 1 from the 0.243 s working-parent phase
+to at most 0.21 s; reduce aggregate GPU-active time by at least 30 ms; and
+improve complete opening by at least 50 ms. A miss rejects the mapping without
+a repeat treatment. If retained, the same SIMD-bucket decomposition may be
+applied separately to only the virtual equality term in the generic Stage-2
+suffix; that is a later candidate with its own gate.
+
+The partial-prefix parity gate passed for all three kernel forms. The single
+T25 treatment then rejected the mapping: Stage 1 fell from 242.75 ms to
+226.22 ms, GPU-active time fell from 645.82 ms to 626.18 ms, and complete
+opening rose from 2.420 s to 2.562 s. Proof bytes, transcript replay, claimed
+evaluation, commitment parity, and verifier acceptance remained exact. The
+16.53 ms Stage-1 gain confirms the factorization but misses the 32.75 ms phase
+bar, while the 19.64 ms GPU reduction shows that the removed equality multiply
+and barriers are not a large enough share of the fp128 round. No kernel or
+dispatch code from this candidate is retained, and its Stage-2 analogue is not
+worth pursuing independently.
+
 ## Claim-to-code map
 
 | Claim | Current code seam | Intended change |
@@ -2438,6 +2763,7 @@ full gate pass.
 | Setup and matrices are reused | `akita-metal/src/prepared.rs` | Extend prepared Metal state to proof kernels and persistent workspaces |
 | D512 relation remains an exact qualified Metal route | `akita-metal/src/ring_switch.rs`, opening metrics | Retain the exact threadgroup-local six-prime route; global and radix-four transform variants are closed |
 | Root centered output becomes reusable resident state | root opening/ring-switch orchestration | Add a typed resident witness only after the relation mechanism passes |
+| Accepted root Z can feed commitment before ring-switch assembly | `OpeningBatchKernel`, root fold grind, recursive commit prefix | Stream ordered position chunks into a nonce-local, block-aligned inner-commit accumulator; retain only the accepted nonce |
 | Unsupported qualified work fails closed | Jolt's runtime backend selector and Akita Metal policy | Required route plus per-operation route metrics; no silent CPU fallback |
 | Proof and verifier stay unchanged | `akita-pcs` prover orchestration and verifier | Backend-only arithmetic and product-domain scheduling; byte parity in the fixed evaluator |
 

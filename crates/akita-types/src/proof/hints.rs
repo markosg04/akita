@@ -12,6 +12,7 @@ use crate::{
 pub struct AkitaCommitmentHint<F: FieldCore> {
     inner_rows: Vec<RingVec<F>>,
     ring_dim: usize,
+    outer_relation_quotients: Option<RingVec<F>>,
     outer_compression_stages: Vec<Vec<u8>>,
     outer_compression_quotients: Vec<RingVec<F>>,
 }
@@ -27,6 +28,7 @@ impl<F: FieldCore> AkitaCommitmentHint<F> {
         let hint = Self {
             inner_rows,
             ring_dim,
+            outer_relation_quotients: None,
             outer_compression_stages: Vec::new(),
             outer_compression_quotients: Vec::new(),
         };
@@ -50,6 +52,7 @@ impl<F: FieldCore> AkitaCommitmentHint<F> {
         let hint = Self {
             inner_rows,
             ring_dim,
+            outer_relation_quotients: None,
             outer_compression_stages: witness
                 .stages()
                 .iter()
@@ -84,6 +87,37 @@ impl<F: FieldCore> AkitaCommitmentHint<F> {
     /// Borrow semantic A rows in polynomial order.
     pub fn inner_rows(&self) -> &[RingVec<F>] {
         &self.inner_rows
+    }
+
+    /// Attach B-relation quotient rows produced with the outer commitment.
+    pub fn with_outer_relation_quotients(
+        mut self,
+        quotients: Option<RingVec<F>>,
+    ) -> Result<Self, AkitaError> {
+        self.outer_relation_quotients = quotients;
+        self.validate_shape()
+            .map_err(|error| AkitaError::InvalidInput(error.to_string()))?;
+        Ok(self)
+    }
+
+    /// Borrow retained B-relation quotient rows after checking their exact shape.
+    pub fn outer_relation_quotients(
+        &self,
+        ring_dim: usize,
+        row_count: usize,
+    ) -> Result<Option<&RingVec<F>>, AkitaError> {
+        let Some(quotients) = self.outer_relation_quotients.as_ref() else {
+            return Ok(None);
+        };
+        let expected = row_count
+            .checked_mul(ring_dim)
+            .ok_or_else(|| AkitaError::InvalidInput("B quotient shape overflow".into()))?;
+        if quotients.ring_dim() != ring_dim || quotients.coeff_len() != expected {
+            return Err(AkitaError::InvalidInput(
+                "commitment hint B quotient shape disagrees with the derived plan".into(),
+            ));
+        }
+        Ok(Some(quotients))
     }
 
     /// Rebuild the checked packed witness under the plan derived from the
@@ -143,11 +177,26 @@ impl<F: FieldCore> AkitaCommitmentHint<F> {
         self.inner_rows
     }
 
+    /// Consume the hint into the semantic rows and retained B quotients.
+    pub fn into_rows_and_outer_relation_quotients(self) -> (Vec<RingVec<F>>, Option<RingVec<F>>) {
+        (self.inner_rows, self.outer_relation_quotients)
+    }
+
     fn validate_shape(&self) -> Result<(), SerializationError> {
         if self.ring_dim == 0 {
             return Err(SerializationError::InvalidData(
                 "commitment hint A ring dimension must be nonzero".into(),
             ));
+        }
+        if let Some(quotients) = &self.outer_relation_quotients {
+            if quotients.ring_dim() == 0
+                || !quotients.coeff_len().is_multiple_of(quotients.ring_dim())
+            {
+                return Err(SerializationError::InvalidData(
+                    "commitment hint B quotient has malformed ring storage".into(),
+                ));
+            }
+            checked_shape_len(quotients.coeff_len())?;
         }
         checked_shape_len(self.inner_rows.len())?;
         if !matches!(
@@ -230,6 +279,9 @@ impl<F: FieldCore + Valid> Valid for AkitaCommitmentHint<F> {
     fn check(&self) -> Result<(), SerializationError> {
         self.validate_shape()?;
         self.inner_rows.check()?;
+        if let Some(quotients) = &self.outer_relation_quotients {
+            quotients.check()?;
+        }
         self.outer_compression_quotients.check()
     }
 }
@@ -249,6 +301,19 @@ impl<F: FieldCore + AkitaSerialize> AkitaSerialize for AkitaCommitmentHint<F> {
             rows.coeff_len()
                 .serialize_with_mode(&mut writer, compress)?;
             for coefficient in rows.coeffs() {
+                coefficient.serialize_with_mode(&mut writer, compress)?;
+            }
+        }
+        usize::from(self.outer_relation_quotients.is_some())
+            .serialize_with_mode(&mut writer, compress)?;
+        if let Some(quotients) = &self.outer_relation_quotients {
+            quotients
+                .ring_dim()
+                .serialize_with_mode(&mut writer, compress)?;
+            quotients
+                .coeff_len()
+                .serialize_with_mode(&mut writer, compress)?;
+            for coefficient in quotients.coeffs() {
                 coefficient.serialize_with_mode(&mut writer, compress)?;
             }
         }
@@ -291,6 +356,19 @@ impl<F: FieldCore + AkitaSerialize> AkitaSerialize for AkitaCommitmentHint<F> {
                             .sum::<usize>()
                 })
                 .sum::<usize>()
+            + 0usize.serialized_size(compress)
+            + self
+                .outer_relation_quotients
+                .as_ref()
+                .map_or(0, |quotients| {
+                    quotients.ring_dim().serialized_size(compress)
+                        + quotients.coeff_len().serialized_size(compress)
+                        + quotients
+                            .coeffs()
+                            .iter()
+                            .map(|coefficient| coefficient.serialized_size(compress))
+                            .sum::<usize>()
+                })
             + self
                 .outer_compression_stages
                 .iter()
@@ -390,6 +468,47 @@ where
             );
         }
 
+        let relation_quotient_count =
+            usize::deserialize_with_mode(&mut reader, compress, validate, &())?;
+        if relation_quotient_count > 1 {
+            return Err(SerializationError::InvalidData(
+                "commitment hint must contain at most one B quotient vector".into(),
+            ));
+        }
+        let outer_relation_quotients = if relation_quotient_count == 0 {
+            None
+        } else {
+            let quotient_ring_dim =
+                usize::deserialize_with_mode(&mut reader, compress, validate, &())?;
+            let quotient_coeff_len =
+                usize::deserialize_with_mode(&mut reader, compress, validate, &())?;
+            if quotient_ring_dim == 0 || !quotient_coeff_len.is_multiple_of(quotient_ring_dim) {
+                return Err(SerializationError::InvalidData(
+                    "commitment hint B quotient has malformed ring storage".into(),
+                ));
+            }
+            checked_shape_len(quotient_coeff_len)?;
+            let mut coefficients = Vec::new();
+            reserve_shape_len(&mut coefficients, quotient_coeff_len)?;
+            for _ in 0..quotient_coeff_len {
+                coefficients.push(F::deserialize_with_mode(
+                    &mut reader,
+                    compress,
+                    validate,
+                    &(),
+                )?);
+            }
+            Some(
+                RingVec::from_coeffs_with_ring_dim(coefficients, quotient_ring_dim).map_err(
+                    |_| {
+                        SerializationError::InvalidData(
+                            "commitment hint B quotient is malformed".into(),
+                        )
+                    },
+                )?,
+            )
+        };
+
         let compression_stage_count =
             usize::deserialize_with_mode(&mut reader, compress, validate, &())?;
         if !matches!(compression_stage_count, 0 | COMPRESSION_MAP_COUNT) {
@@ -473,6 +592,7 @@ where
         let hint = Self {
             inner_rows,
             ring_dim,
+            outer_relation_quotients,
             outer_compression_stages,
             outer_compression_quotients,
         };
@@ -519,6 +639,7 @@ mod tests {
                 coefficient.serialize_uncompressed(&mut expected).unwrap();
             }
         }
+        0usize.serialize_uncompressed(&mut expected).unwrap();
         0usize.serialize_uncompressed(&mut expected).unwrap();
         0usize.serialize_uncompressed(&mut expected).unwrap();
         assert_eq!(encoded, expected);
@@ -582,6 +703,8 @@ mod tests {
             &witness,
             &quotients,
         )
+        .unwrap()
+        .with_outer_relation_quotients(Some(rows(70, 8, 4)))
         .unwrap();
 
         let mut encoded = Vec::new();
@@ -589,6 +712,14 @@ mod tests {
         let decoded =
             AkitaCommitmentHint::<F>::deserialize_uncompressed(&encoded[..], &()).unwrap();
         assert_eq!(decoded, hint);
+        assert_eq!(
+            decoded
+                .outer_relation_quotients(4, 2)
+                .unwrap()
+                .unwrap()
+                .coeffs(),
+            rows(70, 8, 4).coeffs()
+        );
         assert_eq!(decoded.outer_compression_witness(&plan).unwrap(), witness);
         assert_eq!(
             decoded.outer_compression_quotients(&plan).unwrap(),

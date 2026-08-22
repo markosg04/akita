@@ -24,6 +24,7 @@ pub(crate) struct PreparedRingSwitchGroup<'a, F: FieldCore> {
     pub(crate) role_dims: CommitmentRingDims,
     pub(crate) e_hat: DigitBlocks,
     pub(crate) t_hat: DigitBlocks,
+    pub(crate) outer_relation_quotients: Option<RingVec<F>>,
     /// Block-major native-A rows: `[block][A row][coefficient]`.
     pub(crate) recomposed_inner_rows: RingVec<F>,
     pub(crate) folded_opening: GroupFoldedOpening<F>,
@@ -431,13 +432,25 @@ where
                 actual: hint.ring_dim(),
             });
         }
-        let inner_rows_by_polynomial = hint.into_rows();
+        let (inner_rows_by_polynomial, outer_relation_quotients) =
+            hint.into_rows_and_outer_relation_quotients();
         let polynomial_count = opening_batch.group_layout(group_index)?.num_polynomials();
         if inner_rows_by_polynomial.len() != polynomial_count {
             return Err(AkitaError::InvalidSize {
                 expected: polynomial_count,
                 actual: inner_rows_by_polynomial.len(),
             });
+        }
+        if let Some(quotients) = &outer_relation_quotients {
+            let expected = group_lp
+                .logical_b_rows_len()?
+                .checked_mul(group_dims.d_b())
+                .ok_or_else(|| AkitaError::InvalidSetup("B quotient shape overflow".into()))?;
+            if quotients.ring_dim() != group_dims.d_b() || quotients.coeff_len() != expected {
+                return Err(AkitaError::InvalidInput(
+                    "commitment hint B quotient shape disagrees with the opening schedule".into(),
+                ));
+            }
         }
         let expected_rings_per_polynomial = group_lp
             .num_live_blocks()
@@ -500,6 +513,7 @@ where
             role_dims: group_dims,
             e_hat,
             t_hat,
+            outer_relation_quotients,
             recomposed_inner_rows,
             folded_opening,
             z_centered,
@@ -625,7 +639,7 @@ where
     Ok((witness, prefix_output))
 }
 
-pub(super) fn balanced_decompose_centered_i32_i8_into<const D: usize>(
+pub(crate) fn balanced_decompose_centered_i32_i8_into<const D: usize>(
     centered: &[i32; D],
     out: &mut [[i8; D]],
     log_basis: u32,

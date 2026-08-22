@@ -378,7 +378,7 @@ fn fp128_onehot_batched() {
         let poly_refs: Vec<_> = polys.iter().collect();
 
         let mut prover_transcript = AkitaTranscript::<F>::new(b"completeness/fp128_onehot_batched");
-        let proof = AkitaCommitmentScheme::<OneHotCfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<OneHotCfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<OneHotCfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,
@@ -452,7 +452,7 @@ fn fp128_dense_batched() {
         let poly_refs: Vec<_> = polys.iter().collect();
 
         let mut prover_transcript = AkitaTranscript::<F>::new(b"completeness/fp128_dense_batched");
-        let proof = AkitaCommitmentScheme::<DenseCfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<DenseCfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<DenseCfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,
@@ -606,7 +606,7 @@ fn fp128_onehot_oversized_setup() {
 
         let mut prover_transcript =
             AkitaTranscript::<F>::new(b"completeness/fp128_onehot_oversized_setup");
-        let proof = AkitaCommitmentScheme::<OneHotCfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<OneHotCfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<OneHotCfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,
@@ -678,7 +678,7 @@ fn fp128_dense_monomial_basis() {
 
         let mut prover_transcript =
             AkitaTranscript::<F>::new(b"completeness/fp128_dense_monomial_basis");
-        let proof = AkitaCommitmentScheme::<DenseCfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<DenseCfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<DenseCfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,

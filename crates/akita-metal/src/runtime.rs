@@ -196,9 +196,10 @@ pub(crate) struct DigitRowsParams {
     pub(crate) output_coefficients: u64,
     pub(crate) columns_per_partial: u64,
     pub(crate) column_partials: u64,
+    pub(crate) retain_quotients: u64,
 }
 
-const _: [(); 56] = [(); size_of::<DigitRowsParams>()];
+const _: [(); 64] = [(); size_of::<DigitRowsParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -246,12 +247,13 @@ pub(crate) struct PackedDecomposeFoldParams {
     pub(crate) num_columns: u64,
     pub(crate) lane_stride: u64,
     pub(crate) num_positions: u64,
+    pub(crate) position_start: u64,
     pub(crate) blocks_per_column: u64,
     pub(crate) challenge_weight: u64,
     pub(crate) output_coefficients: u64,
 }
 
-const _: [(); 56] = [(); size_of::<PackedDecomposeFoldParams>()];
+const _: [(); 64] = [(); size_of::<PackedDecomposeFoldParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1102,6 +1104,7 @@ impl MetalRuntime {
         num_vectors: usize,
         num_rows: usize,
         num_cols: usize,
+        retain_quotients: bool,
     ) -> bool {
         let Ok(num_vectors) = u64::try_from(num_vectors) else {
             return false;
@@ -1134,13 +1137,18 @@ impl MetalRuntime {
         let digit_bytes = num_vectors
             .checked_mul(num_cols)
             .and_then(|count| count.checked_mul(D as u64));
+        let product_count = 1 + u64::from(retain_quotients);
         let partial_bytes = threadgroups
             .and_then(|count| count.checked_mul(D as u64))
+            .and_then(|count| count.checked_mul(product_count))
             .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
-        let output_bytes =
-            output_coefficients.and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
+        let output_bytes = output_coefficients
+            .and_then(|count| count.checked_mul(product_count))
+            .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64));
         let maximum = self.device.max_buffer_length();
-        output_coefficients.is_some_and(|count| count <= u64::from(u32::MAX))
+        output_coefficients
+            .and_then(|count| count.checked_mul(product_count))
+            .is_some_and(|count| count <= u64::from(u32::MAX))
             && threadgroups.is_some_and(|count| count <= u64::from(u32::MAX))
             && [matrix_bytes, digit_bytes, partial_bytes, output_bytes]
                 .into_iter()
@@ -1560,6 +1568,7 @@ impl MetalRuntime {
         &self,
         matrix: &Buffer,
         digit_vectors: &[&[[i8; D]]],
+        retain_quotients: bool,
         params: DigitRowsParams,
     ) -> Result<DigitRowsDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
@@ -1568,6 +1577,11 @@ impl MetalRuntime {
                 .checked_mul(params.num_rows)
                 .and_then(|count| count.checked_mul(params.ring_d))
                 .ok_or(MetalCommitError::ShapeOverflow("digit-row output"))?;
+            let product_count = 1u64 + u64::from(retain_quotients);
+            let total_output = params
+                .output_coefficients
+                .checked_mul(product_count)
+                .ok_or(MetalCommitError::ShapeOverflow("digit-row product output"))?;
             let expected_vector_width = usize::try_from(params.num_cols)
                 .map_err(|_| MetalCommitError::ShapeOverflow("digit-row column count"))?;
             let expected_vector_count = usize::try_from(params.num_vectors)
@@ -1582,6 +1596,7 @@ impl MetalRuntime {
                 .checked_mul(params.num_rows)
                 .and_then(|count| count.checked_mul(expected_column_partials))
                 .and_then(|count| count.checked_mul(params.ring_d))
+                .and_then(|count| count.checked_mul(product_count))
                 .ok_or(MetalCommitError::ShapeOverflow("digit-row partials"))?;
             let expected_matrix_bytes = params
                 .num_rows
@@ -1598,9 +1613,10 @@ impl MetalRuntime {
                     .iter()
                     .any(|digits| digits.len() != expected_vector_width)
                 || params.output_coefficients != expected_output
+                || params.retain_quotients != u64::from(retain_quotients)
                 || params.columns_per_partial != FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64
                 || params.column_partials != expected_column_partials
-                || params.output_coefficients > u64::from(u32::MAX)
+                || total_output > u64::from(u32::MAX)
                 || params
                     .num_vectors
                     .checked_mul(params.num_rows)
@@ -1611,6 +1627,7 @@ impl MetalRuntime {
                     expected_vector_count,
                     expected_row_count,
                     expected_vector_width,
+                    retain_quotients,
                 )
             {
                 return Err(MetalCommitError::UnsupportedShape(
@@ -1620,7 +1637,7 @@ impl MetalRuntime {
 
             let buffer_start = Instant::now();
             let digit_buffer = self.shared_buffer_from_digit_rows(digit_vectors)?;
-            let output_count = usize::try_from(params.output_coefficients)
+            let output_count = usize::try_from(total_output)
                 .map_err(|_| MetalCommitError::ShapeOverflow("digit-row output coefficients"))?;
             let output_bytes = output_count
                 .checked_mul(size_of::<Fp128Limbs>())
@@ -1659,7 +1676,7 @@ impl MetalRuntime {
             encoder.set_buffer(1, Some(&output), 0);
             set_inline_bytes(encoder, 2, &params);
             encoder.dispatch_thread_groups(
-                MTLSize::new(params.output_coefficients, 1, 1),
+                MTLSize::new(total_output, 1, 1),
                 MTLSize::new(FP128_D64_DIGIT_ROWS_THREADS as u64, 1, 1),
             );
             encoder.end_encoding();
@@ -1952,12 +1969,14 @@ impl MetalRuntime {
         })
     }
 
-    pub(crate) fn dispatch_packed_fp128_d512_decompose_fold(
+    pub(crate) fn dispatch_packed_fp128_d512_decompose_fold_streaming(
         &self,
         lanes: &[u8],
         challenge_positions: &[u16],
         challenge_coefficients: &[i8],
         params: PackedDecomposeFoldParams,
+        position_chunk_len: usize,
+        mut consume: impl FnMut(usize, &[i32]),
     ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
             let expected_challenge_terms = params
@@ -1979,6 +1998,8 @@ impl MetalRuntime {
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
                 || params.challenge_weight == 0
+                || params.position_start != 0
+                || position_chunk_len == 0
                 || params.output_coefficients != expected_output
                 || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
                 || u64::try_from(challenge_positions.len()).ok() != Some(expected_challenge_terms)
@@ -2021,36 +2042,75 @@ impl MetalRuntime {
             };
             let buffer_setup = buffer_start.elapsed();
 
-            let command = self.queue.new_command_buffer();
-            command.set_label("Akita fp128 D512 packed decompose-fold");
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_label("Akita fp128 D512 packed decompose-fold");
-            encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
-            encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
-            encoder.set_buffer(1, Some(&positions), 0);
-            encoder.set_buffer(2, Some(&coefficients), 0);
-            encoder.set_buffer(3, Some(&output), 0);
-            set_inline_bytes(encoder, 4, &params);
-            encoder.dispatch_thread_groups(
-                MTLSize::new(params.num_positions, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            encoder.end_encoding();
-            let (command_wall, gpu) = complete_command(command)?;
-
-            let readback_start = Instant::now();
-            if !output_zero_copy {
-                // SAFETY: both buffers contain exactly `output_count`
-                // initialized i32 values and do not overlap.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        output.contents().cast::<i32>(),
-                        centered_coefficients.as_mut_ptr(),
-                        output_count,
-                    );
-                }
+            let total_positions = usize::try_from(params.num_positions)
+                .map_err(|_| MetalCommitError::ShapeOverflow("decompose-fold position count"))?;
+            let chunk_len = position_chunk_len.min(total_positions);
+            let command_start = Instant::now();
+            let mut commands = Vec::with_capacity(total_positions.div_ceil(chunk_len));
+            for position_start in (0..total_positions).step_by(chunk_len) {
+                let position_end = position_start
+                    .saturating_add(chunk_len)
+                    .min(total_positions);
+                let position_count = position_end - position_start;
+                let mut command_params = params;
+                command_params.position_start = u64::try_from(position_start).map_err(|_| {
+                    MetalCommitError::ShapeOverflow("decompose-fold position offset")
+                })?;
+                let output_offset = position_start
+                    .checked_mul(512)
+                    .and_then(|count| count.checked_mul(size_of::<i32>()))
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "decompose-fold output offset",
+                    ))?;
+                let command = self.queue.new_command_buffer();
+                command.set_label("Akita fp128 D512 packed decompose-fold");
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 D512 packed decompose-fold");
+                encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
+                encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+                encoder.set_buffer(1, Some(&positions), 0);
+                encoder.set_buffer(2, Some(&coefficients), 0);
+                encoder.set_buffer(3, Some(&output), output_offset as u64);
+                set_inline_bytes(encoder, 4, &command_params);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(position_count as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                encoder.end_encoding();
+                command.commit();
+                commands.push((command, position_start, position_end));
             }
-            let readback_copy = readback_start.elapsed();
+
+            let mut readback_copy = Duration::ZERO;
+            for (command, position_start, position_end) in &commands {
+                command.wait_until_completed();
+                validate_completed_command(command)?;
+                let coefficient_start = position_start * 512;
+                let coefficient_end = position_end * 512;
+                if !output_zero_copy {
+                    let readback_start = Instant::now();
+                    // SAFETY: this completed command initialized the disjoint
+                    // coefficient range copied into equally sized host storage.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            output.contents().cast::<i32>().add(coefficient_start),
+                            centered_coefficients.as_mut_ptr().add(coefficient_start),
+                            coefficient_end - coefficient_start,
+                        );
+                    }
+                    readback_copy += readback_start.elapsed();
+                }
+                consume(
+                    *position_start,
+                    &centered_coefficients[coefficient_start..coefficient_end],
+                );
+            }
+            let command_wall = command_start.elapsed();
+            let gpu = commands.first().and_then(|(first, _, _)| {
+                commands
+                    .last()
+                    .and_then(|(last, _, _)| completed_commands_gpu_span(first, last))
+            });
             let allocation_bytes = output_bytes
                 .checked_add(size_of_val(challenge_positions))
                 .and_then(|bytes| bytes.checked_add(size_of_val(challenge_coefficients)))
@@ -2486,7 +2546,6 @@ impl MetalRuntime {
                 e_second,
                 basis,
             )?;
-
             let buffer_start = Instant::now();
             let first = self.shared_buffer_from_slice(e_first)?;
             let second = self.shared_buffer_from_slice(e_second)?;
@@ -4704,16 +4763,24 @@ mod tests {
             num_columns: COLUMNS as u64,
             lane_stride: COLUMNS as u64,
             num_positions: POSITIONS as u64,
+            position_start: 0,
             blocks_per_column: BLOCKS_PER_COLUMN as u64,
             challenge_weight: CHALLENGE_WEIGHT as u64,
             output_coefficients: (POSITIONS * 512) as u64,
         };
+        let mut streamed = Vec::new();
+        let mut chunk_starts = Vec::new();
         let actual = runtime
-            .dispatch_packed_fp128_d512_decompose_fold(
+            .dispatch_packed_fp128_d512_decompose_fold_streaming(
                 &lanes,
                 &challenge_positions,
                 &challenge_coefficients,
                 params,
+                3,
+                |position_start, coefficients| {
+                    chunk_starts.push(position_start);
+                    streamed.extend_from_slice(coefficients);
+                },
             )
             .unwrap()
             .centered_coefficients;
@@ -4748,6 +4815,8 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
+        assert_eq!(streamed, expected);
+        assert_eq!(chunk_starts, [0, 3, 6]);
     }
 
     #[test]

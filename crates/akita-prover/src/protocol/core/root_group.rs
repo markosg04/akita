@@ -64,6 +64,7 @@ where
         challenges: &crate::protocol::fold_grind::GroupFoldChallenges,
         root_params: &CommittedGroupParams,
         params: &(impl LevelParamsLike + ?Sized),
+        sink: Option<&mut dyn crate::compute::DecomposeFoldChunkSink>,
     ) -> Result<crate::protocol::fold_grind::FoldProbeOutput<F>, AkitaError>;
 }
 
@@ -271,6 +272,7 @@ where
         challenges: &crate::protocol::fold_grind::GroupFoldChallenges,
         root_params: &CommittedGroupParams,
         params: &(impl LevelParamsLike + ?Sized),
+        sink: Option<&mut dyn crate::compute::DecomposeFoldChunkSink>,
     ) -> Result<crate::protocol::fold_grind::FoldProbeOutput<F>, AkitaError> {
         let ring_dimension = params.inner_commit_matrix_params().ring_dimension();
         dispatch_for_field!(
@@ -288,6 +290,7 @@ where
                         &point_indices,
                         root_params,
                         params,
+                        sink,
                     )?;
                 Ok::<_, AkitaError>(crate::protocol::fold_grind::FoldProbeOutput {
                     witness,

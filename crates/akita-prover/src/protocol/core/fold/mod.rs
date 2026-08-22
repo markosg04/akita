@@ -7,7 +7,8 @@ use crate::compute::{
     RuntimeCommitBackendFor, RuntimeRingSwitchProveBackend,
 };
 use crate::protocol::ring_switch::{
-    commit_w_with_prefix, prepare_recursive_commit_prefix, ring_switch_build_w_pipelined,
+    commit_w_with_prefix, merge_recursive_commit_prefixes, prepare_recursive_commit_prefix,
+    ring_switch_build_w_pipelined, RecursiveCommitPrefix,
 };
 use crate::protocol::sumcheck::relation_range_image::{
     prepare_coefficient_packing_linear_terms, PreparedProverLinearTerms,
@@ -135,6 +136,7 @@ where
     level_params: &'a CommittedGroupParams,
     basis: BasisMode,
     pad_base_evals: bool,
+    fold_sink: Option<&'p mut dyn crate::protocol::fold_grind::FoldProbeSink>,
     transcript: &'p mut T,
 }
 
@@ -176,6 +178,7 @@ where
         level_params,
         basis,
         pad_base_evals,
+        fold_sink,
         transcript,
     } = args;
     let opening = stack.opening();
@@ -275,6 +278,7 @@ where
         block_claims,
         level_params.clone(),
         transcript,
+        fold_sink,
         |transcript| {
             let (trace_claim, row_coefficients) = prepare_evaluation_trace_claim::<F, E, T>(
                 &reduction,
@@ -399,6 +403,7 @@ pub(in crate::protocol::core) fn prove_fold<'stack, F, E, T, C, O, TS, R, Cfg>(
     lp: &CommittedGroupParams,
     next_params: Option<FoldSuccessorParams<'_>>,
     expected_output_witness_len: Option<usize>,
+    early_commit_prefix: Option<RecursiveCommitPrefix<F>>,
     next_witness_binding: Option<akita_types::NextWitnessBindingPolicy>,
     prepared_fold: PreparedFold<F, E>,
 ) -> Result<ProveLevelOutput<F, E>, AkitaError>
@@ -450,7 +455,53 @@ where
         }
         _ => None,
     };
-    let (logical_w, mut commit_prefix) = if let Some(params) = pipeline_params {
+    let (logical_w, mut commit_prefix) = if let Some(prefix) = early_commit_prefix {
+        let params = pipeline_params.ok_or_else(|| {
+            AkitaError::InvalidSetup(
+                "early recursive commitment prefix is not eligible at this fold".into(),
+            )
+        })?;
+        let block_coeff_len = params
+            .num_positions_per_block
+            .checked_mul(params.role_dims().d_a())
+            .ok_or_else(|| AkitaError::InvalidSetup("commit block width overflow".into()))?;
+        let prefix_coeff_len = prefix.coeff_len();
+        let (witness, tail_prefix) = ring_switch_build_w_pipelined::<F, R, _, _>(
+            &prepared_fold.instance,
+            prepared_fold.witness,
+            stack.ring_switch(),
+            lp,
+            block_coeff_len,
+            |digits, known_balanced_log_basis| {
+                let tail = digits.get(prefix_coeff_len..).ok_or_else(|| {
+                    AkitaError::InvalidSetup(
+                        "early recursive commitment prefix exceeds the ring-switch body".into(),
+                    )
+                })?;
+                if tail.is_empty() {
+                    Ok(None)
+                } else {
+                    prepare_recursive_commit_prefix::<Cfg, C>(
+                        params,
+                        expanded.as_ref(),
+                        stack.commit(),
+                        tail,
+                        known_balanced_log_basis,
+                    )
+                    .map(Some)
+                }
+            },
+        )
+        .map_err(|err| {
+            AkitaError::InvalidInput(format!("ring-switch witness build failed: {err:?}"))
+        })?;
+        let prefix = if let Some(tail_prefix) = tail_prefix {
+            merge_recursive_commit_prefixes(vec![prefix, tail_prefix])?
+        } else {
+            prefix
+        };
+        (witness, Some(prefix))
+    } else if let Some(params) = pipeline_params {
         let block_coeff_len = params
             .num_positions_per_block
             .checked_mul(params.role_dims().d_a())

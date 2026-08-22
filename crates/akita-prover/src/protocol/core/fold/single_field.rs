@@ -19,14 +19,15 @@ use akita_types::{BasisMode, CommittedGroupParams, FpExtEncoding};
 ///
 /// This path never runs extension-opening reduction or tensor projection.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::protocol::core) fn prepare_single_field_fold<'a, F, E, T, P, V, C, O, TS, R>(
+pub(in crate::protocol::core) fn prepare_single_field_fold<'a, 'p, F, E, T, P, V, C, O, TS, R>(
     stack: &ProverComputeStack<'_, F, C, O, TS, R>,
     block_claims: ProverOpeningData<'a, E, P, F>,
     pad_base_evals: bool,
-    transcript: &mut T,
+    transcript: &'p mut T,
     validate_non_eor: V,
     level_params: &CommittedGroupParams,
     basis: BasisMode,
+    fold_sink: Option<&'p mut dyn crate::protocol::fold_grind::FoldProbeSink>,
 ) -> Result<PreparedFold<F, E>, AkitaError>
 where
     F: FieldCore
@@ -65,6 +66,7 @@ where
         level_params,
         basis,
         pad_base_evals,
+        fold_sink,
         transcript,
     })
     .map_err(|err| AkitaError::InvalidInput(format!("finish prepared fold failed: {err:?}")))

@@ -259,6 +259,7 @@ pub(super) fn build_point_decompose_fold_witness<F, P, B, const D: usize>(
     num_positions_per_block: usize,
     num_digits_inner: usize,
     log_basis_inner: u32,
+    mut sink: Option<&mut dyn crate::compute::DecomposeFoldChunkSink>,
 ) -> Result<DecomposeFoldWitness<F>, AkitaError>
 where
     F: FieldCore + CanonicalField,
@@ -269,17 +270,20 @@ where
 {
     let point_challenges = challenges.select_claims(point_indices)?;
     let batch_view = P::opening_batch(point_polys)?;
-    match OpeningBatchKernel::decompose_fold_batch(
-        backend,
-        prepared,
-        batch_view,
-        DecomposeFoldBatchPlan::Sparse {
-            challenges: point_challenges.as_slice(),
-            num_positions_per_block,
-            num_digits: num_digits_inner,
-            log_basis: log_basis_inner,
-        },
-    )? {
+    let plan = DecomposeFoldBatchPlan::Sparse {
+        challenges: point_challenges.as_slice(),
+        num_positions_per_block,
+        num_digits: num_digits_inner,
+        log_basis: log_basis_inner,
+    };
+    let outcome = if let Some(consumer) = sink.as_deref_mut() {
+        OpeningBatchKernel::decompose_fold_batch_streaming(
+            backend, prepared, batch_view, plan, consumer,
+        )?
+    } else {
+        OpeningBatchKernel::decompose_fold_batch(backend, prepared, batch_view, plan)?
+    };
+    match outcome {
         BatchDecomposeFoldOutcome::Fused(z_point) => Ok(z_point),
         BatchDecomposeFoldOutcome::FallbackPerPoly => {
             let witnesses: Vec<DecomposeFoldWitness<F>> = point_polys
@@ -303,7 +307,17 @@ where
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            aggregate_decompose_fold_witnesses::<F, D>(witnesses)
+            let witness = aggregate_decompose_fold_witnesses::<F, D>(witnesses)?;
+            if let Some(consumer) = sink.as_deref_mut() {
+                consumer.consume(crate::compute::DecomposeFoldChunk::new(
+                    0,
+                    num_positions_per_block,
+                    D,
+                    num_digits_inner,
+                    witness.centered_coeffs_flat(),
+                )?)?;
+            }
+            Ok(witness)
         }
         BatchDecomposeFoldOutcome::Unsupported => Err(AkitaError::InvalidSetup(
             "sparse batched fold is unsupported for this polynomial backend".to_string(),
@@ -447,6 +461,7 @@ impl RingRelationProver {
         block_claims: ProverOpeningData<'a, PointF, P, F>,
         lp: CommittedGroupParams,
         transcript: &mut T,
+        fold_sink: Option<&mut dyn fold_grind::FoldProbeSink>,
         bind_claims_after_payload: BindClaims,
     ) -> Result<(PreparedRingRelation<F, PointF>, BoundClaims), AkitaError>
     where
@@ -833,6 +848,7 @@ impl RingRelationProver {
                 &opening_batch,
                 &grind_groups,
                 None,
+                fold_sink,
             )
             .map_err(|err| AkitaError::InvalidInput(format!("fold grind failed: {err:?}")))?;
         drop(_grind_span);

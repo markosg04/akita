@@ -5,7 +5,7 @@ use crate::kernels::linear::decompose_commit_blocks_into;
 use crate::CommitInnerWitness;
 use akita_algebra::ring::CyclotomicRing;
 use akita_field::parallel::*;
-use akita_field::{AkitaError, CanonicalField, FieldCore};
+use akita_field::{AkitaError, CanonicalField, FieldCore, HalvingField};
 use akita_types::{DigitBlocks, RingVec};
 
 #[tracing::instrument(skip_all, name = "validate_commit_inner_shape")]
@@ -84,6 +84,11 @@ where
         .collect()
 }
 
+pub(crate) struct OuterCommitProducts<F: FieldCore, const D: usize> {
+    pub(crate) rows: Vec<CyclotomicRing<F, D>>,
+    pub(crate) quotients: Option<Vec<CyclotomicRing<F, D>>>,
+}
+
 /// Apply one physical B matrix to every canonical slice and stack the images.
 pub(crate) fn commit_outer_slices<'a, F, B, const D_B: usize>(
     backend: &B,
@@ -92,9 +97,9 @@ pub(crate) fn commit_outer_slices<'a, F, B, const D_B: usize>(
     polynomial_digits: impl IntoIterator<Item = &'a DigitBlocks>,
     geometry: &akita_types::CommitmentSliceGeometry,
     log_basis: u32,
-) -> Result<Vec<CyclotomicRing<F, D_B>>, AkitaError>
+) -> Result<OuterCommitProducts<F, D_B>, AkitaError>
 where
-    F: FieldCore + CanonicalField,
+    F: FieldCore + CanonicalField + HalvingField,
     B: DigitRowsComputeBackend<F>,
 {
     let expected_rows = geometry.logical_output_rows(n_b)?;
@@ -105,16 +110,29 @@ where
         Ok(())
     })?;
     let input_views = slice_inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let row_batches = backend.digit_rows_batch::<D_B>(prepared, n_b, &input_views, log_basis)?;
+    let row_batches =
+        backend.digit_rows_products_batch::<D_B>(prepared, n_b, &input_views, log_basis)?;
     let mut stacked = Vec::with_capacity(expected_rows);
-    for rows in row_batches {
-        if rows.len() != n_b {
+    let retain_quotients = row_batches
+        .iter()
+        .all(|products| products.quotients.is_some());
+    let mut stacked_quotients = retain_quotients.then(|| Vec::with_capacity(expected_rows));
+    for products in row_batches {
+        if products.negacyclic.len() != n_b
+            || products
+                .quotients
+                .as_ref()
+                .is_some_and(|quotients| quotients.len() != n_b)
+        {
             return Err(AkitaError::InvalidSetup(format!(
                 "backend returned {} B commitment rows, expected {n_b}",
-                rows.len(),
+                products.negacyclic.len(),
             )));
         }
-        stacked.extend(rows);
+        stacked.extend(products.negacyclic);
+        if let (Some(stacked), Some(quotients)) = (stacked_quotients.as_mut(), products.quotients) {
+            stacked.extend(quotients);
+        }
     }
     if stacked.len() != expected_rows {
         return Err(AkitaError::InvalidSetup(format!(
@@ -122,7 +140,18 @@ where
             stacked.len()
         )));
     }
-    Ok(stacked)
+    if stacked_quotients
+        .as_ref()
+        .is_some_and(|quotients| quotients.len() != expected_rows)
+    {
+        return Err(AkitaError::InvalidSetup(
+            "backend returned an incomplete B quotient cache".into(),
+        ));
+    }
+    Ok(OuterCommitProducts {
+        rows: stacked,
+        quotients: stacked_quotients,
+    })
 }
 
 /// Validate one committed group's per-polynomial plane counts, then stream its

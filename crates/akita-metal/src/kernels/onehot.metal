@@ -96,6 +96,7 @@ struct DigitRowsParams {
     ulong output_coefficients;
     ulong columns_per_partial;
     ulong column_partials;
+    ulong retain_quotients;
 };
 
 struct I8CoefficientPackingParams {
@@ -134,6 +135,7 @@ struct PackedDecomposeFoldParams {
     ulong num_columns;
     ulong lane_stride;
     ulong num_positions;
+    ulong position_start;
     ulong blocks_per_column;
     ulong challenge_weight;
     ulong output_coefficients;
@@ -736,6 +738,7 @@ kernel void akita_fp128_d64_digit_rows_partials(
         (uint)params.num_cols);
     uint coefficient = thread_index;
     AkitaWideAccumulator accumulator = akita_wide_zero();
+    AkitaWideAccumulator quotient = akita_wide_zero();
     for (uint column = column_start; column < column_end; ++column) {
         ulong ring_start =
             ((ulong)row * params.num_cols + (ulong)column) * 64ul;
@@ -749,14 +752,15 @@ kernel void akita_fp128_d64_digit_rows_partials(
             int digit = (int)digit_ring[digit_coefficient];
             uint magnitude = (uint)(digit < 0 ? -digit : digit);
             bool positive = digit > 0;
-            if (digit_coefficient > coefficient) {
-                positive = !positive;
-            }
+            bool wraps = digit_coefficient > coefficient;
             uint source_coefficient =
                 (coefficient + 64u - digit_coefficient) & 63u;
             AkitaFp128 value = matrix_ring[source_coefficient];
             for (uint repeat = 0u; repeat < magnitude; ++repeat) {
-                akita_wide_accumulate(accumulator, value, positive);
+                akita_wide_accumulate(accumulator, value, wraps ? !positive : positive);
+                if (params.retain_quotients != 0ul && wraps) {
+                    akita_wide_accumulate(quotient, value, positive);
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -766,6 +770,11 @@ kernel void akita_fp128_d64_digit_rows_partials(
             * params.column_partials + (ulong)partial) * 64ul
         + (ulong)coefficient;
     partials[output_index] = akita_reduce_wide(accumulator);
+    if (params.retain_quotients != 0ul) {
+        ulong partial_coefficients =
+            params.num_vectors * params.num_rows * params.column_partials * 64ul;
+        partials[partial_coefficients + output_index] = akita_reduce_wide(quotient);
+    }
 }
 
 kernel void akita_fp128_d64_digit_rows_reduce(
@@ -778,9 +787,12 @@ kernel void akita_fp128_d64_digit_rows_reduce(
     threadgroup AkitaFp128 reduction[256];
 
     uint output_index = threadgroup_index.x;
+    uint product = (uint)((ulong)output_index / params.output_coefficients);
+    uint product_output_index =
+        (uint)((ulong)output_index % params.output_coefficients);
     uint outputs_per_vector = (uint)params.num_rows * 64u;
-    uint vector = output_index / outputs_per_vector;
-    uint vector_local = output_index % outputs_per_vector;
+    uint vector = product_output_index / outputs_per_vector;
+    uint vector_local = product_output_index % outputs_per_vector;
     uint row = vector_local >> 6u;
     uint coefficient = vector_local & 63u;
     AkitaWideAccumulator accumulator = akita_wide_zero();
@@ -791,6 +803,8 @@ kernel void akita_fp128_d64_digit_rows_reduce(
             (((ulong)vector * params.num_rows + (ulong)row)
                 * params.column_partials + (ulong)partial) * 64ul
             + (ulong)coefficient;
+        partial_index += (ulong)product
+            * params.num_vectors * params.num_rows * params.column_partials * 64ul;
         akita_wide_accumulate(accumulator, partials[partial_index], true);
     }
     reduction[thread_index] = akita_reduce_wide(accumulator);
@@ -1001,7 +1015,8 @@ kernel void akita_fp128_d512_decompose_fold(
 {
     threadgroup atomic_int accumulators[512];
 
-    uint position = threadgroup_index.x;
+    uint local_position = threadgroup_index.x;
+    ulong position = params.position_start + (ulong)local_position;
     atomic_store_explicit(
         &accumulators[thread_index], 0, memory_order_relaxed);
     atomic_store_explicit(
@@ -1017,7 +1032,7 @@ kernel void akita_fp128_d512_decompose_fold(
         ulong block_local = task % (params.num_columns * 2ul);
         ulong column = block_local >> 1ul;
         ulong row_in_ring = block_local & 1ul;
-        ulong ring = trace_block * params.num_positions + (ulong)position;
+        ulong ring = trace_block * params.num_positions + position;
         ulong row = ring * 2ul + row_in_ring;
         uchar hot = lanes[row * params.lane_stride + column];
         if (hot == 0u) {
@@ -1041,7 +1056,7 @@ kernel void akita_fp128_d512_decompose_fold(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    ulong output_base = (ulong)position * 512ul;
+    ulong output_base = (ulong)local_position * 512ul;
     output[output_base + (ulong)thread_index] = atomic_load_explicit(
         &accumulators[thread_index], memory_order_relaxed);
     output[output_base + (ulong)thread_index + 256ul] = atomic_load_explicit(

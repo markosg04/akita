@@ -8,9 +8,10 @@ use akita_algebra::CyclotomicRing;
 use akita_field::{AkitaError, ExtField, MulBaseUnreduced};
 use akita_prover::compute::{
     CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
-    ComputeExecutionDomain, CyclicRowsComputeBackend, DecomposeFoldBatchPlan, DecomposeFoldPlan,
-    DigitRowsComputeBackend, OpeningBatchKernel, OpeningFoldKernel, OpeningFoldOutput,
-    OpeningFoldPlan, TensorPackedWitness, TensorProjectionKernel,
+    ComputeExecutionDomain, CyclicRowsComputeBackend, DecomposeFoldBatchPlan, DecomposeFoldChunk,
+    DecomposeFoldChunkSink, DecomposeFoldPlan, DigitRowsComputeBackend, DigitRowsProducts,
+    OpeningBatchKernel, OpeningFoldKernel, OpeningFoldOutput, OpeningFoldPlan, TensorPackedWitness,
+    TensorProjectionKernel,
 };
 use akita_prover::{
     CpuBackend, CpuPreparedSetup, DirectDigitRangeProofBackend, DirectDigitRangeProofInput,
@@ -401,6 +402,25 @@ impl MetalCommitBackend<F> {
         source: PackedOneHotView<'_, F, D>,
         plan: DecomposeFoldPlan<'_>,
     ) -> Result<akita_prover::DecomposeFoldWitness<F>, AkitaError> {
+        self.decompose_fold_packed_fp128_d512_impl(source, plan, None)
+    }
+
+    /// Decompose a packed D512 root and expose ordered completed position chunks.
+    pub fn decompose_fold_packed_fp128_d512_streaming<const D: usize>(
+        &self,
+        source: PackedOneHotView<'_, F, D>,
+        plan: DecomposeFoldPlan<'_>,
+        sink: &mut dyn DecomposeFoldChunkSink,
+    ) -> Result<akita_prover::DecomposeFoldWitness<F>, AkitaError> {
+        self.decompose_fold_packed_fp128_d512_impl(source, plan, Some(sink))
+    }
+
+    fn decompose_fold_packed_fp128_d512_impl<const D: usize>(
+        &self,
+        source: PackedOneHotView<'_, F, D>,
+        plan: DecomposeFoldPlan<'_>,
+        mut sink: Option<&mut dyn DecomposeFoldChunkSink>,
+    ) -> Result<akita_prover::DecomposeFoldWitness<F>, AkitaError> {
         if D != 512
             || source.onehot_k() != 256
             || source.column_capacity() != 32
@@ -477,8 +497,16 @@ impl MetalCommitBackend<F> {
         let runtime = self
             .runtime()
             .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
+        let position_chunk_len = sink
+            .as_deref()
+            .map_or(plan.num_positions_per_block, |consumer| {
+                consumer
+                    .preferred_position_chunk_len(plan.num_positions_per_block)
+                    .max(1)
+            });
+        let mut sink_error = None;
         let outcome = runtime
-            .dispatch_packed_fp128_d512_decompose_fold(
+            .dispatch_packed_fp128_d512_decompose_fold_streaming(
                 source.lanes(),
                 &positions,
                 &coefficients,
@@ -487,12 +515,37 @@ impl MetalCommitBackend<F> {
                     num_columns: source.num_columns() as u64,
                     lane_stride: source.num_columns() as u64,
                     num_positions: plan.num_positions_per_block as u64,
+                    position_start: 0,
                     blocks_per_column: blocks_per_column as u64,
                     challenge_weight: challenge_weight as u64,
                     output_coefficients: output_coefficients as u64,
                 },
+                position_chunk_len,
+                |position_start, compressed_chunk| {
+                    let Some(consumer) = sink.as_deref_mut() else {
+                        return;
+                    };
+                    let expanded =
+                        expand_packed_decompose_chunk::<D>(compressed_chunk, plan.num_digits);
+                    match expanded.and_then(|expanded| {
+                        let position_count = compressed_chunk.len() / D;
+                        consumer.consume(DecomposeFoldChunk::new(
+                            position_start,
+                            position_count,
+                            D,
+                            plan.num_digits,
+                            &expanded,
+                        )?)
+                    }) {
+                        Ok(()) => {}
+                        Err(error) => sink_error = Some(error),
+                    }
+                },
             )
             .map_err(MetalCommitError::into_akita)?;
+        if let Some(error) = sink_error {
+            return Err(error);
+        }
         let timings = outcome.timings;
         self.update_opening_metrics(|metrics| {
             metrics.command_wall_time += timings.command_wall;
@@ -525,6 +578,34 @@ impl MetalCommitBackend<F> {
         let modulus = (-F::one()).to_canonical_u128() + 1;
         Ok(akita_prover::backend::poly_helpers::build_decompose_fold_witness(centered, modulus))
     }
+}
+
+fn expand_packed_decompose_chunk<const D: usize>(
+    compressed: &[i32],
+    num_digits: usize,
+) -> Result<Vec<i32>, AkitaError> {
+    if D == 0 || num_digits == 0 || !compressed.len().is_multiple_of(D) {
+        return Err(AkitaError::InvalidSize {
+            expected: D,
+            actual: compressed.len(),
+        });
+    }
+    if num_digits == 1 {
+        return Ok(compressed.to_vec());
+    }
+    let expanded_len = compressed
+        .len()
+        .checked_mul(num_digits)
+        .ok_or_else(|| AkitaError::InvalidSetup("packed decompose chunk overflow".into()))?;
+    let mut expanded = Vec::with_capacity(expanded_len);
+    let zeros = vec![0i32; D];
+    for coefficients in compressed.chunks_exact(D) {
+        expanded.extend_from_slice(coefficients);
+        for _ in 1..num_digits {
+            expanded.extend_from_slice(&zeros);
+        }
+    }
+    Ok(expanded)
 }
 
 fn into_array_vec<T, const D: usize>(values: Vec<T>) -> Result<Vec<[T; D]>, AkitaError> {
@@ -1526,13 +1607,14 @@ where
 }
 
 impl MetalCommitBackend<F> {
-    fn digit_rows_batch_impl<const D: usize>(
+    fn digit_rows_products_batch_impl<const D: usize>(
         &self,
         prepared: &MetalPreparedSetup<F>,
         row_len: usize,
         digit_vectors: &[&[[i8; D]]],
         log_basis: u32,
-    ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
+        retain_quotients: bool,
+    ) -> Result<Vec<DigitRowsProducts<F, D>>, AkitaError> {
         if digit_vectors.is_empty() {
             return Ok(Vec::new());
         }
@@ -1550,7 +1632,12 @@ impl MetalCommitBackend<F> {
                     .all(|&digit| (-4..=3).contains(&digit))
             })
             && self.runtime().is_some_and(|runtime| {
-                runtime.supports_fp128_d64_digit_rows::<D>(digit_vectors.len(), row_len, num_cols)
+                runtime.supports_fp128_d64_digit_rows::<D>(
+                    digit_vectors.len(),
+                    row_len,
+                    num_cols,
+                    retain_quotients,
+                )
             });
         let (row_batches, used_metal, metal_timings, allocation_bytes) = if use_metal {
             if let Some(runtime) = self.runtime() {
@@ -1567,6 +1654,7 @@ impl MetalCommitBackend<F> {
                     .dispatch_fp128_d64_digit_rows(
                         matrix.buffer.as_ref(),
                         digit_vectors,
+                        retain_quotients,
                         DigitRowsParams {
                             num_vectors: u64::try_from(digit_vectors.len()).map_err(|_| {
                                 MetalCommitError::ShapeOverflow("digit-row vector count")
@@ -1594,6 +1682,7 @@ impl MetalCommitBackend<F> {
                                 MetalCommitError::ShapeOverflow("digit-row column partials")
                                     .into_akita()
                             })?,
+                            retain_quotients: u64::from(retain_quotients),
                         },
                     )
                     .map_err(MetalCommitError::into_akita)?;
@@ -1605,8 +1694,12 @@ impl MetalCommitBackend<F> {
                     .ok_or_else(|| {
                         MetalCommitError::ShapeOverflow("digit-row input bytes").into_akita()
                     })?;
+                let product_count = 1usize + usize::from(retain_quotients);
                 let output_bytes = output_coefficients
-                    .checked_mul(std::mem::size_of::<crate::field::Fp128Limbs>())
+                    .checked_mul(product_count)
+                    .and_then(|count| {
+                        count.checked_mul(std::mem::size_of::<crate::field::Fp128Limbs>())
+                    })
                     .ok_or_else(|| {
                         MetalCommitError::ShapeOverflow("digit-row output bytes").into_akita()
                     })?;
@@ -1619,6 +1712,7 @@ impl MetalCommitBackend<F> {
                         )
                     })
                     .and_then(|count| count.checked_mul(D))
+                    .and_then(|count| count.checked_mul(product_count))
                     .and_then(|count| {
                         count.checked_mul(std::mem::size_of::<crate::field::Fp128Limbs>())
                     })
@@ -1641,7 +1735,10 @@ impl MetalCommitBackend<F> {
                 let coefficients_per_vector = row_len.checked_mul(D).ok_or_else(|| {
                     MetalCommitError::ShapeOverflow("digit-row vector output").into_akita()
                 })?;
-                let row_batches = coefficients
+                let negacyclic_coefficients = coefficients
+                    .get(..output_coefficients)
+                    .ok_or(AkitaError::InvalidProof)?;
+                let row_batches = negacyclic_coefficients
                     .chunks_exact(coefficients_per_vector)
                     .map(|vector| {
                         vector
@@ -1649,17 +1746,56 @@ impl MetalCommitBackend<F> {
                             .map(CyclotomicRing::from_slice)
                             .collect()
                     })
+                    .collect::<Vec<_>>();
+                let quotient_batches = if retain_quotients {
+                    let quotient_coefficients = coefficients
+                        .get(output_coefficients..)
+                        .filter(|values| values.len() == output_coefficients)
+                        .ok_or(AkitaError::InvalidProof)?;
+                    Some(
+                        quotient_coefficients
+                            .chunks_exact(coefficients_per_vector)
+                            .map(|vector| {
+                                vector
+                                    .chunks_exact(D)
+                                    .map(CyclotomicRing::from_slice)
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
+                let products = row_batches
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, negacyclic)| DigitRowsProducts {
+                        negacyclic,
+                        quotients: quotient_batches
+                            .as_ref()
+                            .and_then(|batches| batches.get(index).cloned()),
+                    })
                     .collect();
-                (row_batches, true, Some(timings), allocation_bytes)
+                (products, true, Some(timings), allocation_bytes)
             } else {
                 (
-                    digit_vectors
-                        .iter()
-                        .map(|digits| {
-                            self.cpu_backend()
-                                .digit_rows(&prepared.cpu, row_len, digits, log_basis)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
+                    if retain_quotients {
+                        self.cpu_backend().digit_rows_products_batch(
+                            &prepared.cpu,
+                            row_len,
+                            digit_vectors,
+                            log_basis,
+                        )?
+                    } else {
+                        self.cpu_backend()
+                            .digit_rows_batch(&prepared.cpu, row_len, digit_vectors, log_basis)?
+                            .into_iter()
+                            .map(|negacyclic| DigitRowsProducts {
+                                negacyclic,
+                                quotients: None,
+                            })
+                            .collect()
+                    },
                     false,
                     None,
                     0,
@@ -1667,13 +1803,23 @@ impl MetalCommitBackend<F> {
             }
         } else {
             (
-                digit_vectors
-                    .iter()
-                    .map(|digits| {
-                        self.cpu_backend()
-                            .digit_rows(&prepared.cpu, row_len, digits, log_basis)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+                if retain_quotients {
+                    self.cpu_backend().digit_rows_products_batch(
+                        &prepared.cpu,
+                        row_len,
+                        digit_vectors,
+                        log_basis,
+                    )?
+                } else {
+                    self.cpu_backend()
+                        .digit_rows_batch(&prepared.cpu, row_len, digit_vectors, log_basis)?
+                        .into_iter()
+                        .map(|negacyclic| DigitRowsProducts {
+                            negacyclic,
+                            quotients: None,
+                        })
+                        .collect()
+                },
                 false,
                 None,
                 0,
@@ -1718,8 +1864,9 @@ impl MetalCommitBackend<F> {
 
 impl DigitRowsComputeBackend<F> for MetalCommitBackend<F>
 where
-    CpuBackend:
-        ComputeBackendSetup<F, PreparedSetup = CpuPreparedSetup<F>> + DigitRowsComputeBackend<F>,
+    CpuBackend: ComputeBackendSetup<F, PreparedSetup = CpuPreparedSetup<F>>
+        + DigitRowsComputeBackend<F>
+        + CyclicRowsComputeBackend<F>,
 {
     fn digit_rows<const D: usize>(
         &self,
@@ -1728,13 +1875,14 @@ where
         digits: &[[i8; D]],
         log_basis: u32,
     ) -> Result<Vec<CyclotomicRing<F, D>>, AkitaError> {
-        let mut batches = self.digit_rows_batch_impl(prepared, row_len, &[digits], log_basis)?;
+        let mut batches =
+            self.digit_rows_products_batch_impl(prepared, row_len, &[digits], log_basis, false)?;
         if batches.len() != 1 {
             return Err(AkitaError::InvalidSetup(
                 "single digit-row dispatch returned an invalid batch count".into(),
             ));
         }
-        Ok(batches.remove(0))
+        Ok(batches.remove(0).negacyclic)
     }
 
     fn digit_rows_batch<const D: usize>(
@@ -1744,7 +1892,23 @@ where
         digit_vectors: &[&[[i8; D]]],
         log_basis: u32,
     ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
-        self.digit_rows_batch_impl(prepared, row_len, digit_vectors, log_basis)
+        self.digit_rows_products_batch_impl(prepared, row_len, digit_vectors, log_basis, false)
+            .map(|products| {
+                products
+                    .into_iter()
+                    .map(|product| product.negacyclic)
+                    .collect()
+            })
+    }
+
+    fn digit_rows_products_batch<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        row_len: usize,
+        digit_vectors: &[&[[i8; D]]],
+        log_basis: u32,
+    ) -> Result<Vec<DigitRowsProducts<F, D>>, AkitaError> {
+        self.digit_rows_products_batch_impl(prepared, row_len, digit_vectors, log_basis, true)
     }
 }
 
@@ -2082,7 +2246,7 @@ mod tests {
         let metal = MetalCommitBackend::<F>::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let runtime = metal.runtime().unwrap();
 
-        assert!(runtime.supports_fp128_d64_digit_rows::<64>(2, 1, 1_409_024));
+        assert!(runtime.supports_fp128_d64_digit_rows::<64>(2, 1, 1_409_024, true));
     }
 
     #[test]
@@ -2154,5 +2318,26 @@ mod tests {
             .unwrap();
         assert_eq!(actual_batch, vec![expected, expected_second]);
         assert_eq!(metal_prepared.matrix_cache_entries().unwrap(), 1);
+
+        let expected_products = cpu
+            .digit_rows_products_batch::<D>(
+                &cpu_prepared,
+                ROWS,
+                &[digits.as_slice(), second_digits.as_slice()],
+                3,
+            )
+            .unwrap();
+        let actual_products = metal
+            .digit_rows_products_batch::<D>(
+                &metal_prepared,
+                ROWS,
+                &[digits.as_slice(), second_digits.as_slice()],
+                3,
+            )
+            .unwrap();
+        for (actual, expected) in actual_products.iter().zip(&expected_products) {
+            assert_eq!(actual.negacyclic, expected.negacyclic);
+            assert_eq!(actual.quotients, expected.quotients);
+        }
     }
 }

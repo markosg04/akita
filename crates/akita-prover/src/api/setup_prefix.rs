@@ -101,7 +101,7 @@ where
         D,
         d_b,
     )?;
-    let raw_commitment =
+    let (raw_commitment, outer_relation_quotients) =
         dispatch_for_field!(ProtocolDispatchSlot::Role(RingRole::Outer), F, d_b, |D_B| {
             let blocks = recomposed_inner_rows
                 .iter()
@@ -112,7 +112,7 @@ where
                 commitment_profile.num_digits_outer,
                 commitment_profile.log_basis_outer,
             )?;
-            let u = commit_outer_slices::<F, _, D_B>(
+            let outer = commit_outer_slices::<F, _, D_B>(
                 backend,
                 prepared,
                 n_b,
@@ -120,7 +120,13 @@ where
                 &slice_geometry,
                 commitment_profile.log_basis_outer,
             )?;
-            Ok::<_, AkitaError>(RingVec::from_ring_elems(&u))
+            Ok::<_, AkitaError>((
+                RingVec::from_ring_elems(&outer.rows),
+                outer
+                    .quotients
+                    .as_ref()
+                    .map(|quotients| RingVec::from_ring_elems(quotients)),
+            ))
         })?;
     let inner_coefficient_count = recomposed_inner_rows
         .iter()
@@ -164,7 +170,8 @@ where
         RingVec::from_coeffs_with_ring_dim(inner_coefficients, D)?,
         &output.witness,
         &output.quotients,
-    )?;
+    )?
+    .with_outer_relation_quotients(outer_relation_quotients)?;
     let id = SetupPrefixSlotId {
         natural_len,
         commitment_profile: *commitment_profile,

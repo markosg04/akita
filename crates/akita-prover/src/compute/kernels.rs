@@ -34,6 +34,86 @@ pub enum BatchDecomposeFoldOutcome<F: FieldCore, const D: usize> {
     Unsupported,
 }
 
+/// One ordered position chunk from a decompose-fold operation.
+///
+/// Centered coefficients use `[position][witness digit][coefficient]` order.
+/// A streaming consumer may process a chunk once and must not retain its
+/// borrowed storage.
+pub struct DecomposeFoldChunk<'a> {
+    position_start: usize,
+    position_count: usize,
+    ring_dimension: usize,
+    witness_digits: usize,
+    centered_coefficients: &'a [i32],
+}
+
+impl<'a> DecomposeFoldChunk<'a> {
+    /// Construct a checked ordered chunk at a backend boundary.
+    pub fn new(
+        position_start: usize,
+        position_count: usize,
+        ring_dimension: usize,
+        witness_digits: usize,
+        centered_coefficients: &'a [i32],
+    ) -> Result<Self, AkitaError> {
+        let expected = position_count
+            .checked_mul(witness_digits)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup("decompose-fold chunk length overflow".into())
+            })?;
+        if position_count == 0
+            || ring_dimension == 0
+            || witness_digits == 0
+            || centered_coefficients.len() != expected
+        {
+            return Err(AkitaError::InvalidSize {
+                expected,
+                actual: centered_coefficients.len(),
+            });
+        }
+        Ok(Self {
+            position_start,
+            position_count,
+            ring_dimension,
+            witness_digits,
+            centered_coefficients,
+        })
+    }
+
+    pub fn position_start(&self) -> usize {
+        self.position_start
+    }
+
+    pub fn position_count(&self) -> usize {
+        self.position_count
+    }
+
+    pub fn ring_dimension(&self) -> usize {
+        self.ring_dimension
+    }
+
+    pub fn witness_digits(&self) -> usize {
+        self.witness_digits
+    }
+
+    pub fn centered_coefficients(&self) -> &'a [i32] {
+        self.centered_coefficients
+    }
+}
+
+/// Ordered consumer for decompose-fold position chunks.
+pub trait DecomposeFoldChunkSink {
+    /// Preferred position count per accelerator command. Backends may choose a
+    /// larger aligned chunk, but chunks must remain ordered and disjoint.
+    fn preferred_position_chunk_len(&self, total_positions: usize) -> usize {
+        total_positions
+    }
+
+    /// Consume one completed chunk.
+    fn consume(&mut self, chunk: DecomposeFoldChunk<'_>) -> Result<(), AkitaError>;
+}
+
 /// Inner Ajtai commit kernel over a borrowed commit source view `S`.
 ///
 /// `S` is the extensibility hook: a downstream crate defines its own commit
@@ -110,6 +190,43 @@ where
         source: S,
         plan: DecomposeFoldBatchPlan<'_>,
     ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError>;
+
+    /// Decompose and fold while exposing ordered completed position chunks.
+    ///
+    /// The default implementation preserves correctness for synchronous
+    /// backends by emitting the complete fused witness as one chunk.
+    fn decompose_fold_batch_streaming(
+        &self,
+        prepared: Option<&Self::PreparedSetup>,
+        source: S,
+        plan: DecomposeFoldBatchPlan<'_>,
+        sink: &mut dyn DecomposeFoldChunkSink,
+    ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError> {
+        let witness_digits = match plan {
+            DecomposeFoldBatchPlan::Sparse { num_digits, .. } => num_digits,
+        };
+        let outcome = self.decompose_fold_batch(prepared, source, plan)?;
+        if let BatchDecomposeFoldOutcome::Fused(witness) = &outcome {
+            witness.ensure_ring_dim::<D>()?;
+            let position_count = witness
+                .row_count()
+                .checked_div(witness_digits)
+                .filter(|_| witness.row_count().is_multiple_of(witness_digits))
+                .ok_or_else(|| {
+                    AkitaError::InvalidInput(
+                        "decompose-fold witness is not position aligned".into(),
+                    )
+                })?;
+            sink.consume(DecomposeFoldChunk::new(
+                0,
+                position_count,
+                D,
+                witness_digits,
+                witness.centered_coeffs_flat(),
+            )?)?;
+        }
+        Ok(outcome)
+    }
 }
 
 /// Tensor projection kernel over a borrowed tensor view `S` for opening at an

@@ -192,7 +192,7 @@ pub(super) fn prove_verify_dense_roundtrip_with_evals<Cfg>(
         .unwrap();
         let poly_refs = [&poly];
         let mut prover_transcript = AkitaTranscript::<F>::new(label);
-        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<Cfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,
@@ -257,7 +257,7 @@ where
         .unwrap();
         let poly_refs = [&poly];
         let mut prover_transcript = AkitaTranscript::<F>::new(label);
-        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prove_input::<Cfg, _>(&pt[..], &poly_refs[..], &commitment, hint),
             &stack,
@@ -384,7 +384,7 @@ where
         let selection = prover_data.selection();
 
         let mut prover_transcript = AkitaTranscript::<F>::new(label);
-        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prover_data,
             &stack,
@@ -505,7 +505,7 @@ pub(super) fn prove_verify_onehot_precommitted_roundtrip<Cfg>(
         let selection = prover_data.selection();
 
         let mut prover_transcript = AkitaTranscript::<F>::new(label);
-        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _>(
+        let proof = AkitaCommitmentScheme::<Cfg>::batched_prove::<_, _, _, _, _, _>(
             &setup,
             prover_data,
             &stack,

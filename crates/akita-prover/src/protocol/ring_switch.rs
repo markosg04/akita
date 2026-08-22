@@ -3,7 +3,6 @@ use crate::api::commitment::{validate_commit_inner_shape, validate_commit_level_
 use crate::protocol::ring_relation::compute_multi_group_relation_quotient;
 use crate::{tensor_pack_recursive_witness, RecursiveWitnessFlat};
 use akita_algebra::ring::cyclotomic::BalancedDecomposePow2Params;
-use akita_algebra::CyclotomicRing;
 use akita_config::CommitmentConfig;
 use akita_field::{
     AkitaError, CanonicalField, ExtField, FieldCore, FromPrimitiveInt, HalvingField, RandomSampling,
@@ -28,9 +27,14 @@ mod relation_weights;
 mod tests;
 
 pub use coeffs::ring_switch_build_w;
-pub(crate) use coeffs::{ring_switch_build_w_pipelined, PreparedRingSwitchGroup};
+pub(crate) use coeffs::{
+    balanced_decompose_centered_i32_i8_into, ring_switch_build_w_pipelined, PreparedRingSwitchGroup,
+};
 pub use commit::{commit_terminal_w, commit_w, NextWitnessState, NextWitnessStateOutput};
-pub(crate) use commit::{commit_w_with_prefix, prepare_recursive_commit_prefix};
+pub(crate) use commit::{
+    commit_w_with_prefix, merge_recursive_commit_prefixes, prepare_recursive_commit_prefix,
+    RecursiveCommitPrefix,
+};
 pub use evals::build_w_evals_compact;
 pub(crate) use finalize::ring_switch_finalize;
 pub(crate) use relation_weights::build_negacyclic_setup_linear_terms;
