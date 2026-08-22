@@ -2820,6 +2820,28 @@ retained for implementation only because the measured T28 CPU/root projection
 has a much larger overlap term. Any material contention with the streamed
 commitment consumer will reject it at the complete-call gate.
 
+The implementation used the fixed nearby split of 53/64 positions on Metal
+and 11/64 on CPU. The focused Metal range test and concatenated CPU range test
+both passed, including an uneven boundary. The single T25 treatment then
+rejected the mechanism:
+
+```text
+                                      working parent       position split
+root decompose/fold                         0.476 s              1.558 s
+complete Metal opening                     2.420 s              2.955 s
+aggregate GPU active                       0.646 s              0.581 s
+```
+
+The root span regressed by 1.082 seconds (3.27 times the parent latency), and
+the complete opening regressed by 534.5 ms. The 64.4 ms reduction in aggregate
+GPU-active time shows that reducing the Metal prefix did take effect; the
+critical path instead waited on the planned CPU suffix and its ordered handoff.
+The ideal model's independence assumption is therefore false on this shared
+SoC execution path. Proof size and digest, claimed evaluation, transcript
+replay, commitment parity, verifier acceptance, and the memory guard all
+passed. Remove the range adapters and hybrid schedule. Do not extrapolate CPU
+and Metal root rates independently at T28.
+
 The next ranked mechanisms are deliberately bounded. A D512 challenge family
 with 15 coefficients in `+/-1` and two in `+/-2` has 128.36 bits of raw support,
 the same L1 mass 19, and weight 17; it can remove only 10.5% of root additions
