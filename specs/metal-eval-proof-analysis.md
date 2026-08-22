@@ -2842,6 +2842,30 @@ replay, commitment parity, verifier acceptance, and the memory guard all
 passed. Remove the range adapters and hybrid schedule. Do not extrapolate CPU
 and Metal root rates independently at T28.
 
+### Max-scale control refresh
+
+The retained architecture is now a max-scale milestone: packed Metal root
+folding, live-prefix direct sumchecks, streamed successor commitment, semantic
+device source generation, and retained outer quotients all compose in the
+canonical evaluator. The remaining T28 model is nevertheless internally
+inconsistent. The current T25 CPU root processed 19,126,026,240 sparse updates
+in 2.240852 seconds. The populated T28 case requires 144,654,212,970 updates,
+or 7.5632 times as many. Equal throughput predicts a 16.95-second CPU root,
+whereas the old provisional max-scale table assigns it only 5.15 seconds. T25
+already has ample position parallelism, so a hidden 3.29-times CPU throughput
+increase at T28 is not a credible planning assumption.
+
+Refresh the max-scale control once with one CPU-then-Metal pair in the existing
+single-shot harness. This is a diagnostic of the retained revision, not a
+candidate treatment, and it reuses one fixture and commitment preparation for
+both openings. Require proof-byte parity, matching claimed evaluation and
+transcript, verifier acceptance, exact schedule/fixture digests, commitment
+parity, and peak RSS below 90 GiB. Do not repeat the pair. If Metal already
+clears five times, move to cleanup and held-out validation. Otherwise use the
+measured disjoint phases and ratio to set the next T28 mechanism's minimum
+required gain; reject any mechanism whose analytical ceiling cannot close that
+measured gap.
+
 The next ranked mechanisms are deliberately bounded. A D512 challenge family
 with 15 coefficients in `+/-1` and two in `+/-2` has 128.36 bits of raw support,
 the same L1 mass 19, and weight 17; it can remove only 10.5% of root additions
