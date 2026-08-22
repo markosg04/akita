@@ -2866,6 +2866,22 @@ measured disjoint phases and ratio to set the next T28 mechanism's minimum
 required gain; reject any mechanism whose analytical ceiling cannot close that
 measured gap.
 
+The first attempt stopped before either opening because the eval-oriented T28
+root uses 262,144 positions per commitment block and therefore 512 blocks per
+column. The packed D512 commit route registered only 32, 64, 128, and 256 even
+though its kernel, command streaming, and output indexing are parameterized by
+the block count. This is an obsolete dispatch bound rather than a new commit
+algorithm. Relative to the previously measured T28 commit geometry, halving
+positions per block doubles block tasks: total lane probes and modeled matrix
+streaming remain constant. The 512-block shape needs a 128 MiB output and a
+2 GiB partial buffer, both checked against the Metal device buffer limit, and
+its largest output index is only 8,388,607.
+
+Register 512 at both validation layers and require exact CPU/Metal inner-row
+parity from a real 512-block panel dispatch before resuming the same control.
+That focused regression passed. The failed attempt produced no opening result,
+so the resumed pair remains the one max-scale measurement authorized above.
+
 The next ranked mechanisms are deliberately bounded. A D512 challenge family
 with 15 coefficients in `+/-1` and two in `+/-2` has 128.36 bits of raw support,
 the same L1 mass 19, and weight 17; it can remove only 10.5% of root additions

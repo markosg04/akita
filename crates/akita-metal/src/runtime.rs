@@ -4151,7 +4151,7 @@ impl MetalRuntime {
                 || params.num_digits_inner != 1
                 || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
                 || !params.positions_per_partial.is_multiple_of(4)
-                || !matches!(params.blocks_per_column, 32 | 64 | 128 | 256)
+                || !matches!(params.blocks_per_column, 32 | 64 | 128 | 256 | 512)
                 || params.full_blocks_per_column > params.blocks_per_column
                 || params.boundary_columns != 0
                 || params.num_blocks != expected_tasks

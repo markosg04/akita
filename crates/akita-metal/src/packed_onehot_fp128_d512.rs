@@ -269,9 +269,9 @@ pub(crate) fn validate_shape<const D: usize>(
         .into_akita());
     }
     let blocks_per_column = source.num_rows() / rows_per_block;
-    if !matches!(blocks_per_column, 32 | 64 | 128 | 256) {
+    if !matches!(blocks_per_column, 32 | 64 | 128 | 256 | 512) {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 D512 panels require 32, 64, 128, or 256 blocks per column".into(),
+            "fp128 D512 panels require 32, 64, 128, 256, or 512 blocks per column".into(),
         )
         .into_akita());
     }
@@ -547,7 +547,13 @@ mod tests {
 
     #[test]
     fn task_and_partial_grids_are_bijective() {
-        for (columns, blocks) in [(25usize, 32usize), (28, 64), (32, 128), (32, 256)] {
+        for (columns, blocks) in [
+            (25usize, 32usize),
+            (28, 64),
+            (32, 128),
+            (32, 256),
+            (30, 512),
+        ] {
             let tasks = columns * blocks;
             let streams = tasks.div_ceil(super::TASKS_PER_STREAM);
             let mut task_map = BTreeSet::new();
@@ -653,6 +659,62 @@ mod tests {
             assert_eq!(metrics.cpu_work_units, columns);
             assert_eq!(metrics.metal_work_units, columns * 31);
         }
+    }
+
+    #[test]
+    fn exact_fp128_d512_panels_match_cpu_at_512_blocks() {
+        const ROWS: usize = 65_536;
+        const COLUMNS: usize = 1;
+        const CAPACITY: usize = 32;
+        const POSITIONS_PER_BLOCK: usize = 64;
+        let plan = CommitInnerPlan {
+            n_a: 1,
+            num_positions_per_block: POSITIONS_PER_BLOCK,
+            num_digits_inner: 1,
+            log_basis_inner: 3,
+        };
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            29,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: POSITIONS_PER_BLOCK * super::RING_D,
+            },
+        )
+        .unwrap();
+        let lanes = (0..ROWS)
+            .map(|row| match row {
+                0 | 31 | 32 | 65_535 => 255,
+                row if row.is_multiple_of(4) => 0,
+                row => ((row * 73) % 255 + 1) as u8,
+            })
+            .collect();
+        let poly = PackedOneHotPoly::<F>::new(super::ONEHOT_K, CAPACITY, COLUMNS, lanes).unwrap();
+        assert_eq!(RootPolyMeta::<F>::num_vars(&poly), 29);
+
+        let cpu = CpuBackend::DEFAULT;
+        let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
+        let cpu_output = cpu
+            .commit_inner_group(
+                &cpu_prepared,
+                vec![RootCommitSource::<F, 512>::commit_view(&poly).unwrap()],
+                plan,
+            )
+            .unwrap();
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let metal_prepared = metal.prepare_setup(&setup).unwrap();
+        let metal_output = metal
+            .commit_inner_group(
+                &metal_prepared,
+                vec![RootCommitSource::<F, 512>::commit_view(&poly).unwrap()],
+                plan,
+            )
+            .unwrap();
+
+        assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
+        let metrics = metal.last_commit_metrics().unwrap().unwrap();
+        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+        assert_eq!(metrics.cpu_work_units, 8);
+        assert_eq!(metrics.metal_work_units, 504);
     }
 
     #[test]
