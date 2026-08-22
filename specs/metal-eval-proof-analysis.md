@@ -2754,6 +2754,72 @@ and barriers are not a large enough share of the fp128 round. No kernel or
 dispatch code from this candidate is retained, and its Stage-2 analogue is not
 worth pursuing independently.
 
+### Position-partitioned CPU/Metal root fold
+
+The max-scale root is not occupancy-limited. T25 already launches 65,536
+256-thread groups. The T28 evaluator launches 262,144 groups, doubles the work
+inside each group, and has 253,779,321 populated rows. Its exact nonzero update
+count is therefore
+
+```text
+253,779,321 rows * 30 columns * 19 terms = 144,654,212,970 additions,
+```
+
+or 7.563 times T25. Scaling the best visible 476.4 ms packed fold at its current
+update rate gives a favorable 3.60-second T28 Metal projection. More groups do
+not improve resident occupancy; they add scheduling waves.
+
+Output positions are independent, however. Partition the canonical position
+axis once: Metal writes the prefix while the existing Rayon implementation
+writes the suffix. The ranges read disjoint rows inside every trace block, write
+disjoint D512 outputs, and concatenate without a reduction. Total selector and
+output traffic is unchanged. Sparse-challenge preparation is shared; proof
+bytes, transcript order, schedule, commitment, and verifier equations do not
+change. The streamed commitment sink consumes the Metal prefix first and the
+completed CPU suffix second, preserving canonical order.
+
+For full-route times `G` and `C`, an ideal linear split assigns `C/(C+G)` of the
+positions to Metal and `G/(C+G)` to CPU, with latency
+
+```text
+H = C*G/(C+G).
+```
+
+Using the provisional T28 CPU root time of 5.15 seconds and the favorable
+3.60-second Metal projection gives `H = 2.12` seconds, a 1.48-second root
+reduction. This does not establish five times by itself: the favorable complete
+T28 projection moves from roughly 6.2--6.7 seconds to 4.7--5.2 seconds before
+any contention. It does restore a credible path when combined with a genuine
+large-round pass reduction.
+
+The adverse term is CPU contention. The streamed root already uses host workers
+to emit the successor commitment prefix, so CPU suffix work can delay that
+consumer even when the root arithmetic overlaps perfectly. Unified-memory
+traffic should not be the first limit (the partition preserves one aggregate
+source pass), but the complete-call gate prices both CPU scheduling and memory
+controller contention rather than assuming ideal overlap.
+
+Before implementation, one current T25 CPU-only evaluator record must recover
+the isolated packed-root span. With `G = 0.476` seconds, reject without code if
+`C > 2.35` seconds: even ideal partitioning would then save less than 80 ms.
+Otherwise add a range form of the existing CPU and Metal operations and use the
+model-derived split. Focused parity must compare the concatenated result with
+the ordinary one-shot fold, including an uneven boundary. One T25 Metal
+treatment follows. Retain only if root command wall falls by at least 70 ms,
+the complete opening improves by at least 50 ms from 2.420 seconds, proof and
+transcript artifacts remain exact, and no qualified route is reported as a
+fallback. Do not run T28 until the measured split and the remaining phase model
+project at most 4.5 seconds.
+
+The next ranked mechanisms are deliberately bounded. A D512 challenge family
+with 15 coefficients in `+/-1` and two in `+/-2` has 128.36 bits of raw support,
+the same L1 mass 19, and weight 17; it can remove only 10.5% of root additions
+and still needs a complete schedule-security audit. Larger root rings reduce
+the production challenge weight to 16 at D1024 and 14 at D2048, but require new
+commitment schedules and kernels. Repeated bivariate sumcheck rounds can reduce
+table traffic, but their 25-point Stage-1 grid raises arithmetic and register
+pressure. None is promoted ahead of the unchanged-protocol position split.
+
 ## Claim-to-code map
 
 | Claim | Current code seam | Intended change |
