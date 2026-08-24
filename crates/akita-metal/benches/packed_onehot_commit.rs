@@ -154,7 +154,7 @@ mod implementation {
         let output_bytes = output_coefficients * size_of::<F>();
         let scratch_bytes = output_bytes * POSITION_PARTIALS;
         let matrix_bytes = INNER_RANK * POSITIONS_PER_BLOCK * RING_D * size_of::<F>();
-        let matrix_streams = metal_work_units.div_ceil(32) * 2;
+        let matrix_streams = metal_work_units.div_ceil(64) * 2;
         let hot_entries = poly.lanes().iter().filter(|&&lane| lane != 0).count();
 
         assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
@@ -166,7 +166,7 @@ mod implementation {
         assert_eq!(metrics.cpu_work_units, cpu_work_units);
         assert_eq!(metrics.cpu_rank_rows, INNER_RANK);
         assert_ne!(metrics.cpu_time, Duration::ZERO);
-        assert_eq!(metrics.blocks_per_threadgroup, 32);
+        assert_eq!(metrics.blocks_per_threadgroup, 64);
         assert_eq!(metrics.columns_per_threadgroup, 1);
         assert_eq!(metrics.metal_blocks, metal_blocks);
         assert_eq!(metrics.metal_full_blocks, metal_blocks);
