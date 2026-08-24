@@ -478,6 +478,24 @@ impl<Field> MetalCommitBackend<Field> {
         }
         Ok(())
     }
+
+    pub(crate) fn record_opening_index_preparation(
+        &self,
+        elapsed: Duration,
+        timings: crate::runtime::DispatchTimings,
+        allocation_bytes: usize,
+    ) -> Result<(), MetalCommitError> {
+        self.update_opening_metrics(|metrics| {
+            metrics.command_wall_time += timings.command_wall;
+            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
+            metrics.opening_index_time += elapsed;
+            metrics.opening_index_gpu_time += timings.gpu.unwrap_or_default();
+            metrics.opening_index_bytes =
+                metrics.opening_index_bytes.saturating_add(allocation_bytes);
+            metrics.upload_time += timings.buffer_setup;
+            metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
+        })
+    }
 }
 
 impl MetalCommitBackend<F> {
