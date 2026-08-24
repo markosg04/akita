@@ -7,13 +7,14 @@ use akita_serialization::AkitaSerialize;
 use spongefish::{
     DomainSeparator, DuplexSpongeInterface, Encoding, ProverState, VerifierState, WithoutInstance,
 };
+use std::any::Any;
 use std::marker::PhantomData;
 
 /// Sponge backend selected by the active transcript feature.
 ///
 /// Exactly one transcript backend feature must be active in the complete PCS graph.
 #[cfg(feature = "transcript-blake2b")]
-pub type TranscriptSponge = spongefish::instantiations::Blake2b512;
+pub type TranscriptSponge = crate::CheckpointBlake2b512;
 
 /// Sponge backend selected by the active transcript feature.
 #[cfg(feature = "transcript-keccak")]
@@ -255,6 +256,22 @@ where
 
     fn bind_instance_bytes(&mut self, instance_bytes: &[u8]) {
         AkitaTranscript::bind_instance_bytes(self, instance_bytes);
+    }
+
+    fn execution_checkpoint(&self) -> Option<crate::TranscriptExecutionCheckpoint> {
+        #[cfg(feature = "transcript-blake2b")]
+        {
+            let sponge = match self.state.as_ref()? {
+                TranscriptState::Prover(state) => &state.duplex_sponge_state,
+                TranscriptState::Verifier(state) => &state.duplex_sponge_state,
+            };
+            let sponge = (sponge as &dyn Any).downcast_ref::<crate::CheckpointBlake2b512>()?;
+            return Some(crate::TranscriptExecutionCheckpoint::Blake2b512(
+                sponge.checkpoint(),
+            ));
+        }
+        #[cfg(not(feature = "transcript-blake2b"))]
+        None
     }
 
     // The `Transcript` trait keeps semantic labels for logging wrappers and

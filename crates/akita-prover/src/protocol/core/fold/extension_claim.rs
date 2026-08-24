@@ -105,6 +105,8 @@ where
         basis,
         pad_base_evals,
         fold_sink: None,
+        pre_fold_task: None,
+        pre_fold_sink: None,
         transcript,
     })
     .map_err(|err| AkitaError::InvalidInput(format!("finish prepared fold failed: {err:?}")))

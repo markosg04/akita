@@ -53,6 +53,7 @@ pub(super) fn fold_coefficient_packing_group<F: FieldCore + akita_field::FromPri
 }
 
 /// Concatenate group-local D inputs in canonical relation order.
+#[tracing::instrument(skip_all, name = "coefficient_packing_d_concat")]
 pub(super) fn concatenate_group_d_inputs(
     opening_batch: &OpeningClaimsLayout,
     group_inputs: &[&DigitBlocks],
@@ -91,6 +92,7 @@ pub(super) fn concatenate_group_d_inputs(
 /// Logical blocks are ordered `[claim][partial block]`. Within each block,
 /// coordinate planes are split into consecutive D-ring subcolumns and then
 /// gadget digit planes.
+#[tracing::instrument(skip_all, name = "coefficient_packing_d_input")]
 pub(super) fn materialize_coefficient_packing_d_input<
     F: FieldCore + CanonicalField,
     const D_D: usize,

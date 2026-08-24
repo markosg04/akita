@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use akita_field::AkitaError;
 use akita_prover::compute::{
     RootOpeningSource, RootPolyMeta, SubringCoefficientPackingBatchKernel,
@@ -11,9 +13,11 @@ use akita_types::PreparedSubringCoefficientPackingPoint;
 
 use crate::backend::MetalCommitBackend;
 use crate::field::{Fp128Limbs, MetalField, F};
+use crate::packed_onehot_fp128_d512::{opening_index_plan, DeferredCoefficientPackingIndex};
 use crate::runtime::{
     CoefficientPackingDispatchOutcome, I8CoefficientPackingParams,
-    PackedOneHotCoefficientPackingParams, FP128_PACKED_COEFFICIENT_PACKING_ROWS_PER_PARTIAL,
+    PackedFp128D512CoefficientPackingIndex, PackedOneHotCoefficientPackingParams,
+    FP128_PACKED_COEFFICIENT_PACKING_ROWS_PER_PARTIAL,
 };
 use crate::{MetalCommitError, MetalExecutionPolicy};
 
@@ -226,6 +230,25 @@ impl<const D: usize> SubringCoefficientPackingBatchKernel<RecursiveFoldBatchView
 }
 
 impl MetalCommitBackend<F> {
+    /// Use the packed-source Metal route when the source owns opening state.
+    pub fn retained_packed_onehot_coefficient_packing<const D: usize>(
+        &self,
+        source: PackedOneHotView<'_, F, D>,
+        point: &PreparedSubringCoefficientPackingPoint<F>,
+    ) -> Result<Option<SubringCoefficientPackingPartials<F>>, AkitaError> {
+        if source
+            .opening_acceleration::<PackedFp128D512CoefficientPackingIndex>()
+            .is_none()
+            && source
+                .opening_acceleration::<DeferredCoefficientPackingIndex>()
+                .is_none()
+        {
+            return Ok(None);
+        }
+        self.packed_onehot_coefficient_packing(source, point)
+            .map(Some)
+    }
+
     /// Project a row-major packed one-hot source into coefficient-packing partials.
     pub fn packed_onehot_coefficient_packing<const D: usize>(
         &self,
@@ -279,6 +302,36 @@ impl MetalCommitBackend<F> {
         };
         let geometry = point.geometry();
         let weights = combined_weights(point)?;
+        let retained_index =
+            source.take_opening_acceleration::<PackedFp128D512CoefficientPackingIndex>();
+        let deferred_requested = source
+            .take_opening_acceleration::<DeferredCoefficientPackingIndex>()
+            .is_some();
+        let deferred_index = if retained_index.is_none() && deferred_requested {
+            let opening_plan = opening_index_plan(
+                source.num_rows(),
+                source.num_columns(),
+                point.num_positions_per_block(),
+                blocks_per_column,
+            )?;
+            let start = Instant::now();
+            let index = runtime
+                .prepare_packed_fp128_d512_coefficient_packing_index(
+                    source.lanes(),
+                    opening_plan.packing,
+                )
+                .map_err(MetalCommitError::into_akita)?;
+            self.record_opening_index_preparation(
+                start.elapsed(),
+                index.timings,
+                index.allocation_bytes,
+            )
+            .map_err(MetalCommitError::into_akita)?;
+            Some(index)
+        } else {
+            None
+        };
+        let opening_index = retained_index.as_deref().or(deferred_index.as_ref());
         let rows_per_partial = FP128_PACKED_COEFFICIENT_PACKING_ROWS_PER_PARTIAL;
         let row_partials_per_block = rows_per_block.div_ceil(rows_per_partial);
         let output_coefficients = num_blocks
@@ -288,60 +341,61 @@ impl MetalCommitBackend<F> {
             .checked_mul(row_partials_per_block)
             .and_then(|count| count.checked_mul(geometry.challenge_subring_dimension()))
             .ok_or_else(|| AkitaError::InvalidInput("packing partial overflow".into()))?;
-        let outcome = runtime
-            .dispatch_fp128_packed_onehot_coefficient_packing(
+        let params = PackedOneHotCoefficientPackingParams {
+            num_rows: checked_u64(source.num_rows(), "packing rows")?,
+            num_columns: checked_u64(source.num_columns(), "packing columns")?,
+            column_capacity: checked_u64(source.column_capacity(), "packing column capacity")?,
+            onehot_k: checked_u64(source.onehot_k(), "packing one-hot K")?,
+            ring_d: checked_u64(D, "packing ring dimension")?,
+            positions_per_block: checked_u64(
+                point.num_positions_per_block(),
+                "packing block positions",
+            )?,
+            blocks_per_column: checked_u64(blocks_per_column, "packing blocks per column")?,
+            rows_per_block: checked_u64(rows_per_block, "packing rows per block")?,
+            rows_per_partial: checked_u64(rows_per_partial, "packing rows per partial")?,
+            row_partials_per_block: checked_u64(row_partials_per_block, "packing row partials")?,
+            num_blocks: checked_u64(num_blocks, "packing blocks")?,
+            stride: checked_u64(geometry.subring_embedding_stride(), "packing stride")?,
+            subring_dimension: checked_u64(
+                geometry.challenge_subring_dimension(),
+                "packing subring dimension",
+            )?,
+            output_coefficients: checked_u64(output_coefficients, "packing output")?,
+            partial_coefficients: checked_u64(partial_coefficients, "packing partial output")?,
+        };
+        let outcome = if let Some(index) = opening_index {
+            runtime
+                .dispatch_fp128_indexed_packed_onehot_coefficient_packing(index, &weights, params)
+        } else {
+            runtime.dispatch_fp128_packed_onehot_coefficient_packing(
                 source.lanes(),
                 &weights,
-                PackedOneHotCoefficientPackingParams {
-                    num_rows: checked_u64(source.num_rows(), "packing rows")?,
-                    num_columns: checked_u64(source.num_columns(), "packing columns")?,
-                    column_capacity: checked_u64(
-                        source.column_capacity(),
-                        "packing column capacity",
-                    )?,
-                    onehot_k: checked_u64(source.onehot_k(), "packing one-hot K")?,
-                    ring_d: checked_u64(D, "packing ring dimension")?,
-                    positions_per_block: checked_u64(
-                        point.num_positions_per_block(),
-                        "packing block positions",
-                    )?,
-                    blocks_per_column: checked_u64(blocks_per_column, "packing blocks per column")?,
-                    rows_per_block: checked_u64(rows_per_block, "packing rows per block")?,
-                    rows_per_partial: checked_u64(rows_per_partial, "packing rows per partial")?,
-                    row_partials_per_block: checked_u64(
-                        row_partials_per_block,
-                        "packing row partials",
-                    )?,
-                    num_blocks: checked_u64(num_blocks, "packing blocks")?,
-                    stride: checked_u64(geometry.subring_embedding_stride(), "packing stride")?,
-                    subring_dimension: checked_u64(
-                        geometry.challenge_subring_dimension(),
-                        "packing subring dimension",
-                    )?,
-                    output_coefficients: checked_u64(output_coefficients, "packing output")?,
-                    partial_coefficients: checked_u64(
-                        partial_coefficients,
-                        "packing partial output",
-                    )?,
-                },
+                params,
             )
-            .map_err(MetalCommitError::into_akita)?;
+        }
+        .map_err(MetalCommitError::into_akita)?;
+        drop(retained_index);
+        drop(deferred_index);
         SubringCoefficientPackingPartials::new(geometry, num_blocks, decode_outcome(self, outcome)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use akita_prover::compute::{
         CpuBackend, RootOpeningSource, SubringCoefficientPackingBatchKernel,
         SubringCoefficientPackingPlan,
     };
-    use akita_prover::{PackedOneHotView, RecursiveWitnessFlat};
+    use akita_prover::{PackedOneHotPoly, PackedOneHotView, RecursiveWitnessFlat};
     use akita_types::{
         BasisMode, PreparedSubringCoefficientPackingPoint, SubringCoefficientPackingGeometry,
     };
 
     use super::*;
+    use crate::OpeningAccelerationPolicy;
 
     fn point_with_subring<const D: usize>(
         live_positions: usize,
@@ -488,5 +542,126 @@ mod tests {
             .packed_onehot_coefficient_packing(source, &point)
             .unwrap();
         assert_eq!(actual.coordinates(), expected);
+    }
+
+    fn indexed_packing_case(
+        lanes: Vec<u8>,
+        num_rows: usize,
+        num_columns: usize,
+        column_capacity: usize,
+        positions_per_block: usize,
+        deferred: bool,
+    ) {
+        const D: usize = 512;
+        const K: usize = 256;
+        let source = PackedOneHotPoly::<F>::new(K, column_capacity, num_columns, lanes).unwrap();
+        let view = source.view::<D>().unwrap();
+        let blocks_per_column = num_rows / (positions_per_block * 2);
+        let num_blocks = blocks_per_column * column_capacity;
+        let source_num_vars = (num_rows * column_capacity * K).ilog2() as usize;
+        let point = point::<D>(
+            num_blocks * positions_per_block,
+            positions_per_block,
+            source_num_vars,
+        );
+        let geometry = point.geometry();
+        let mut expected = vec![F::zero(); num_blocks * geometry.partial_base_field_width()];
+        for column in 0..num_columns {
+            for row in 0..num_rows {
+                let hot = usize::from(view.lanes()[row * num_columns + column]);
+                if hot == 0 {
+                    continue;
+                }
+                let field_index = row * K + hot;
+                let block = field_index / (positions_per_block * D);
+                let within_block = field_index % (positions_per_block * D);
+                let position = within_block / D;
+                let coefficient = within_block % D;
+                let subring = coefficient / geometry.subring_embedding_stride();
+                let low = coefficient % geometry.subring_embedding_stride();
+                let output_block = column * blocks_per_column + block;
+                expected[output_block * geometry.partial_base_field_width() + subring] +=
+                    point.position_weights()[position] * point.packing_weights()[low];
+            }
+        }
+
+        let metal = if deferred {
+            MetalCommitBackend::new_with_opening_acceleration_policy(
+                MetalExecutionPolicy::RequireMetal,
+                OpeningAccelerationPolicy::RetainUpToBytes(0),
+            )
+            .unwrap()
+        } else {
+            MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap()
+        };
+        if deferred {
+            assert!(view.retain_opening_acceleration(Arc::new(DeferredCoefficientPackingIndex,)));
+        } else {
+            let position_tiles = positions_per_block.div_ceil(256);
+            let layouts = blocks_per_column * num_columns * 2 * position_tiles;
+            let index = metal
+                .runtime()
+                .unwrap()
+                .prepare_packed_fp128_d512_coefficient_packing_index(
+                    view.lanes(),
+                    crate::runtime::PackedCoefficientPackingIndexParams {
+                        num_rows: num_rows as u64,
+                        num_columns: num_columns as u64,
+                        lane_stride: num_columns as u64,
+                        num_positions: positions_per_block as u64,
+                        blocks_per_column: blocks_per_column as u64,
+                        position_tiles: position_tiles as u64,
+                        record_slots: (layouts * 256) as u64,
+                        offset_entries: (layouts * 33) as u64,
+                    },
+                )
+                .unwrap();
+            assert!(view.retain_opening_acceleration(Arc::new(index)));
+        }
+        metal.begin_opening_metrics().unwrap();
+        let actual = metal
+            .retained_packed_onehot_coefficient_packing(view, &point)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.coordinates(), expected);
+        let metrics = metal.last_opening_metrics().unwrap().unwrap();
+        assert_eq!(metrics.opening_index_bytes != 0, deferred);
+        assert!(metal
+            .retained_packed_onehot_coefficient_packing(view, &point)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn indexed_packed_onehot_coefficient_packing_matches_definition() {
+        const ROWS: usize = 2048;
+        const COLUMNS: usize = 3;
+        const CAPACITY: usize = 4;
+        let lanes = (0..ROWS * COLUMNS)
+            .map(|index| {
+                if index % 17 == 0 {
+                    0
+                } else {
+                    ((index * 19 + 7) % 255 + 1) as u8
+                }
+            })
+            .collect();
+        indexed_packing_case(lanes, ROWS, COLUMNS, CAPACITY, 512, false);
+    }
+
+    #[test]
+    fn indexed_packed_onehot_coefficient_packing_handles_maximal_skew() {
+        const ROWS: usize = 256;
+        indexed_packing_case(vec![7; ROWS], ROWS, 1, 1, 128, false);
+    }
+
+    #[test]
+    fn deferred_packed_onehot_coefficient_packing_builds_index_at_opening() {
+        const ROWS: usize = 2_048;
+        const COLUMNS: usize = 3;
+        let lanes = (0..ROWS * COLUMNS)
+            .map(|index| ((index * 19 + 7) % 255 + 1) as u8)
+            .collect();
+        indexed_packing_case(lanes, ROWS, COLUMNS, 4, 512, true);
     }
 }

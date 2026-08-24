@@ -42,10 +42,10 @@ pub use backend::{
 pub use cpu::{CpuBackend, CpuPreparedSetup, PreparedCrtNttProfile, PreparedNttCacheMetric};
 pub use delegating_cpu::{CommitCluster, OpeningCluster, RingSwitchCluster, TensorCluster};
 pub use kernels::{
-    BatchDecomposeFoldOutcome, DecomposeFoldChunk, DecomposeFoldChunkSink, OpeningBatchKernel,
-    OpeningFoldKernel, RingSwitchRelationKernel, RootCommitKernel,
-    SubringCoefficientPackingBatchKernel, TensorPackedWitness, TensorProjectionBatchKernel,
-    TensorProjectionKernel,
+    BalancedDigitChunk, BalancedDigitRequest, BatchDecomposeFoldOutcome, DecomposeFoldChunk,
+    DecomposeFoldChunkSink, OpeningBatchKernel, OpeningFoldKernel, RingSwitchRelationKernel,
+    RootCommitKernel, SubringCoefficientPackingBatchKernel, TensorPackedWitness,
+    TensorProjectionBatchKernel, TensorProjectionKernel,
 };
 pub use operation_plans::{
     CommitInnerPlan, DecomposeFoldBatchPlan, DecomposeFoldPlan, OpeningFoldOutput, OpeningFoldPlan,
@@ -69,7 +69,7 @@ pub use runtime_capabilities::{
     SuffixTensorProveBackend,
 };
 pub use stack::{
-    planned_ntt_cache_metrics, prewarm_ntt_requirements, LevelProveStacks, OperationCtx,
-    PlannedNttCacheOwnerMetric, ProverComputeStack, ReleaseRootNttAfterFold, TieredProveStacks,
-    UniformProverStack,
+    planned_ntt_cache_metrics, prewarm_ntt_requirements, LevelProveStacks, NttPrewarmPhase,
+    OperationCtx, PlannedNttCacheOwnerMetric, ProverComputeStack, ReleaseRootNttAfterFold,
+    RootFoldNttPrewarm, TieredProveStacks, UniformProverStack,
 };

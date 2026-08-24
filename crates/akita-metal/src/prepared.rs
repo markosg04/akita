@@ -8,7 +8,7 @@ use akita_types::AkitaExpandedSetup;
 use metal::Buffer;
 
 use crate::field::{MetalField, F};
-use crate::runtime::{MetalRuntime, SharedSliceBuffer};
+use crate::runtime::{DispatchTimings, MetalRuntime, RecursiveCommitParams, SharedSliceBuffer};
 use crate::MetalCommitError;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -19,6 +19,11 @@ struct MatrixCacheKey {
 }
 
 struct PreparedMatrix {
+    buffer: Arc<Buffer>,
+    bytes: usize,
+}
+
+struct PreparedRecursiveMatrix {
     buffer: Arc<Buffer>,
     bytes: usize,
 }
@@ -38,11 +43,20 @@ pub(crate) struct SharedMatrixPreparation<'a> {
     marker: std::marker::PhantomData<&'a [F]>,
 }
 
+pub(crate) struct RecursiveMatrixPreparation {
+    pub(crate) buffer: Arc<Buffer>,
+    pub(crate) bytes: usize,
+    pub(crate) cache_hit: bool,
+    pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
+}
+
 /// Setup-bound CPU fallback state and lazily packed Metal matrix prefixes.
 pub struct MetalPreparedSetup<Field: FieldCore = F> {
     pub(crate) cpu: CpuPreparedSetup<Field>,
     pub(crate) expanded: Arc<AkitaExpandedSetup<Field>>,
     matrices: Mutex<HashMap<MatrixCacheKey, PreparedMatrix>>,
+    recursive_matrices: Mutex<HashMap<MatrixCacheKey, PreparedRecursiveMatrix>>,
 }
 
 #[expect(
@@ -58,6 +72,7 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
             cpu,
             expanded,
             matrices: Mutex::new(HashMap::new()),
+            recursive_matrices: Mutex::new(HashMap::new()),
         }
     }
 
@@ -169,6 +184,61 @@ impl<Field: MetalField> MetalPreparedSetup<Field> {
 }
 
 impl MetalPreparedSetup<F> {
+    pub(crate) fn recursive_commit_matrix<const D: usize>(
+        &self,
+        runtime: &MetalRuntime,
+        params: RecursiveCommitParams,
+    ) -> Result<RecursiveMatrixPreparation, AkitaError> {
+        let n_a = usize::try_from(params.num_rows)
+            .map_err(|_| MetalCommitError::ShapeOverflow("recursive matrix rows").into_akita())?;
+        let active_a_cols = usize::try_from(params.num_cols).map_err(|_| {
+            MetalCommitError::ShapeOverflow("recursive matrix columns").into_akita()
+        })?;
+        let key = MatrixCacheKey {
+            ring_d: D,
+            n_a,
+            active_a_cols,
+        };
+        let mut matrices = self
+            .recursive_matrices
+            .lock()
+            .map_err(|_| MetalCommitError::PoisonedLock.into_akita())?;
+        if let Some(prepared) = matrices.get(&key) {
+            return Ok(RecursiveMatrixPreparation {
+                buffer: prepared.buffer.clone(),
+                bytes: prepared.bytes,
+                cache_hit: true,
+                timings: DispatchTimings::default(),
+                allocation_bytes: 0,
+            });
+        }
+
+        let source = self.shared_matrix(runtime, D, n_a, active_a_cols)?;
+        let mut outcome = runtime
+            .prepare_fp128_recursive_commit_matrix::<D>(&source.buffer, params)
+            .map_err(MetalCommitError::into_akita)?;
+        outcome.timings.buffer_setup += source.prepare_time;
+        let allocation_bytes = outcome
+            .allocation_bytes
+            .saturating_add(source.bytes.saturating_mul(usize::from(!source.zero_copy)));
+        let buffer = Arc::new(outcome.buffer);
+        let bytes = outcome.allocation_bytes;
+        matrices.insert(
+            key,
+            PreparedRecursiveMatrix {
+                buffer: buffer.clone(),
+                bytes,
+            },
+        );
+        Ok(RecursiveMatrixPreparation {
+            buffer,
+            bytes,
+            cache_hit: false,
+            timings: outcome.timings,
+            allocation_bytes,
+        })
+    }
+
     pub(crate) fn shared_matrix(
         &self,
         runtime: &MetalRuntime,

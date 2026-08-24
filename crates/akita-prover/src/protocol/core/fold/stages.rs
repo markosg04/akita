@@ -3,7 +3,7 @@ use super::*;
 pub(in crate::protocol::core) fn prove_stage1<F, E, T, O>(
     transcript: &mut T,
     opening: &crate::compute::OperationCtx<'_, F, O>,
-    rs: &mut RingSwitchOutput<E>,
+    rs: &RingSwitchOutput<E>,
     lp: &CommittedGroupParams,
     plan: &RelationRangeImagePlan,
 ) -> Result<Stage1ProveOutput<E>, AkitaError>
@@ -102,6 +102,7 @@ pub(super) fn prove_stage2<F, E, T, O>(
     linear_terms: PreparedProverLinearTerms<E>,
     trace_opening_claim: E,
     plan: RelationRangeImagePlan,
+    preparation: O::Preparation,
 ) -> Result<RelationRangeImageProveResult<E>, AkitaError>
 where
     F: FieldCore + CanonicalField,
@@ -159,18 +160,21 @@ where
         );
         linear_weights.sort_unstable_by_key(|(index, _)| *index);
     }
-    let additional_relation_terms = (!linear_weights.is_empty() || !binary_intervals.is_empty())
-        .then(|| {
-            AdditionalRelationTerms::new(
-                rs.w_evals_compact.as_ref(),
-                domain_len,
-                linear_weights,
-                &binary_intervals,
-                stage1_point,
-                binary_batching.unwrap_or_else(E::zero),
-            )
-        })
-        .transpose()?;
+    let additional_relation_terms = {
+        let _span = tracing::info_span!("stage2_additional_terms_prepare").entered();
+        (!linear_weights.is_empty() || !binary_intervals.is_empty())
+            .then(|| {
+                AdditionalRelationTerms::new(
+                    rs.w_evals_compact.as_ref(),
+                    domain_len,
+                    linear_weights,
+                    &binary_intervals,
+                    stage1_point,
+                    binary_batching.unwrap_or_else(E::zero),
+                )
+            })
+            .transpose()?
+    };
     let ordinary_relation_claim = relation_claim + physical_l2_claim
         - additional_relation_terms
             .as_ref()
@@ -196,7 +200,7 @@ where
             "stage-2 prover initialization failed at fold level {level}: {err}"
         ))
     })?;
-    stage2_prover.prove_with_backend::<F, T, O>(opening, transcript)
+    stage2_prover.prove_with_backend::<F, T, O>(opening, preparation, transcript)
 }
 
 #[allow(clippy::too_many_arguments)]

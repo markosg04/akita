@@ -16,6 +16,26 @@ pub enum MetalExecutionPolicy {
     PreferMetal,
 }
 
+/// Maximum packed-opening preprocessing retained after commitment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OpeningAccelerationPolicy {
+    /// Retain every supported opening accelerator.
+    #[default]
+    Eager,
+    /// Retain accelerators only when their combined allocation fits this limit.
+    RetainUpToBytes(usize),
+}
+
+impl OpeningAccelerationPolicy {
+    #[must_use]
+    pub const fn allows_retention(self, bytes: usize) -> bool {
+        match self {
+            Self::Eager => true,
+            Self::RetainUpToBytes(limit) => bytes <= limit,
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
@@ -39,7 +59,8 @@ mod runtime;
 
 #[cfg(target_os = "macos")]
 pub use backend::{
-    MetalCommitBackend, MetalCommitMetrics, MetalMatrixPrewarmMetrics, MetalOpeningMetrics,
+    MetalCommitBackend, MetalCommitMetrics, MetalDirectRelationPreparation,
+    MetalMatrixPrewarmMetrics, MetalOpeningMetrics,
 };
 #[cfg(target_os = "macos")]
 pub use prepared::MetalPreparedSetup;
@@ -53,7 +74,7 @@ mod unsupported {
     use akita_field::Prime128OffsetA7F7;
     use akita_prover::CpuBackend;
 
-    use super::{MetalCommitError, MetalExecutionPolicy};
+    use super::{MetalCommitError, MetalExecutionPolicy, OpeningAccelerationPolicy};
 
     /// Unavailable Metal backend placeholder on non-macOS targets.
     #[derive(Clone, Copy, Debug)]
@@ -69,6 +90,14 @@ mod unsupported {
 
         /// Constructing the backend on a non-macOS target always fails.
         pub fn new(_policy: MetalExecutionPolicy) -> Result<Self, MetalCommitError> {
+            Err(MetalCommitError::UnsupportedPlatform)
+        }
+
+        /// Constructing the backend on a non-macOS target always fails.
+        pub fn new_with_opening_acceleration_policy(
+            _policy: MetalExecutionPolicy,
+            _opening_acceleration: OpeningAccelerationPolicy,
+        ) -> Result<Self, MetalCommitError> {
             Err(MetalCommitError::UnsupportedPlatform)
         }
 

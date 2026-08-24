@@ -72,6 +72,7 @@ fn into_source<F: FieldCore>(
 }
 
 /// Execute every B/D chain using plans owned by the canonical relation layout.
+#[tracing::instrument(skip_all, name = "relation_compression_witness")]
 pub(crate) fn materialize_compression_witness<F, B>(
     ctx: &OperationCtx<'_, F, B>,
     layout: &RelationRhsLayout,

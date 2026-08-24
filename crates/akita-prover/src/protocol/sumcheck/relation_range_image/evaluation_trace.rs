@@ -3,7 +3,7 @@
 use super::fold_two_round_quad;
 #[cfg(test)]
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use akita_algebra::ring::eval_flat_negacyclic_shift_sequence_into;
 use akita_field::parallel::*;
@@ -173,10 +173,16 @@ pub(crate) struct NegacyclicSetupLinearTerms<E: FieldCore> {
     pub(crate) coefficient_count: usize,
 }
 
-struct PreparedPackingLaneMap<E: FieldCore> {
-    segments: Vec<PreparedPackingSegment<E>>,
+struct PreparedPackingLaneIndex {
     lane_offsets: Vec<usize>,
     lane_segments: Vec<usize>,
+}
+
+struct PreparedPackingLaneMap<E: FieldCore> {
+    segments: Vec<PreparedPackingSegment<E>>,
+    live_lane_count: usize,
+    support_count: usize,
+    lane_index: OnceLock<PreparedPackingLaneIndex>,
 }
 
 impl<E: FieldCore> PreparedPackingLaneMap<E> {
@@ -184,63 +190,78 @@ impl<E: FieldCore> PreparedPackingLaneMap<E> {
         segments: Vec<PreparedPackingSegment<E>>,
         live_lane_count: usize,
     ) -> Result<Self, AkitaError> {
-        let mut lane_offsets = vec![0usize; live_lane_count + 1];
+        if live_lane_count == 0 {
+            return Err(AkitaError::InvalidSetup(
+                "linear lane domain must be nonempty".into(),
+            ));
+        }
+        let mut support_count = 0usize;
         for segment in &segments {
-            for lane_offset in 0..segment.lane_count {
-                let lane = segment
-                    .target_lane_start
-                    .checked_add(
-                        lane_offset
-                            .checked_mul(segment.target_lane_stride)
-                            .ok_or_else(|| {
-                                AkitaError::InvalidSetup("linear target lane overflow".into())
-                            })?,
-                    )
-                    .ok_or_else(|| {
-                        AkitaError::InvalidSetup("linear target lane overflow".into())
-                    })?;
-                let count = lane_offsets
-                    .get_mut(lane + 1)
-                    .ok_or(AkitaError::InvalidProof)?;
-                *count = count.checked_add(1).ok_or_else(|| {
-                    AkitaError::InvalidSetup("linear lane support overflow".into())
-                })?;
+            if segment.lane_count == 0 || segment.target_lane_stride == 0 {
+                return Err(AkitaError::InvalidSetup(
+                    "linear target lane geometry is malformed".into(),
+                ));
             }
-        }
-        for lane in 0..live_lane_count {
-            lane_offsets[lane + 1] = lane_offsets[lane + 1]
-                .checked_add(lane_offsets[lane])
-                .ok_or_else(|| AkitaError::InvalidSetup("linear support overflow".into()))?;
-        }
-        let mut lane_segments = vec![0usize; *lane_offsets.last().unwrap_or(&0)];
-        let mut cursors = lane_offsets[..live_lane_count].to_vec();
-        for (segment_index, segment) in segments.iter().enumerate() {
-            for lane_offset in 0..segment.lane_count {
-                let lane = segment.target_lane_start + lane_offset * segment.target_lane_stride;
-                let cursor = cursors.get_mut(lane).ok_or(AkitaError::InvalidProof)?;
-                let slot = lane_segments
-                    .get_mut(*cursor)
-                    .ok_or(AkitaError::InvalidProof)?;
-                *slot = segment_index;
-                *cursor += 1;
+            let last_lane = segment
+                .lane_count
+                .checked_sub(1)
+                .and_then(|offset| offset.checked_mul(segment.target_lane_stride))
+                .and_then(|offset| segment.target_lane_start.checked_add(offset))
+                .ok_or_else(|| AkitaError::InvalidSetup("linear target lane overflow".into()))?;
+            if last_lane >= live_lane_count {
+                return Err(AkitaError::InvalidProof);
             }
+            support_count = support_count
+                .checked_add(segment.lane_count)
+                .ok_or_else(|| AkitaError::InvalidSetup("linear lane support overflow".into()))?;
         }
         Ok(Self {
             segments,
-            lane_offsets,
-            lane_segments,
+            live_lane_count,
+            support_count,
+            lane_index: OnceLock::new(),
+        })
+    }
+
+    fn lane_index(&self) -> &PreparedPackingLaneIndex {
+        self.lane_index.get_or_init(|| {
+            let mut lane_offsets = vec![0usize; self.live_lane_count + 1];
+            for segment in &self.segments {
+                for lane_offset in 0..segment.lane_count {
+                    let lane = segment.target_lane_start + lane_offset * segment.target_lane_stride;
+                    lane_offsets[lane + 1] += 1;
+                }
+            }
+            for lane in 0..self.live_lane_count {
+                lane_offsets[lane + 1] += lane_offsets[lane];
+            }
+            let mut lane_segments = vec![0usize; self.support_count];
+            let mut cursors = lane_offsets[..self.live_lane_count].to_vec();
+            for (segment_index, segment) in self.segments.iter().enumerate() {
+                for lane_offset in 0..segment.lane_count {
+                    let lane = segment.target_lane_start + lane_offset * segment.target_lane_stride;
+                    let cursor = &mut cursors[lane];
+                    lane_segments[*cursor] = segment_index;
+                    *cursor += 1;
+                }
+            }
+            PreparedPackingLaneIndex {
+                lane_offsets,
+                lane_segments,
+            }
         })
     }
 
     fn for_each_segment(&self, lane: usize, mut visit: impl FnMut(usize)) {
-        let Some((&start, &end)) = self
+        let lane_index = self.lane_index();
+        let Some((&start, &end)) = lane_index
             .lane_offsets
             .get(lane)
-            .zip(self.lane_offsets.get(lane + 1))
+            .zip(lane_index.lane_offsets.get(lane + 1))
         else {
             return;
         };
-        if let Some(segments) = self.lane_segments.get(start..end) {
+        if let Some(segments) = lane_index.lane_segments.get(start..end) {
             for &segment in segments {
                 visit(segment);
             }
@@ -260,9 +281,7 @@ fn lane_weights_into_sparse<E: FieldCore>(
 ) -> Result<Vec<Vec<PreparedLaneTerm<E>>>, AkitaError> {
     match weights {
         PreparedLaneWeights::Sparse(lanes) if lanes.len() == live_lane_count => Ok(lanes),
-        PreparedLaneWeights::Packing(packing)
-            if packing.lane_offsets.len() == live_lane_count + 1 =>
-        {
+        PreparedLaneWeights::Packing(packing) if packing.live_lane_count == live_lane_count => {
             let mut lanes = vec![Vec::new(); live_lane_count];
             for (lane, terms) in lanes.iter_mut().enumerate() {
                 packing.for_each_segment(lane, |segment_index| {
@@ -487,6 +506,7 @@ impl<E: FieldCore> PreparedProverLinearTerms<E> {
 
     pub(super) fn direct_layout(&self) -> DirectLinearLayout<E> {
         if let PreparedLaneWeights::Packing(packing) = &self.lane_weights {
+            let lane_index = packing.lane_index();
             return DirectLinearLayout {
                 segments: packing
                     .segments
@@ -501,8 +521,8 @@ impl<E: FieldCore> PreparedProverLinearTerms<E> {
                         lane_count: segment.lane_count,
                     })
                     .collect(),
-                lane_offsets: packing.lane_offsets.clone(),
-                lane_segments: packing.lane_segments.clone(),
+                lane_offsets: lane_index.lane_offsets.clone(),
+                lane_segments: lane_index.lane_segments.clone(),
                 source_count: self.sources.len(),
             };
         }
@@ -1143,9 +1163,14 @@ impl<E: FieldCore> PreparedProverLinearTerms<E> {
                 for segment in &mut source.segments {
                     segment.source_index += source_offset;
                 }
-                let mut segments = std::mem::take(&mut target.segments);
-                segments.extend(source.segments);
-                *target = PreparedPackingLaneMap::new(segments, self.live_lane_count)?;
+                target.support_count = target
+                    .support_count
+                    .checked_add(source.support_count)
+                    .ok_or_else(|| {
+                        AkitaError::InvalidSetup("linear lane support overflow".into())
+                    })?;
+                target.segments.extend(source.segments);
+                target.lane_index.take();
             }
             (target, source) => {
                 let mut target_sparse = lane_weights_into_sparse(
@@ -1290,7 +1315,8 @@ impl<E: FieldCore> PreparedProverLinearTerms<E> {
         let lane_shape_is_valid = match &self.lane_weights {
             PreparedLaneWeights::Sparse(terms) => terms.len() == self.live_lane_count,
             PreparedLaneWeights::Packing(packing) => {
-                packing.lane_offsets.len() == self.live_lane_count + 1
+                packing.live_lane_count == self.live_lane_count
+                    && packing.lane_index().lane_offsets.len() == self.live_lane_count + 1
             }
             PreparedLaneWeights::Dense(values) => {
                 self.coeff_count == 1 && values.len() == self.live_lane_count

@@ -1,4 +1,6 @@
 use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -116,6 +118,51 @@ impl Drop for AlignedBytes {
     }
 }
 
+#[derive(Default)]
+struct PackedOpeningCache {
+    entries: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+}
+
+impl fmt::Debug for PackedOpeningCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        formatter
+            .debug_struct("PackedOpeningCache")
+            .field("entries", &len)
+            .finish()
+    }
+}
+
+impl PackedOpeningCache {
+    fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|value| value.downcast().ok())
+    }
+
+    fn take<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&TypeId::of::<T>())
+            .and_then(|value| value.downcast().ok())
+    }
+
+    fn insert<T: Any + Send + Sync>(&self, value: Arc<T>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(TypeId::of::<T>(), value);
+    }
+}
+
 /// A packed row-major trace whose nonzero bytes select one-hot lanes.
 ///
 /// Storage contains `num_rows * num_columns` bytes in row-major order. Byte
@@ -125,6 +172,7 @@ impl Drop for AlignedBytes {
 #[derive(Debug, Clone)]
 pub struct PackedOneHotPoly<F: FieldCore> {
     lanes: Arc<AlignedBytes>,
+    opening_cache: Arc<PackedOpeningCache>,
     num_rows: usize,
     num_columns: usize,
     column_capacity: usize,
@@ -138,6 +186,7 @@ pub struct PackedOneHotPoly<F: FieldCore> {
 #[derive(Debug, Clone, Copy)]
 pub struct PackedOneHotView<'a, F: FieldCore, const D: usize> {
     lanes: &'a [u8],
+    opening_cache: Option<&'a PackedOpeningCache>,
     num_rows: usize,
     num_columns: usize,
     column_capacity: usize,
@@ -157,6 +206,7 @@ struct StreamingProgress {
 #[derive(Debug)]
 struct StreamingPackedOneHotInner<F: FieldCore> {
     lanes: Arc<AlignedBytes>,
+    opening_cache: Arc<PackedOpeningCache>,
     num_rows: usize,
     populated_rows: usize,
     num_columns: usize,
@@ -323,6 +373,7 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
             validate_geometry(onehot_k, column_capacity, num_columns, &lanes)?;
         Ok(Self {
             lanes: Arc::new(AlignedBytes::copy_from(&lanes)),
+            opening_cache: Arc::new(PackedOpeningCache::default()),
             num_rows,
             num_columns,
             column_capacity,
@@ -367,6 +418,7 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
         }
         Ok(Self {
             lanes: Arc::new(lanes),
+            opening_cache: Arc::new(PackedOpeningCache::default()),
             num_rows: validated_rows,
             num_columns,
             column_capacity,
@@ -418,6 +470,7 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
         }
         Ok(Self {
             lanes: Arc::new(lanes),
+            opening_cache: Arc::new(PackedOpeningCache::default()),
             num_rows: validated_rows,
             num_columns,
             column_capacity,
@@ -456,6 +509,21 @@ impl<F: FieldCore> PackedOneHotPoly<F> {
     #[must_use]
     pub const fn hot_entries(&self) -> usize {
         self.hot_entries
+    }
+
+    /// Borrow a commitment view from this already-validated packed source.
+    pub fn view<const D: usize>(&self) -> Result<PackedOneHotView<'_, F, D>, AkitaError> {
+        validate_ring_dimension(self.onehot_k, self.num_vars, D)?;
+        Ok(PackedOneHotView {
+            lanes: &self.lanes,
+            opening_cache: Some(&self.opening_cache),
+            num_rows: self.num_rows,
+            num_columns: self.num_columns,
+            column_capacity: self.column_capacity,
+            onehot_k: self.onehot_k,
+            hot_entries: self.hot_entries,
+            marker: PhantomData,
+        })
     }
 }
 
@@ -536,6 +604,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
     ) -> (Self, PackedOneHotStreamWriter<F>) {
         let inner = Arc::new(StreamingPackedOneHotInner {
             lanes: Arc::new(lanes),
+            opening_cache: Arc::new(PackedOpeningCache::default()),
             num_rows,
             populated_rows: storage.populated_rows,
             num_columns,
@@ -594,6 +663,7 @@ impl<F: FieldCore> StreamingPackedOneHotPoly<F> {
         let hot_entries = wait_for_rows(&self.inner, self.inner.num_rows, true)?;
         Ok(PackedOneHotPoly {
             lanes: self.inner.lanes.clone(),
+            opening_cache: self.inner.opening_cache.clone(),
             num_rows: self.inner.num_rows,
             num_columns: self.inner.num_columns,
             column_capacity: self.inner.column_capacity,
@@ -956,6 +1026,11 @@ impl<F: FieldCore, const D: usize> StreamingPackedOneHotView<F, D> {
     pub fn wait_hot_entries(&self) -> Result<usize, AkitaError> {
         wait_for_rows(&self.inner, self.inner.num_rows, true)
     }
+
+    /// Retain backend-private preprocessing with the packed source.
+    pub fn retain_opening_acceleration<T: Any + Send + Sync>(&self, value: Arc<T>) {
+        self.inner.opening_cache.insert(value);
+    }
 }
 
 fn wait_for_rows<F: FieldCore>(
@@ -1004,6 +1079,7 @@ impl<'a, F: FieldCore, const D: usize> PackedOneHotView<'a, F, D> {
         validate_ring_dimension(onehot_k, total_field_elems.trailing_zeros() as usize, D)?;
         Ok(Self {
             lanes,
+            opening_cache: None,
             num_rows,
             num_columns,
             column_capacity,
@@ -1042,6 +1118,30 @@ impl<'a, F: FieldCore, const D: usize> PackedOneHotView<'a, F, D> {
     pub const fn hot_entries(self) -> usize {
         self.hot_entries
     }
+
+    /// Retrieve backend-private preprocessing retained by the commit path.
+    pub fn opening_acceleration<T: Any + Send + Sync>(self) -> Option<Arc<T>> {
+        self.opening_cache.and_then(PackedOpeningCache::get)
+    }
+
+    /// Remove one-shot backend preprocessing from the packed source.
+    pub fn take_opening_acceleration<T: Any + Send + Sync>(self) -> Option<Arc<T>> {
+        self.opening_cache.and_then(PackedOpeningCache::take)
+    }
+
+    /// Retain backend-private preprocessing when this view has an owned source.
+    pub fn retain_opening_acceleration<T: Any + Send + Sync>(self, value: Arc<T>) -> bool {
+        let Some(cache) = self.opening_cache else {
+            return false;
+        };
+        cache.insert(value);
+        true
+    }
+
+    /// Whether this view can retain preprocessing for a later opening.
+    pub const fn retains_opening_acceleration(self) -> bool {
+        self.opening_cache.is_some()
+    }
 }
 
 impl<F: FieldCore> RootPolyMeta<F> for PackedOneHotPoly<F> {
@@ -1075,16 +1175,7 @@ impl<F: FieldCore, const D: usize> RootCommitSource<F, D> for PackedOneHotPoly<F
         Self: 'a;
 
     fn commit_view(&self) -> Result<Self::CommitView<'_>, AkitaError> {
-        validate_ring_dimension(self.onehot_k, self.num_vars, D)?;
-        Ok(PackedOneHotView {
-            lanes: &self.lanes,
-            num_rows: self.num_rows,
-            num_columns: self.num_columns,
-            column_capacity: self.column_capacity,
-            onehot_k: self.onehot_k,
-            hot_entries: self.hot_entries,
-            marker: PhantomData,
-        })
+        self.view()
     }
 
     fn committed_centered_reach(

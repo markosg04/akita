@@ -298,6 +298,11 @@ where
         level: usize,
     ) -> &ProverComputeStack<'a, F, Self::Commit, Self::Opening, Self::Tensor, Self::RingSwitch>;
 
+    /// Phase at which retained NTT requirements are prepared.
+    fn ntt_prewarm_phase(&self) -> NttPrewarmPhase {
+        NttPrewarmPhase::Eager
+    }
+
     /// Optional lifecycle hook after the root fold and before the recursive
     /// suffix. The default retains every prepared NTT cache.
     ///
@@ -309,6 +314,78 @@ where
     /// Returns an error when the selected lifecycle action fails.
     fn after_root_fold(&self) -> Result<(), AkitaError> {
         Ok(())
+    }
+}
+
+/// Scheduling policy for public NTT-cache preparation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NttPrewarmPhase {
+    /// Prepare retained slots before proving begins.
+    #[default]
+    Eager,
+    /// Prepare retained slots after root coefficient packing, concurrently with
+    /// the root fold grind.
+    RootFold,
+}
+
+/// Stack policy that moves retained NTT preparation under the root fold.
+pub struct RootFoldNttPrewarm<S> {
+    stacks: S,
+    enabled: bool,
+}
+
+impl<S> RootFoldNttPrewarm<S> {
+    /// Wrap a stack selector with root-fold NTT prewarming.
+    pub fn new(stacks: S) -> Self {
+        Self {
+            stacks,
+            enabled: true,
+        }
+    }
+
+    /// Select root-fold prewarming conditionally without changing the stack type.
+    pub fn when(stacks: S, enabled: bool) -> Self {
+        Self { stacks, enabled }
+    }
+
+    /// Recover the wrapped stack selector.
+    pub fn into_inner(self) -> S {
+        self.stacks
+    }
+}
+
+impl<'a, F, C, O, T, R, S> LevelProveStacks<'a, F> for RootFoldNttPrewarm<S>
+where
+    F: FieldCore + CanonicalField,
+    C: ComputeBackendSetup<F> + 'a,
+    O: ComputeBackendSetup<F> + 'a,
+    T: ComputeBackendSetup<F> + 'a,
+    R: ComputeBackendSetup<F> + 'a,
+    S: LevelProveStacks<'a, F, Commit = C, Opening = O, Tensor = T, RingSwitch = R>,
+    C::PreparedSetup: 'a,
+    O::PreparedSetup: 'a,
+    T::PreparedSetup: 'a,
+    R::PreparedSetup: 'a,
+{
+    type Commit = C;
+    type Opening = O;
+    type Tensor = T;
+    type RingSwitch = R;
+
+    fn prove_stack_at_level(&self, level: usize) -> &ProverComputeStack<'a, F, C, O, T, R> {
+        self.stacks.prove_stack_at_level(level)
+    }
+
+    fn ntt_prewarm_phase(&self) -> NttPrewarmPhase {
+        if self.enabled {
+            NttPrewarmPhase::RootFold
+        } else {
+            self.stacks.ntt_prewarm_phase()
+        }
+    }
+
+    fn after_root_fold(&self) -> Result<(), AkitaError> {
+        self.stacks.after_root_fold()
     }
 }
 
@@ -356,6 +433,10 @@ where
 
     fn prove_stack_at_level(&self, level: usize) -> &ProverComputeStack<'a, F, C, O, T, R> {
         self.stacks.prove_stack_at_level(level)
+    }
+
+    fn ntt_prewarm_phase(&self) -> NttPrewarmPhase {
+        self.stacks.ntt_prewarm_phase()
     }
 
     fn after_root_fold(&self) -> Result<(), AkitaError> {
@@ -521,6 +602,10 @@ where
 
     fn prove_stack_at_level(&self, level: usize) -> &ProverComputeStack<'a, F, C, O, T, R> {
         (*self).prove_stack_at_level(level)
+    }
+
+    fn ntt_prewarm_phase(&self) -> NttPrewarmPhase {
+        <S as LevelProveStacks<'a, F>>::ntt_prewarm_phase(*self)
     }
 
     fn after_root_fold(&self) -> Result<(), AkitaError> {

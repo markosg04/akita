@@ -538,6 +538,8 @@ where
             level_params,
             BasisMode::Lagrange,
             None,
+            None,
+            None,
         )
     } else {
         prepare_extension_claim_fold::<F, E, T, _, _, C, O, TS, R>(

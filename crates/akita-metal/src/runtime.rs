@@ -29,6 +29,17 @@ const FP128_PACKED_ONEHOT_COEFFICIENT_PACKING_PARTIALS_KERNEL_NAME: &str =
 const FP128_PACKED_ONEHOT_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME: &str =
     "akita_fp128_packed_onehot_coefficient_packing_reduce";
 const FP128_D512_DECOMPOSE_FOLD_KERNEL_NAME: &str = "akita_fp128_d512_decompose_fold";
+const FP128_D512_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_d512_subring64_decompose_fold";
+const FP128_D512_BUILD_FOLD_INDEX_KERNEL_NAME: &str = "akita_fp128_d512_build_fold_index";
+const FP128_D512_BUILD_COEFFICIENT_PACKING_INDEX_KERNEL_NAME: &str =
+    "akita_fp128_d512_build_coefficient_packing_index";
+const FP128_D512_INDEXED_COEFFICIENT_PACKING_KERNEL_NAME: &str =
+    "akita_fp128_d512_indexed_coefficient_packing_partials";
+const FP128_D512_INDEXED_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME: &str =
+    "akita_fp128_d512_indexed_coefficient_packing_reduce";
+const FP128_D512_INDEXED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_d512_indexed_subring64_decompose_fold";
 const FP128_D512_LINEAR_RELATION_PARTIALS_KERNEL_NAME: &str =
     "akita_fp128_d512_linear_relation_partials";
 const FP128_D512_LINEAR_RELATION_REDUCE_KERNEL_NAME: &str =
@@ -47,6 +58,9 @@ const FP128_DIRECT_RANGE_FIELD_FOLD_KERNEL_NAME: &str =
     "akita_fp128_direct_range_field_fold_partials";
 const FP128_DIRECT_RANGE_REDUCE_KERNEL_NAME: &str = "akita_fp128_direct_range_reduce";
 const FP128_DIRECT_RANGE_FINALIZE_KERNEL_NAME: &str = "akita_fp128_direct_range_finalize";
+const FP128_BLAKE2B_SUMCHECK_CHALLENGE_KERNEL_NAME: &str = "akita_fp128_blake2b_sumcheck_challenge";
+const FP128_BLAKE2B_RELATION_SUMCHECK_ROUND_KERNEL_NAME: &str =
+    "akita_fp128_blake2b_relation_sumcheck_round";
 const FP128_DIRECT_RELATION_INITIAL_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_initial_partials";
 const FP128_DIRECT_RELATION_COMPACT_FOLD_KERNEL_NAME: &str =
@@ -63,6 +77,11 @@ const FP128_DIRECT_RELATION_TWO_ROUND_PREFIX_REDUCE_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_two_round_prefix_reduce";
 const FP128_DIRECT_RELATION_LINEAR_FOLD_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_linear_fold";
+const FP128_DIRECT_RELATION_ALPHA_FOLD_KERNEL_NAME: &str = "akita_fp128_direct_relation_alpha_fold";
+const FP128_DIRECT_RELATION_SCALAR_ADVANCE_KERNEL_NAME: &str =
+    "akita_fp128_direct_relation_scalar_advance";
+const FP128_DIRECT_RELATION_ADDITIONAL_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_direct_relation_additional_fold";
 const FP128_DIRECT_RELATION_SETUP_SOURCE_KERNEL_NAME: &str =
     "akita_fp128_direct_relation_setup_source";
 const FP128_DIRECT_RELATION_SPARSE_SOURCE_KERNEL_NAME: &str =
@@ -80,8 +99,14 @@ const FP128_D64_DIGIT_ROWS_THREADS: usize = 256;
 const FP128_D64_DIGIT_ROWS_PARTIAL_THREADS: usize = 64;
 pub(crate) const FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL: usize = 64;
 const FP128_COEFFICIENT_PACKING_THREADS: usize = 256;
+pub(crate) const FP128_D512_PACKING_INDEX_TILE_POSITIONS: usize = 256;
+pub(crate) const FP128_D512_PACKING_INDEX_BUCKET_OFFSETS: usize = 33;
+const FP128_D512_PACKING_TILES_PER_CHUNK: usize = 32;
 const FP128_PACKED_COEFFICIENT_PACKING_PARTIAL_THREADS: usize = 256;
 const FP128_PACKED_COEFFICIENT_PACKING_REDUCE_THREADS: usize = 256;
+pub(crate) const FP128_D512_FOLD_INDEX_TILE_TASKS: usize = 256;
+pub(crate) const FP128_D512_FOLD_INDEX_COUNT_BUCKETS: usize = 8;
+const FP128_D512_SUBRING_DIMENSION: usize = 64;
 pub(crate) const FP128_PACKED_COEFFICIENT_PACKING_ROWS_PER_PARTIAL: usize =
     i32::MAX as usize / u16::MAX as usize;
 const FP128_DIRECT_RANGE_THREADS: usize = 256;
@@ -106,6 +131,37 @@ const FP128_RECURSIVE_COMMIT_THREADS: usize = 512;
 const FP128_RECURSIVE_COMMIT_RECONSTRUCT_THREADS: usize = 256;
 const FP128_RECURSIVE_COMMIT_BLOCKS_PER_GROUP: usize = 16;
 const FP128_RECURSIVE_COMMIT_MAX_ROWS: usize = 8;
+
+fn pack_biased_subring64_challenges(dense_challenges: &[i8]) -> Result<Vec<u32>, MetalCommitError> {
+    if !dense_challenges
+        .len()
+        .is_multiple_of(FP128_D512_SUBRING_DIMENSION)
+        || dense_challenges
+            .iter()
+            .any(|&coefficient| !(-2..=2).contains(&coefficient))
+    {
+        return Err(MetalCommitError::UnsupportedShape(
+            "indexed D512 fold requires D64 challenge coefficients in [-2, 2]".into(),
+        ));
+    }
+
+    let mut packed = Vec::with_capacity(dense_challenges.len());
+    for challenge in dense_challenges.chunks_exact(FP128_D512_SUBRING_DIMENSION) {
+        for source_phase in 0..8 {
+            for destination_quad in 0..8 {
+                let start = (8 * destination_quad + FP128_D512_SUBRING_DIMENSION - source_phase)
+                    % FP128_D512_SUBRING_DIMENSION;
+                let word = (0..8).fold(0u32, |word, offset| {
+                    let position = (start + offset) % FP128_D512_SUBRING_DIMENSION;
+                    let biased = u32::from((challenge[position] + 2) as u8);
+                    word | (biased << (4 * offset))
+                });
+                packed.push(word);
+            }
+        }
+    }
+    Ok(packed)
+}
 
 /// Metal implementation selected for a one-hot inner commitment.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -257,6 +313,41 @@ const _: [(); 64] = [(); size_of::<PackedDecomposeFoldParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedFoldIndexParams {
+    pub(crate) num_rows: u64,
+    pub(crate) num_columns: u64,
+    pub(crate) lane_stride: u64,
+    pub(crate) num_positions: u64,
+    pub(crate) position_start: u64,
+    pub(crate) blocks_per_column: u64,
+    pub(crate) tasks_per_position: u64,
+    pub(crate) tiles_per_position: u64,
+    pub(crate) record_slots: u64,
+    pub(crate) count_entries: u64,
+    pub(crate) output_coefficients: u64,
+    pub(crate) fold_digits: u64,
+    pub(crate) fold_log_basis: u64,
+}
+
+const _: [(); 104] = [(); size_of::<PackedFoldIndexParams>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedCoefficientPackingIndexParams {
+    pub(crate) num_rows: u64,
+    pub(crate) num_columns: u64,
+    pub(crate) lane_stride: u64,
+    pub(crate) num_positions: u64,
+    pub(crate) blocks_per_column: u64,
+    pub(crate) position_tiles: u64,
+    pub(crate) record_slots: u64,
+    pub(crate) offset_entries: u64,
+}
+
+const _: [(); 64] = [(); size_of::<PackedCoefficientPackingIndexParams>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct D512LinearRelationParams {
     pub(crate) num_columns: u64,
     pub(crate) columns_per_tile: u64,
@@ -311,9 +402,21 @@ pub(crate) struct DirectRangeParams {
     pub(crate) basis: u64,
     pub(crate) prefix_size: u64,
     pub(crate) materialize_prefix: u64,
+    pub(crate) resident_challenges: u64,
 }
 
-const _: [(); 88] = [(); size_of::<DirectRangeParams>()];
+const _: [(); 96] = [(); size_of::<DirectRangeParams>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Blake2bSumcheckChallengeParams {
+    include_claim: u64,
+    coefficient_count: u64,
+    prior_squeezed_bytes: u64,
+    reserved: u64,
+}
+
+const _: [(); 32] = [(); size_of::<Blake2bSumcheckChallengeParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -334,9 +437,19 @@ pub(crate) struct DirectRelationParams {
     pub(crate) additional_pair_count: u64,
     pub(crate) additional_workgroups: u64,
     pub(crate) fold_lane_weights: u64,
+    pub(crate) resident_challenges: u64,
 }
 
-const _: [(); 128] = [(); size_of::<DirectRelationParams>()];
+const _: [(); 136] = [(); size_of::<DirectRelationParams>()];
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DirectRelationTranscriptParams {
+    prior_squeezed_bytes: u64,
+    has_additional: u64,
+}
+
+const _: [(); 16] = [(); size_of::<DirectRelationTranscriptParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -455,6 +568,16 @@ pub(crate) struct DirectRelationAdditionalPair {
 
 const _: [(); 80] = [(); size_of::<DirectRelationAdditionalPair>()];
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DirectRelationAdditionalFoldMapping {
+    parent: u64,
+    left: u32,
+    right: u32,
+}
+
+const _: [(); 16] = [(); size_of::<DirectRelationAdditionalFoldMapping>()];
+
 trait PackedLaneSource {
     fn lane_count(&self) -> usize;
 
@@ -538,6 +661,23 @@ pub(crate) struct CoefficientPackingDispatchOutcome {
 pub(crate) struct PackedDecomposeFoldDispatchOutcome {
     pub(crate) centered_coefficients: Vec<i32>,
     pub(crate) timings: DispatchTimings,
+    pub(crate) consumer_time: Duration,
+    pub(crate) allocation_bytes: usize,
+}
+
+pub(crate) struct PackedFp128D512FoldIndex {
+    records: Buffer,
+    counts: Buffer,
+    params: PackedFoldIndexParams,
+    pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
+}
+
+pub(crate) struct PackedFp128D512CoefficientPackingIndex {
+    records: Buffer,
+    offsets: Buffer,
+    params: PackedCoefficientPackingIndexParams,
+    pub(crate) timings: DispatchTimings,
     pub(crate) allocation_bytes: usize,
 }
 
@@ -553,15 +693,37 @@ pub(crate) struct RecursiveCommitDispatchOutcome {
     pub(crate) allocation_bytes: usize,
 }
 
+pub(crate) struct RecursiveCommitMatrixNttOutcome {
+    pub(crate) buffer: Buffer,
+    pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
+}
+
 pub(crate) struct DirectRangeRoundOutcome {
     pub(crate) coefficients: [Fp128Limbs; FP128_DIRECT_RANGE_STORED_COEFFICIENTS],
     pub(crate) timings: DispatchTimings,
     pub(crate) allocation_bytes: usize,
 }
 
+#[cfg(test)]
+pub(crate) struct Blake2bSumcheckChallengeOutcome {
+    pub(crate) challenge: Fp128Limbs,
+    pub(crate) chaining_value: [u8; 64],
+}
+
 pub(crate) struct DirectRangeAdvanceOutcome {
     pub(crate) next_coefficients: Option<[Fp128Limbs; FP128_DIRECT_RANGE_STORED_COEFFICIENTS]>,
     pub(crate) final_evaluation: Option<Fp128Limbs>,
+    pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectRangeResidentOutcome {
+    pub(crate) round_coefficients: Vec<[Fp128Limbs; FP128_DIRECT_RANGE_STORED_COEFFICIENTS]>,
+    pub(crate) challenges: Vec<Fp128Limbs>,
+    pub(crate) final_evaluation: Fp128Limbs,
+    pub(crate) chaining_value: [u8; 64],
     pub(crate) timings: DispatchTimings,
     pub(crate) allocation_bytes: usize,
 }
@@ -621,6 +783,23 @@ pub(crate) struct DirectRelationAdvanceOutcome {
     pub(crate) allocation_bytes: usize,
 }
 
+pub(crate) struct DirectRelationResidentEqRound {
+    pub(crate) e_first: Vec<Fp128Limbs>,
+    pub(crate) e_second: Vec<Fp128Limbs>,
+    pub(crate) tau: Fp128Limbs,
+}
+
+pub(crate) struct DirectRelationResidentOutcome {
+    pub(crate) round_coefficients: Vec<[Fp128Limbs; 3]>,
+    pub(crate) coefficient_counts: Vec<usize>,
+    pub(crate) challenges: Vec<Fp128Limbs>,
+    pub(crate) final_evaluation: Fp128Limbs,
+    pub(crate) final_linear_evaluation: Fp128Limbs,
+    pub(crate) chaining_value: [u8; 64],
+    pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
+}
+
 pub(crate) struct DirectRelationSession {
     compact_digits: Buffer,
     tables: [Buffer; 2],
@@ -660,6 +839,12 @@ struct DirectRelationRoundBuffers {
     e_second: Buffer,
     alpha: Buffer,
     allocation_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+enum Fp128KernelBinding<'a> {
+    Inline(Fp128Limbs),
+    Buffer(&'a Buffer, u64),
 }
 
 struct PackedLaneBuffer<'a> {
@@ -717,6 +902,12 @@ pub(crate) struct MetalRuntime {
     fp128_packed_onehot_coefficient_packing_partials_pipeline: ComputePipelineState,
     fp128_packed_onehot_coefficient_packing_reduce_pipeline: ComputePipelineState,
     fp128_d512_decompose_fold_pipeline: ComputePipelineState,
+    fp128_d512_subring64_decompose_fold_pipeline: ComputePipelineState,
+    fp128_d512_build_fold_index_pipeline: ComputePipelineState,
+    fp128_d512_build_coefficient_packing_index_pipeline: ComputePipelineState,
+    fp128_d512_indexed_coefficient_packing_pipeline: ComputePipelineState,
+    fp128_d512_indexed_coefficient_packing_reduce_pipeline: ComputePipelineState,
+    fp128_d512_indexed_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_partials_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_reduce_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_reconstruct_pipeline: ComputePipelineState,
@@ -730,6 +921,8 @@ pub(crate) struct MetalRuntime {
     fp128_direct_range_field_fold_pipeline: ComputePipelineState,
     fp128_direct_range_reduce_pipeline: ComputePipelineState,
     fp128_direct_range_finalize_pipeline: ComputePipelineState,
+    fp128_blake2b_sumcheck_challenge_pipeline: ComputePipelineState,
+    fp128_blake2b_relation_sumcheck_round_pipeline: ComputePipelineState,
     fp128_direct_relation_initial_pipeline: ComputePipelineState,
     fp128_direct_relation_compact_fold_pipeline: ComputePipelineState,
     fp128_direct_relation_field_fold_pipeline: ComputePipelineState,
@@ -738,6 +931,9 @@ pub(crate) struct MetalRuntime {
     fp128_direct_relation_two_round_prefix_pipeline: ComputePipelineState,
     fp128_direct_relation_two_round_prefix_reduce_pipeline: ComputePipelineState,
     fp128_direct_relation_linear_fold_pipeline: ComputePipelineState,
+    fp128_direct_relation_alpha_fold_pipeline: ComputePipelineState,
+    fp128_direct_relation_scalar_advance_pipeline: ComputePipelineState,
+    fp128_direct_relation_additional_fold_pipeline: ComputePipelineState,
     fp128_direct_relation_setup_source_pipeline: ComputePipelineState,
     fp128_direct_relation_sparse_source_pipeline: ComputePipelineState,
 }
@@ -1007,6 +1203,24 @@ impl MetalRuntime {
                 FP128_PACKED_ONEHOT_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME,
             )?,
             fp128_d512_decompose_fold_pipeline: pipeline(FP128_D512_DECOMPOSE_FOLD_KERNEL_NAME)?,
+            fp128_d512_subring64_decompose_fold_pipeline: pipeline(
+                FP128_D512_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
+            )?,
+            fp128_d512_build_fold_index_pipeline: pipeline(
+                FP128_D512_BUILD_FOLD_INDEX_KERNEL_NAME,
+            )?,
+            fp128_d512_build_coefficient_packing_index_pipeline: pipeline(
+                FP128_D512_BUILD_COEFFICIENT_PACKING_INDEX_KERNEL_NAME,
+            )?,
+            fp128_d512_indexed_coefficient_packing_pipeline: pipeline(
+                FP128_D512_INDEXED_COEFFICIENT_PACKING_KERNEL_NAME,
+            )?,
+            fp128_d512_indexed_coefficient_packing_reduce_pipeline: pipeline(
+                FP128_D512_INDEXED_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME,
+            )?,
+            fp128_d512_indexed_subring64_decompose_fold_pipeline: pipeline(
+                FP128_D512_INDEXED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
+            )?,
             fp128_d512_linear_relation_partials_pipeline: pipeline(
                 FP128_D512_LINEAR_RELATION_PARTIALS_KERNEL_NAME,
             )?,
@@ -1038,6 +1252,12 @@ impl MetalRuntime {
             fp128_direct_range_finalize_pipeline: pipeline(
                 FP128_DIRECT_RANGE_FINALIZE_KERNEL_NAME,
             )?,
+            fp128_blake2b_sumcheck_challenge_pipeline: pipeline(
+                FP128_BLAKE2B_SUMCHECK_CHALLENGE_KERNEL_NAME,
+            )?,
+            fp128_blake2b_relation_sumcheck_round_pipeline: pipeline(
+                FP128_BLAKE2B_RELATION_SUMCHECK_ROUND_KERNEL_NAME,
+            )?,
             fp128_direct_relation_initial_pipeline: pipeline(
                 FP128_DIRECT_RELATION_INITIAL_KERNEL_NAME,
             )?,
@@ -1061,6 +1281,15 @@ impl MetalRuntime {
             )?,
             fp128_direct_relation_linear_fold_pipeline: pipeline(
                 FP128_DIRECT_RELATION_LINEAR_FOLD_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_alpha_fold_pipeline: pipeline(
+                FP128_DIRECT_RELATION_ALPHA_FOLD_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_scalar_advance_pipeline: pipeline(
+                FP128_DIRECT_RELATION_SCALAR_ADVANCE_KERNEL_NAME,
+            )?,
+            fp128_direct_relation_additional_fold_pipeline: pipeline(
+                FP128_DIRECT_RELATION_ADDITIONAL_FOLD_KERNEL_NAME,
             )?,
             fp128_direct_relation_setup_source_pipeline: pipeline(
                 FP128_DIRECT_RELATION_SETUP_SOURCE_KERNEL_NAME,
@@ -1969,11 +2198,171 @@ impl MetalRuntime {
         })
     }
 
+    pub(crate) fn dispatch_fp128_indexed_packed_onehot_coefficient_packing(
+        &self,
+        index: &PackedFp128D512CoefficientPackingIndex,
+        combined_weights: &[Fp128Limbs],
+        params: PackedOneHotCoefficientPackingParams,
+    ) -> Result<CoefficientPackingDispatchOutcome, MetalCommitError> {
+        autoreleasepool(|| {
+            let index_params = index.params;
+            let expected_blocks = params
+                .column_capacity
+                .checked_mul(params.blocks_per_column)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed coefficient-packing blocks",
+                ))?;
+            let expected_output = expected_blocks
+                .checked_mul(params.subring_dimension)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed coefficient-packing output",
+                ))?;
+            let expected_weights = params
+                .positions_per_block
+                .checked_mul(params.stride)
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed coefficient-packing weights",
+                ))?;
+            let tile_chunks = index_params
+                .position_tiles
+                .div_ceil(FP128_D512_PACKING_TILES_PER_CHUNK as u64);
+            let live_streams = params
+                .blocks_per_column
+                .checked_mul(params.num_columns)
+                .and_then(|count| count.checked_mul(2))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed coefficient-packing live streams",
+                ))?;
+            let partial_groups =
+                live_streams
+                    .checked_mul(tile_chunks)
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "indexed coefficient-packing partial groups",
+                    ))?;
+            let partial_count = live_streams
+                .checked_mul(32)
+                .and_then(|count| count.checked_mul(tile_chunks))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed coefficient-packing partials",
+                ))?;
+            if params.num_rows == 0
+                || params.num_columns == 0
+                || params.num_columns > params.column_capacity
+                || params.onehot_k != 256
+                || params.ring_d != 512
+                || params.stride != 8
+                || params.subring_dimension != 64
+                || params.positions_per_block == 0
+                || params.positions_per_block.checked_mul(2) != Some(params.rows_per_block)
+                || params.blocks_per_column == 0
+                || params.num_blocks != expected_blocks
+                || params.output_coefficients != expected_output
+                || params.output_coefficients > u64::from(u32::MAX)
+                || partial_groups > u64::from(u32::MAX)
+                || u64::try_from(combined_weights.len()).ok() != Some(expected_weights)
+                || index_params.num_rows != params.num_rows
+                || index_params.num_columns != params.num_columns
+                || index_params.lane_stride != params.num_columns
+                || index_params.num_positions != params.positions_per_block
+                || index_params.blocks_per_column != params.blocks_per_column
+                || index_params.position_tiles
+                    != params
+                        .positions_per_block
+                        .div_ceil(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64)
+                || self
+                    .fp128_d512_indexed_coefficient_packing_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_COEFFICIENT_PACKING_THREADS as u64
+                || self
+                    .fp128_d512_indexed_coefficient_packing_reduce_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_COEFFICIENT_PACKING_THREADS as u64
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "indexed fp128 packed coefficient-packing shape is unsupported".into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let weights = self.shared_buffer_from_slice(combined_weights)?;
+            let output_count = usize::try_from(params.output_coefficients).map_err(|_| {
+                MetalCommitError::ShapeOverflow("indexed coefficient-packing output")
+            })?;
+            let output_bytes = output_count.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+                MetalCommitError::ShapeOverflow("indexed coefficient-packing output bytes"),
+            )?;
+            let output = self.shared_buffer(output_bytes)?;
+            let partial_count = usize::try_from(partial_count).map_err(|_| {
+                MetalCommitError::ShapeOverflow("indexed coefficient-packing partial count")
+            })?;
+            let partial_bytes = partial_count.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+                MetalCommitError::ShapeOverflow("indexed coefficient-packing partial bytes"),
+            )?;
+            let partials = self.private_buffer(partial_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 indexed coefficient packing");
+            let encoder = command.new_compute_command_encoder();
+            encoder
+                .set_compute_pipeline_state(&self.fp128_d512_indexed_coefficient_packing_pipeline);
+            encoder.set_buffer(0, Some(&index.records), 0);
+            encoder.set_buffer(1, Some(&index.offsets), 0);
+            encoder.set_buffer(2, Some(&weights), 0);
+            encoder.set_buffer(3, Some(&partials), 0);
+            set_inline_bytes(encoder, 4, &index_params);
+            set_inline_bytes(encoder, 5, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(partial_groups, 1, 1),
+                MTLSize::new(FP128_COEFFICIENT_PACKING_THREADS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(
+                &self.fp128_d512_indexed_coefficient_packing_reduce_pipeline,
+            );
+            encoder.set_buffer(0, Some(&partials), 0);
+            encoder.set_buffer(1, Some(&output), 0);
+            set_inline_bytes(encoder, 2, &index_params);
+            set_inline_bytes(encoder, 3, &params);
+            encoder.dispatch_threads(
+                MTLSize::new(params.output_coefficients, 1, 1),
+                MTLSize::new(FP128_COEFFICIENT_PACKING_THREADS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let (command_wall, gpu) = complete_command(command)?;
+
+            let readback_start = Instant::now();
+            // SAFETY: the completed command initialized exactly `output_count`
+            // aligned canonical limb values in shared storage.
+            let coefficients = unsafe {
+                std::slice::from_raw_parts(output.contents().cast::<Fp128Limbs>(), output_count)
+                    .to_vec()
+            };
+            Ok(CoefficientPackingDispatchOutcome {
+                coefficients,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: readback_start.elapsed(),
+                },
+                allocation_bytes: output_bytes
+                    .checked_add(size_of_val(combined_weights))
+                    .and_then(|bytes| bytes.checked_add(partial_bytes))
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "indexed coefficient-packing allocation bytes",
+                    ))?,
+            })
+        })
+    }
+
     pub(crate) fn dispatch_packed_fp128_d512_decompose_fold_streaming(
         &self,
         lanes: &[u8],
         challenge_positions: &[u16],
         challenge_coefficients: &[i8],
+        dense_subring64_challenges: Option<&[i8]>,
         params: PackedDecomposeFoldParams,
         position_chunk_len: usize,
         mut consume: impl FnMut(usize, &[i32]),
@@ -1994,6 +2383,13 @@ impl MetalRuntime {
                 .num_positions
                 .checked_mul(512)
                 .ok_or(MetalCommitError::ShapeOverflow("decompose-fold output"))?;
+            let expected_dense_challenges = params
+                .num_columns
+                .checked_mul(params.blocks_per_column)
+                .and_then(|count| count.checked_mul(64))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "dense subring challenge coefficients",
+                ))?;
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
@@ -2004,6 +2400,9 @@ impl MetalRuntime {
                 || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
                 || u64::try_from(challenge_positions.len()).ok() != Some(expected_challenge_terms)
                 || challenge_positions.len() != challenge_coefficients.len()
+                || dense_subring64_challenges.is_some_and(|dense| {
+                    u64::try_from(dense.len()).ok() != Some(expected_dense_challenges)
+                })
                 || params.num_positions > u64::from(u32::MAX)
                 || self
                     .fp128_d512_decompose_fold_pipeline
@@ -2019,6 +2418,9 @@ impl MetalRuntime {
             let lane_buffer = self.packed_lane_buffer(lanes)?;
             let positions = self.shared_buffer_from_slice(challenge_positions)?;
             let coefficients = self.shared_buffer_from_slice(challenge_coefficients)?;
+            let dense_challenges = dense_subring64_challenges
+                .map(|dense| self.shared_buffer_from_slice(dense))
+                .transpose()?;
             let output_count = usize::try_from(params.output_coefficients)
                 .map_err(|_| MetalCommitError::ShapeOverflow("decompose-fold output count"))?;
             let output_bytes = output_count.checked_mul(size_of::<i32>()).ok_or(
@@ -2066,12 +2468,22 @@ impl MetalRuntime {
                 command.set_label("Akita fp128 D512 packed decompose-fold");
                 let encoder = command.new_compute_command_encoder();
                 encoder.set_label("Akita fp128 D512 packed decompose-fold");
-                encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
-                encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
-                encoder.set_buffer(1, Some(&positions), 0);
-                encoder.set_buffer(2, Some(&coefficients), 0);
-                encoder.set_buffer(3, Some(&output), output_offset as u64);
-                set_inline_bytes(encoder, 4, &command_params);
+                if let Some(dense_challenges) = dense_challenges.as_ref() {
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_d512_subring64_decompose_fold_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+                    encoder.set_buffer(1, Some(dense_challenges), 0);
+                    encoder.set_buffer(2, Some(&output), output_offset as u64);
+                    set_inline_bytes(encoder, 3, &command_params);
+                } else {
+                    encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
+                    encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+                    encoder.set_buffer(1, Some(&positions), 0);
+                    encoder.set_buffer(2, Some(&coefficients), 0);
+                    encoder.set_buffer(3, Some(&output), output_offset as u64);
+                    set_inline_bytes(encoder, 4, &command_params);
+                }
                 encoder.dispatch_thread_groups(
                     MTLSize::new(position_count as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -2082,6 +2494,7 @@ impl MetalRuntime {
             }
 
             let mut readback_copy = Duration::ZERO;
+            let mut consumer_time = Duration::ZERO;
             for (command, position_start, position_end) in &commands {
                 command.wait_until_completed();
                 validate_completed_command(command)?;
@@ -2100,10 +2513,12 @@ impl MetalRuntime {
                     }
                     readback_copy += readback_start.elapsed();
                 }
+                let consumer_start = Instant::now();
                 consume(
                     *position_start,
                     &centered_coefficients[coefficient_start..coefficient_end],
                 );
+                consumer_time += consumer_start.elapsed();
             }
             let command_wall = command_start.elapsed();
             let gpu = commands.first().and_then(|(first, _, _)| {
@@ -2114,6 +2529,9 @@ impl MetalRuntime {
             let allocation_bytes = output_bytes
                 .checked_add(size_of_val(challenge_positions))
                 .and_then(|bytes| bytes.checked_add(size_of_val(challenge_coefficients)))
+                .and_then(|bytes| {
+                    bytes.checked_add(dense_subring64_challenges.map_or(0, size_of_val))
+                })
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "decompose-fold allocation bytes",
                 ))?;
@@ -2125,6 +2543,408 @@ impl MetalRuntime {
                     gpu,
                     readback_copy,
                 },
+                consumer_time,
+                allocation_bytes,
+            })
+        })
+    }
+
+    pub(crate) fn prepare_packed_fp128_d512_fold_index(
+        &self,
+        lanes: &[u8],
+        params: PackedFoldIndexParams,
+    ) -> Result<PackedFp128D512FoldIndex, MetalCommitError> {
+        autoreleasepool(|| {
+            let expected_lanes = params
+                .num_rows
+                .checked_mul(params.lane_stride)
+                .ok_or(MetalCommitError::ShapeOverflow("fold-index lanes"))?;
+            let expected_tasks = params
+                .blocks_per_column
+                .checked_mul(params.num_columns)
+                .and_then(|count| count.checked_mul(2))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "fold-index tasks per position",
+                ))?;
+            let expected_tiles = expected_tasks.div_ceil(FP128_D512_FOLD_INDEX_TILE_TASKS as u64);
+            let expected_records = params
+                .num_positions
+                .checked_mul(expected_tiles)
+                .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_TILE_TASKS as u64))
+                .ok_or(MetalCommitError::ShapeOverflow("fold-index records"))?;
+            let expected_counts = params
+                .num_positions
+                .checked_mul(expected_tiles)
+                .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_COUNT_BUCKETS as u64))
+                .ok_or(MetalCommitError::ShapeOverflow("fold-index counts"))?;
+            if params.num_rows == 0
+                || params.num_columns == 0
+                || params.num_columns > params.lane_stride
+                || params.num_positions == 0
+                || params.position_start != 0
+                || params.tasks_per_position != expected_tasks
+                || params.tiles_per_position != expected_tiles
+                || params.record_slots != expected_records
+                || params.count_entries != expected_counts
+                || params.fold_digits != 0
+                || params.fold_log_basis != 0
+                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
+                || self
+                    .fp128_d512_build_fold_index_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_D512_FOLD_INDEX_TILE_TASKS as u64
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "fp128 D512 packed fold-index geometry is unsupported".into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let lane_buffer = self.packed_lane_buffer(lanes)?;
+            let record_count = usize::try_from(params.record_slots)
+                .map_err(|_| MetalCommitError::ShapeOverflow("fold-index record count"))?;
+            let record_bytes = record_count
+                .checked_mul(size_of::<u32>())
+                .ok_or(MetalCommitError::ShapeOverflow("fold-index record bytes"))?;
+            let count_count = usize::try_from(params.count_entries)
+                .map_err(|_| MetalCommitError::ShapeOverflow("fold-index count count"))?;
+            let count_bytes = count_count
+                .checked_mul(size_of::<u16>())
+                .ok_or(MetalCommitError::ShapeOverflow("fold-index count bytes"))?;
+            let records = self.private_buffer(record_bytes)?;
+            let counts = self.private_buffer(count_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 D512 packed fold index");
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_label("Akita fp128 D512 packed fold index");
+            encoder.set_compute_pipeline_state(&self.fp128_d512_build_fold_index_pipeline);
+            encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+            encoder.set_buffer(1, Some(&records), 0);
+            encoder.set_buffer(2, Some(&counts), 0);
+            set_inline_bytes(encoder, 3, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(params.num_positions, 1, 1),
+                MTLSize::new(FP128_D512_FOLD_INDEX_TILE_TASKS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let (command_wall, gpu) = complete_command(command)?;
+            let allocation_bytes =
+                record_bytes
+                    .checked_add(count_bytes)
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "fold-index allocation bytes",
+                    ))?;
+            Ok(PackedFp128D512FoldIndex {
+                records,
+                counts,
+                params,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: Duration::ZERO,
+                },
+                allocation_bytes,
+            })
+        })
+    }
+
+    pub(crate) fn prepare_packed_fp128_d512_coefficient_packing_index(
+        &self,
+        lanes: &[u8],
+        params: PackedCoefficientPackingIndexParams,
+    ) -> Result<PackedFp128D512CoefficientPackingIndex, MetalCommitError> {
+        autoreleasepool(|| {
+            let expected_lanes = params
+                .num_rows
+                .checked_mul(params.lane_stride)
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index lanes"))?;
+            let expected_tiles = params
+                .num_positions
+                .div_ceil(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64);
+            let expected_streams = params
+                .blocks_per_column
+                .checked_mul(params.num_columns)
+                .and_then(|count| count.checked_mul(2))
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index streams"))?;
+            let expected_layouts = expected_streams
+                .checked_mul(expected_tiles)
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index layouts"))?;
+            let expected_records = expected_layouts
+                .checked_mul(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64)
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index records"))?;
+            let expected_offsets = expected_layouts
+                .checked_mul(FP128_D512_PACKING_INDEX_BUCKET_OFFSETS as u64)
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index offsets"))?;
+            let expected_groups = params
+                .blocks_per_column
+                .checked_mul(expected_tiles)
+                .ok_or(MetalCommitError::ShapeOverflow("packing-index groups"))?;
+            if params.num_rows == 0
+                || params.num_columns == 0
+                || params.num_columns > 32
+                || params.num_columns > params.lane_stride
+                || params.num_positions == 0
+                || params.blocks_per_column == 0
+                || params.position_tiles != expected_tiles
+                || params.record_slots != expected_records
+                || params.offset_entries != expected_offsets
+                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
+                || expected_groups > u64::from(u32::MAX)
+                || self
+                    .fp128_d512_build_coefficient_packing_index_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "fp128 D512 coefficient-packing index geometry is unsupported".into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let lane_buffer = self.packed_lane_buffer(lanes)?;
+            let record_count = usize::try_from(params.record_slots)
+                .map_err(|_| MetalCommitError::ShapeOverflow("packing-index record count"))?;
+            let record_bytes = record_count.checked_mul(size_of::<u16>()).ok_or(
+                MetalCommitError::ShapeOverflow("packing-index record bytes"),
+            )?;
+            let offset_count = usize::try_from(params.offset_entries)
+                .map_err(|_| MetalCommitError::ShapeOverflow("packing-index offset count"))?;
+            let offset_bytes = offset_count.checked_mul(size_of::<u16>()).ok_or(
+                MetalCommitError::ShapeOverflow("packing-index offset bytes"),
+            )?;
+            let records = self.private_buffer(record_bytes)?;
+            let offsets = self.private_buffer(offset_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 D512 coefficient-packing index");
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(
+                &self.fp128_d512_build_coefficient_packing_index_pipeline,
+            );
+            encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+            encoder.set_buffer(1, Some(&records), 0);
+            encoder.set_buffer(2, Some(&offsets), 0);
+            set_inline_bytes(encoder, 3, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(expected_groups, 1, 1),
+                MTLSize::new(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            let (command_wall, gpu) = complete_command(command)?;
+            Ok(PackedFp128D512CoefficientPackingIndex {
+                records,
+                offsets,
+                params,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: Duration::ZERO,
+                },
+                allocation_bytes: record_bytes.checked_add(offset_bytes).ok_or(
+                    MetalCommitError::ShapeOverflow("packing-index allocation bytes"),
+                )?,
+            })
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the indexed root dispatch keeps source, retained index, challenge, digit, and streaming boundaries explicit"
+    )]
+    pub(crate) fn dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+        &self,
+        lanes: &[u8],
+        dense_subring64_challenges: &[i8],
+        index: &PackedFp128D512FoldIndex,
+        params: PackedDecomposeFoldParams,
+        fold_digits: usize,
+        fold_log_basis: u32,
+        position_chunk_len: usize,
+        mut consume: impl FnMut(usize, &[i32], &[i8]),
+    ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
+        autoreleasepool(|| {
+            let expected_lanes = params
+                .num_rows
+                .checked_mul(params.lane_stride)
+                .ok_or(MetalCommitError::ShapeOverflow("indexed fold lanes"))?;
+            let expected_dense = params
+                .num_columns
+                .checked_mul(params.blocks_per_column)
+                .and_then(|count| count.checked_mul(64))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed fold dense challenges",
+                ))?;
+            let expected_output = params
+                .num_positions
+                .checked_mul(512)
+                .ok_or(MetalCommitError::ShapeOverflow("indexed fold output"))?;
+            let index_params = index.params;
+            if params.num_rows == 0
+                || params.num_columns == 0
+                || params.num_columns > params.lane_stride
+                || params.position_start != 0
+                || params.output_coefficients != expected_output
+                || fold_digits == 0
+                || !(1..=8).contains(&fold_log_basis)
+                || position_chunk_len == 0
+                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
+                || u64::try_from(dense_subring64_challenges.len()).ok() != Some(expected_dense)
+                || index_params.num_rows != params.num_rows
+                || index_params.num_columns != params.num_columns
+                || index_params.lane_stride != params.lane_stride
+                || index_params.num_positions != params.num_positions
+                || index_params.blocks_per_column != params.blocks_per_column
+                || self
+                    .fp128_d512_indexed_subring64_decompose_fold_pipeline
+                    .max_total_threads_per_threadgroup()
+                    < 256
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "fp128 D512 indexed fold geometry is unsupported".into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let packed_challenges = pack_biased_subring64_challenges(dense_subring64_challenges)?;
+            let packed_challenges_buffer = self.shared_buffer_from_slice(&packed_challenges)?;
+            let output_count = usize::try_from(params.output_coefficients)
+                .map_err(|_| MetalCommitError::ShapeOverflow("indexed fold output count"))?;
+            let output_bytes = output_count
+                .checked_mul(size_of::<i32>())
+                .ok_or(MetalCommitError::ShapeOverflow("indexed fold output bytes"))?;
+            let digit_bytes = output_count
+                .checked_mul(fold_digits)
+                .ok_or(MetalCommitError::ShapeOverflow("indexed fold digit bytes"))?;
+            let mut centered_coefficients = vec![0i32; output_count];
+            let output_zero_copy = centered_coefficients
+                .as_ptr()
+                .addr()
+                .is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT)
+                && output_bytes.is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT);
+            let output = if output_zero_copy {
+                self.device.new_buffer_with_bytes_no_copy(
+                    centered_coefficients.as_mut_ptr().cast::<c_void>(),
+                    output_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            } else {
+                self.shared_buffer(output_bytes)?
+            };
+            let digits = self.shared_buffer(digit_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let total_positions = usize::try_from(params.num_positions)
+                .map_err(|_| MetalCommitError::ShapeOverflow("indexed fold positions"))?;
+            let chunk_len = position_chunk_len.min(total_positions);
+            let command_start = Instant::now();
+            let mut commands = Vec::with_capacity(total_positions.div_ceil(chunk_len));
+            for position_start in (0..total_positions).step_by(chunk_len) {
+                let position_end = position_start
+                    .saturating_add(chunk_len)
+                    .min(total_positions);
+                let position_count = position_end - position_start;
+                let mut command_params = index_params;
+                command_params.position_start = u64::try_from(position_start)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("indexed fold position offset"))?;
+                command_params.output_coefficients = params.output_coefficients;
+                command_params.fold_digits = u64::try_from(fold_digits)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("indexed fold digit count"))?;
+                command_params.fold_log_basis = u64::from(fold_log_basis);
+                let output_offset = position_start
+                    .checked_mul(512)
+                    .and_then(|count| count.checked_mul(size_of::<i32>()))
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "indexed fold output offset",
+                    ))?;
+                let digit_offset = position_start
+                    .checked_mul(512)
+                    .and_then(|count| count.checked_mul(fold_digits))
+                    .ok_or(MetalCommitError::ShapeOverflow("indexed fold digit offset"))?;
+                let command = self.queue.new_command_buffer();
+                command.set_label("Akita fp128 D512 indexed packed decompose-fold");
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 D512 indexed packed decompose-fold");
+                encoder.set_compute_pipeline_state(
+                    &self.fp128_d512_indexed_subring64_decompose_fold_pipeline,
+                );
+                encoder.set_buffer(0, Some(&index.records), 0);
+                encoder.set_buffer(1, Some(&index.counts), 0);
+                encoder.set_buffer(2, Some(&packed_challenges_buffer), 0);
+                encoder.set_buffer(3, Some(&output), output_offset as u64);
+                encoder.set_buffer(4, Some(&digits), digit_offset as u64);
+                set_inline_bytes(encoder, 5, &command_params);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(position_count as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                encoder.end_encoding();
+                command.commit();
+                commands.push((command, position_start, position_end));
+            }
+
+            let mut readback_copy = Duration::ZERO;
+            let mut consumer_time = Duration::ZERO;
+            for (command, position_start, position_end) in &commands {
+                command.wait_until_completed();
+                validate_completed_command(command)?;
+                let coefficient_start = position_start * 512;
+                let coefficient_end = position_end * 512;
+                if !output_zero_copy {
+                    let readback_start = Instant::now();
+                    // SAFETY: this completed command initialized the disjoint output range.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            output.contents().cast::<i32>().add(coefficient_start),
+                            centered_coefficients.as_mut_ptr().add(coefficient_start),
+                            coefficient_end - coefficient_start,
+                        );
+                    }
+                    readback_copy += readback_start.elapsed();
+                }
+                let digit_start = coefficient_start * fold_digits;
+                let digit_end = coefficient_end * fold_digits;
+                // SAFETY: this completed command initialized the matching digit range.
+                let digit_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        digits.contents().cast::<i8>().add(digit_start),
+                        digit_end - digit_start,
+                    )
+                };
+                let consumer_start = Instant::now();
+                consume(
+                    *position_start,
+                    &centered_coefficients[coefficient_start..coefficient_end],
+                    digit_slice,
+                );
+                consumer_time += consumer_start.elapsed();
+            }
+            let command_wall = command_start.elapsed();
+            let gpu = commands.first().and_then(|(first, _, _)| {
+                commands
+                    .last()
+                    .and_then(|(last, _, _)| completed_commands_gpu_span(first, last))
+            });
+            let allocation_bytes = output_bytes
+                .checked_add(digit_bytes)
+                .and_then(|bytes| bytes.checked_add(size_of_val(packed_challenges.as_slice())))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "indexed fold allocation bytes",
+                ))?;
+            Ok(PackedDecomposeFoldDispatchOutcome {
+                centered_coefficients,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy,
+                },
+                consumer_time,
                 allocation_bytes,
             })
         })
@@ -2264,9 +3084,91 @@ impl MetalRuntime {
             })
         })
     }
-    pub(crate) fn dispatch_fp128_recursive_commit<const D: usize>(
+    pub(crate) fn prepare_fp128_recursive_commit_matrix<const D: usize>(
         &self,
         matrix: &Buffer,
+        params: RecursiveCommitParams,
+    ) -> Result<RecursiveCommitMatrixNttOutcome, MetalCommitError> {
+        autoreleasepool(|| {
+            let num_rows = usize::try_from(params.num_rows)
+                .map_err(|_| MetalCommitError::ShapeOverflow("recursive commit rows"))?;
+            let num_cols = usize::try_from(params.num_cols)
+                .map_err(|_| MetalCommitError::ShapeOverflow("recursive commit columns"))?;
+            let expected_matrix_rings =
+                num_rows
+                    .checked_mul(num_cols)
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "recursive commit matrix rings",
+                    ))?;
+            let expected_matrix_bytes = expected_matrix_rings
+                .checked_mul(D)
+                .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>()))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "recursive commit matrix bytes",
+                ))?;
+            if params.ring_d != D as u64
+                || params.num_primes != FP128_D512_LINEAR_RELATION_NUM_PRIMES as u64
+                || params.matrix_rings != expected_matrix_rings as u64
+                || matrix.length() < expected_matrix_bytes as u64
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "fp128 recursive commitment matrix geometry is unsupported".into(),
+                ));
+            }
+            let resources = self.recursive_commit_resources(D).ok_or_else(|| {
+                MetalCommitError::UnsupportedShape(format!(
+                    "no recursive commitment resources for D={D}"
+                ))
+            })?;
+
+            let buffer_start = Instant::now();
+            let matrix_ntt_count = expected_matrix_rings
+                .checked_mul(D)
+                .and_then(|count| count.checked_mul(FP128_D512_LINEAR_RELATION_NUM_PRIMES))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "recursive commit transformed matrix",
+                ))?;
+            let matrix_ntt_bytes = matrix_ntt_count.checked_mul(size_of::<i32>()).ok_or(
+                MetalCommitError::ShapeOverflow("recursive commit transformed matrix bytes"),
+            )?;
+            let matrix_ntt = self.private_buffer(matrix_ntt_bytes)?;
+            let buffer_setup = buffer_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 recursive commitment matrix NTT");
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_label("Akita recursive commitment matrix NTT");
+            encoder.set_compute_pipeline_state(&self.fp128_recursive_commit_matrix_ntt_pipeline);
+            encoder.set_buffer(0, Some(matrix), 0);
+            encoder.set_buffer(1, Some(&matrix_ntt), 0);
+            encoder.set_buffer(2, Some(&resources.primes), 0);
+            encoder.set_buffer(3, Some(&resources.limb_weights), 0);
+            encoder.set_buffer(4, Some(&resources.field_moduli), 0);
+            encoder.set_buffer(5, Some(&resources.fwd_twiddles), 0);
+            encoder.set_buffer(6, Some(&resources.psi_pows), 0);
+            set_inline_bytes(encoder, 7, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(params.matrix_rings * params.num_primes, 1, 1),
+                MTLSize::new(params.ring_d, 1, 1),
+            );
+            encoder.end_encoding();
+            let (command_wall, gpu) = complete_command(command)?;
+            Ok(RecursiveCommitMatrixNttOutcome {
+                buffer: matrix_ntt,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: Duration::ZERO,
+                },
+                allocation_bytes: matrix_ntt_bytes,
+            })
+        })
+    }
+
+    pub(crate) fn dispatch_fp128_recursive_commit<const D: usize>(
+        &self,
+        matrix_ntt: &Buffer,
         digits: &[i8],
         params: RecursiveCommitParams,
     ) -> Result<RecursiveCommitDispatchOutcome, MetalCommitError> {
@@ -2293,11 +3195,12 @@ impl MetalRuntime {
                 .checked_mul(num_rows)
                 .and_then(|count| count.checked_mul(D))
                 .ok_or(MetalCommitError::ShapeOverflow("recursive commit output"))?;
-            let expected_matrix_bytes = expected_matrix_rings
+            let expected_matrix_ntt_bytes = expected_matrix_rings
                 .checked_mul(D)
-                .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>()))
+                .and_then(|count| count.checked_mul(FP128_D512_LINEAR_RELATION_NUM_PRIMES))
+                .and_then(|count| count.checked_mul(size_of::<i32>()))
                 .ok_or(MetalCommitError::ShapeOverflow(
-                    "recursive commit matrix bytes",
+                    "recursive commit transformed matrix bytes",
                 ))?;
             let expected_block_groups =
                 num_blocks.div_ceil(FP128_RECURSIVE_COMMIT_BLOCKS_PER_GROUP);
@@ -2308,7 +3211,7 @@ impl MetalRuntime {
                 || params.matrix_rings != expected_matrix_rings as u64
                 || params.output_coefficients != expected_output as u64
                 || digits.len() < expected_source_bytes
-                || matrix.length() < expected_matrix_bytes as u64
+                || matrix_ntt.length() < expected_matrix_ntt_bytes as u64
                 || !self.supports_fp128_recursive_commit::<D>(
                     num_blocks,
                     num_rows,
@@ -2328,16 +3231,6 @@ impl MetalRuntime {
 
             let buffer_start = Instant::now();
             let digit_buffer = self.shared_slice_buffer(digits)?;
-            let matrix_ntt_count = expected_matrix_rings
-                .checked_mul(D)
-                .and_then(|count| count.checked_mul(FP128_D512_LINEAR_RELATION_NUM_PRIMES))
-                .ok_or(MetalCommitError::ShapeOverflow(
-                    "recursive commit transformed matrix",
-                ))?;
-            let matrix_ntt_bytes = matrix_ntt_count.checked_mul(size_of::<i32>()).ok_or(
-                MetalCommitError::ShapeOverflow("recursive commit transformed matrix bytes"),
-            )?;
-            let matrix_ntt = self.private_buffer(matrix_ntt_bytes)?;
             let residue_count = expected_output
                 .checked_mul(FP128_D512_LINEAR_RELATION_NUM_PRIMES)
                 .ok_or(MetalCommitError::ShapeOverflow("recursive commit residues"))?;
@@ -2353,23 +3246,6 @@ impl MetalRuntime {
 
             let command = self.queue.new_command_buffer();
             command.set_label("Akita fp128 recursive witness commitment");
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_label("Akita recursive commitment matrix NTT");
-            encoder.set_compute_pipeline_state(&self.fp128_recursive_commit_matrix_ntt_pipeline);
-            encoder.set_buffer(0, Some(matrix), 0);
-            encoder.set_buffer(1, Some(&matrix_ntt), 0);
-            encoder.set_buffer(2, Some(&resources.primes), 0);
-            encoder.set_buffer(3, Some(&resources.limb_weights), 0);
-            encoder.set_buffer(4, Some(&resources.field_moduli), 0);
-            encoder.set_buffer(5, Some(&resources.fwd_twiddles), 0);
-            encoder.set_buffer(6, Some(&resources.psi_pows), 0);
-            set_inline_bytes(encoder, 7, &params);
-            encoder.dispatch_thread_groups(
-                MTLSize::new(params.matrix_rings * params.num_primes, 1, 1),
-                MTLSize::new(params.ring_d, 1, 1),
-            );
-            encoder.end_encoding();
-
             let encoder = command.new_compute_command_encoder();
             encoder.set_label("Akita recursive commitment exact matvec");
             encoder.set_compute_pipeline_state(&self.fp128_recursive_commit_matvec_pipeline);
@@ -2418,9 +3294,8 @@ impl MetalRuntime {
                     .to_vec()
             };
             let readback_copy = readback_start.elapsed();
-            let allocation_bytes = matrix_ntt_bytes
-                .checked_add(residue_bytes)
-                .and_then(|bytes| bytes.checked_add(output_bytes))
+            let allocation_bytes = residue_bytes
+                .checked_add(output_bytes)
                 .and_then(|bytes| {
                     bytes.checked_add(if digit_buffer.zero_copy {
                         0
@@ -2433,6 +3308,357 @@ impl MetalRuntime {
                 ))?;
             Ok(RecursiveCommitDispatchOutcome {
                 coefficients,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy,
+                },
+                allocation_bytes,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_fp128_blake2b_sumcheck_challenge(
+        &self,
+        chaining_value: &[u8; 64],
+        prior_squeezed_bytes: usize,
+        claim: Option<Fp128Limbs>,
+        coefficients: &[Fp128Limbs],
+    ) -> Result<Blake2bSumcheckChallengeOutcome, MetalCommitError> {
+        if coefficients.is_empty() || coefficients.len() > 4 {
+            return Err(MetalCommitError::UnsupportedShape(
+                "Blake2b sumcheck challenge requires one to four coefficients".into(),
+            ));
+        }
+        autoreleasepool(|| {
+            let include_claim = claim.is_some();
+            let state = self.shared_buffer_from_slice(chaining_value)?;
+            let claim = self.shared_buffer_from_slice(&[claim.unwrap_or_default()])?;
+            let coefficients = self.shared_buffer_from_slice(coefficients)?;
+            let challenge = self.shared_buffer(size_of::<Fp128Limbs>())?;
+            let params = Blake2bSumcheckChallengeParams {
+                include_claim: u64::from(include_claim),
+                coefficient_count: coefficients.length() / 16,
+                prior_squeezed_bytes: u64::try_from(prior_squeezed_bytes)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("Blake2b prior squeeze length"))?,
+                reserved: 0,
+            };
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 Blake2b sumcheck challenge");
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.fp128_blake2b_sumcheck_challenge_pipeline);
+            encoder.set_buffer(0, Some(&state), 0);
+            encoder.set_buffer(1, Some(&claim), 0);
+            encoder.set_buffer(2, Some(&coefficients), 0);
+            encoder.set_buffer(3, Some(&challenge), 0);
+            set_inline_bytes(encoder, 4, &params);
+            encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            encoder.end_encoding();
+            let _ = complete_command(command)?;
+
+            // SAFETY: both shared output buffers were initialized by the completed kernel.
+            let challenge = unsafe { *challenge.contents().cast::<Fp128Limbs>() };
+            let mut next_chaining_value = [0u8; 64];
+            // SAFETY: `state` is a 64-byte shared buffer valid for the destination length.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.contents().cast::<u8>(),
+                    next_chaining_value.as_mut_ptr(),
+                    next_chaining_value.len(),
+                );
+            }
+            Ok(Blake2bSumcheckChallengeOutcome {
+                challenge,
+                chaining_value: next_chaining_value,
+            })
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the resident session keeps proof geometry and transcript state explicit"
+    )]
+    #[cfg(test)]
+    pub(crate) fn dispatch_fp128_direct_range_resident(
+        &self,
+        session: &mut DirectRangeSession,
+        equality_schedule: &[(Vec<Fp128Limbs>, Vec<Fp128Limbs>)],
+        basis: usize,
+        chaining_value: &[u8; 64],
+        prior_squeezed_bytes: usize,
+    ) -> Result<DirectRangeResidentOutcome, MetalCommitError> {
+        let num_rounds = equality_schedule.len();
+        if num_rounds == 0
+            || num_rounds != session.current_len.trailing_zeros() as usize
+            || session.current_table.is_some()
+            || session.rounds_folded != 0
+        {
+            return Err(MetalCommitError::UnsupportedShape(
+                "resident direct range session has malformed initial state".into(),
+            ));
+        }
+        let coefficient_count = match basis {
+            4 => 2usize,
+            8 => 4usize,
+            _ => {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "resident direct range proof supports basis four or eight".into(),
+                ))
+            }
+        };
+
+        autoreleasepool(|| {
+            let setup_start = Instant::now();
+            let equality_buffers = equality_schedule
+                .iter()
+                .map(|(first, second)| {
+                    Ok((
+                        self.shared_buffer_from_slice(first)?,
+                        self.shared_buffer_from_slice(second)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, MetalCommitError>>()?;
+            let round_output_bytes = num_rounds
+                .checked_mul(FP128_DIRECT_RANGE_STORED_COEFFICIENTS)
+                .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>()))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct range round outputs",
+                ))?;
+            let challenge_bytes = num_rounds.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+                MetalCommitError::ShapeOverflow("resident direct range challenges"),
+            )?;
+            let round_outputs = self.shared_buffer(round_output_bytes)?;
+            let challenges = self.shared_buffer(challenge_bytes)?;
+            let state = self.shared_buffer_from_slice(chaining_value)?;
+            let claim = self.shared_buffer_from_slice(&[Fp128Limbs::default()])?;
+            let buffer_setup = setup_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 resident direct range proof");
+            let (first, second) = &equality_schedule[0];
+            let mut params = direct_range_params(
+                session.live_len,
+                session.current_len,
+                session.current_live_len,
+                session.current_live_len,
+                first,
+                second,
+                basis,
+            )?;
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_label("Akita fp128 resident direct range initial partials");
+            encoder.set_compute_pipeline_state(&self.fp128_direct_range_initial_pipeline);
+            encoder.set_buffer(0, Some(&session.compact_digits), 0);
+            encoder.set_buffer(1, Some(&equality_buffers[0].0), 0);
+            encoder.set_buffer(2, Some(&equality_buffers[0].1), 0);
+            encoder.set_buffer(3, Some(&session.partials), 0);
+            set_inline_bytes(encoder, 4, &params);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(params.workgroups, 1, 1),
+                MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+            );
+            encoder.end_encoding();
+            encode_direct_range_reduction_at_offset(
+                command,
+                &self.fp128_direct_range_reduce_pipeline,
+                &session.partials,
+                &round_outputs,
+                0,
+                &params,
+            );
+
+            let mut current_len = session.current_len;
+            let mut current_live_len = session.current_live_len;
+            let mut current_table = session.current_table;
+            let mut rounds_folded = session.rounds_folded;
+            for round in 0..num_rounds {
+                let transcript_params = Blake2bSumcheckChallengeParams {
+                    include_claim: u64::from(round == 0),
+                    coefficient_count: coefficient_count as u64,
+                    prior_squeezed_bytes: if round == 0 {
+                        u64::try_from(prior_squeezed_bytes).map_err(|_| {
+                            MetalCommitError::ShapeOverflow(
+                                "resident direct range prior squeeze length",
+                            )
+                        })?
+                    } else {
+                        32
+                    },
+                    reserved: 0,
+                };
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 resident direct range challenge");
+                encoder.set_compute_pipeline_state(&self.fp128_blake2b_sumcheck_challenge_pipeline);
+                encoder.set_buffer(0, Some(&state), 0);
+                encoder.set_buffer(1, Some(&claim), 0);
+                encoder.set_buffer(
+                    2,
+                    Some(&round_outputs),
+                    (round * FP128_DIRECT_RANGE_STORED_COEFFICIENTS * size_of::<Fp128Limbs>())
+                        as u64,
+                );
+                encoder.set_buffer(
+                    3,
+                    Some(&challenges),
+                    (round * size_of::<Fp128Limbs>()) as u64,
+                );
+                set_inline_bytes(encoder, 4, &transcript_params);
+                encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder.end_encoding();
+
+                let next_len = current_len / 2;
+                let next_live_len = current_live_len.div_ceil(2);
+                if next_len == 1 {
+                    let table = current_table.ok_or_else(|| {
+                        MetalCommitError::UnsupportedShape(
+                            "resident direct range compact prefix reaches final fold".into(),
+                        )
+                    })?;
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 resident direct range final fold");
+                    encoder.set_compute_pipeline_state(&self.fp128_direct_range_finalize_pipeline);
+                    encoder.set_buffer(0, Some(&session.tables[table]), 0);
+                    encoder.set_buffer(1, Some(&session.final_output), 0);
+                    encoder.set_buffer(
+                        2,
+                        Some(&challenges),
+                        (round * size_of::<Fp128Limbs>()) as u64,
+                    );
+                    set_inline_bytes(encoder, 3, &(current_live_len as u64));
+                    encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                    encoder.end_encoding();
+                    current_len = 1;
+                    current_live_len = next_live_len;
+                    break;
+                }
+
+                let (first, second) = &equality_schedule[round + 1];
+                params = direct_range_params(
+                    session.live_len,
+                    next_len,
+                    next_live_len,
+                    current_live_len,
+                    first,
+                    second,
+                    basis,
+                )?;
+                let output_table = current_table.map_or(0, |current| 1 - current);
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 resident direct range fold and partials");
+                if let Some(table) = current_table {
+                    encoder
+                        .set_compute_pipeline_state(&self.fp128_direct_range_field_fold_pipeline);
+                    encoder.set_buffer(0, Some(&session.tables[table]), 0);
+                    encoder.set_buffer(
+                        5,
+                        Some(&challenges),
+                        (round * size_of::<Fp128Limbs>()) as u64,
+                    );
+                } else {
+                    let prefix_size = 1usize
+                        .checked_shl(u32::try_from(rounds_folded + 1).map_err(|_| {
+                            MetalCommitError::ShapeOverflow(
+                                "resident direct range compact prefix width",
+                            )
+                        })?)
+                        .ok_or(MetalCommitError::ShapeOverflow(
+                            "resident direct range compact prefix size",
+                        ))?;
+                    params.prefix_size = prefix_size as u64;
+                    params.materialize_prefix =
+                        u64::from(rounds_folded + 1 >= session.compact_prefix_rounds);
+                    params.resident_challenges = 1;
+                    encoder
+                        .set_compute_pipeline_state(&self.fp128_direct_range_compact_fold_pipeline);
+                    encoder.set_buffer(0, Some(&session.compact_digits), 0);
+                    encoder.set_buffer(5, Some(&challenges), 0);
+                }
+                encoder.set_buffer(1, Some(&session.tables[output_table]), 0);
+                encoder.set_buffer(2, Some(&equality_buffers[round + 1].0), 0);
+                encoder.set_buffer(3, Some(&equality_buffers[round + 1].1), 0);
+                encoder.set_buffer(4, Some(&session.partials), 0);
+                set_inline_bytes(encoder, 6, &params);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(params.workgroups, 1, 1),
+                    MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+                );
+                encoder.end_encoding();
+                encode_direct_range_reduction_at_offset(
+                    command,
+                    &self.fp128_direct_range_reduce_pipeline,
+                    &session.partials,
+                    &round_outputs,
+                    ((round + 1) * FP128_DIRECT_RANGE_STORED_COEFFICIENTS * size_of::<Fp128Limbs>())
+                        as u64,
+                    &params,
+                );
+
+                if current_table.is_some() || rounds_folded + 1 >= session.compact_prefix_rounds {
+                    current_table = Some(output_table);
+                }
+                current_len = next_len;
+                current_live_len = next_live_len;
+                rounds_folded += 1;
+            }
+
+            let (command_wall, gpu) = complete_command(command)?;
+            let readback_start = Instant::now();
+            // SAFETY: the completed command initialized all round and challenge outputs.
+            let round_values = unsafe {
+                std::slice::from_raw_parts(
+                    round_outputs.contents().cast::<Fp128Limbs>(),
+                    num_rounds * FP128_DIRECT_RANGE_STORED_COEFFICIENTS,
+                )
+            };
+            let round_coefficients = round_values
+                .chunks_exact(FP128_DIRECT_RANGE_STORED_COEFFICIENTS)
+                .map(|values| std::array::from_fn(|index| values[index]))
+                .collect::<Vec<_>>();
+            // SAFETY: the completed command initialized exactly `num_rounds` challenges.
+            let challenge_values = unsafe {
+                std::slice::from_raw_parts(challenges.contents().cast::<Fp128Limbs>(), num_rounds)
+            }
+            .to_vec();
+            // SAFETY: the completed command initialized the final scalar output.
+            let final_evaluation = unsafe { *session.final_output.contents().cast::<Fp128Limbs>() };
+            let mut next_chaining_value = [0u8; 64];
+            // SAFETY: `state` remains a 64-byte shared buffer after command completion.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.contents().cast::<u8>(),
+                    next_chaining_value.as_mut_ptr(),
+                    next_chaining_value.len(),
+                );
+            }
+            let readback_copy = readback_start.elapsed();
+            session.current_len = current_len;
+            session.current_live_len = current_live_len;
+            session.current_table = current_table;
+            session.rounds_folded = rounds_folded;
+            let equality_bytes = equality_schedule
+                .iter()
+                .try_fold(0usize, |bytes, (first, second)| {
+                    bytes
+                        .checked_add(size_of_val(first.as_slice()))
+                        .and_then(|sum| sum.checked_add(size_of_val(second.as_slice())))
+                })
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct range equality buffers",
+                ))?;
+            let allocation_bytes = equality_bytes
+                .checked_add(round_output_bytes)
+                .and_then(|bytes| bytes.checked_add(challenge_bytes))
+                .and_then(|bytes| bytes.checked_add(64 + size_of::<Fp128Limbs>()))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct range dispatch allocation bytes",
+                ))?;
+            Ok(DirectRangeResidentOutcome {
+                round_coefficients,
+                challenges: challenge_values,
+                final_evaluation,
+                chaining_value: next_chaining_value,
                 timings: DispatchTimings {
                     buffer_setup,
                     command_wall,
@@ -3567,6 +4793,552 @@ impl MetalRuntime {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the resident suffix boundary keeps transcript and proof state explicit"
+    )]
+    pub(crate) fn dispatch_fp128_direct_relation_resident_suffix(
+        &self,
+        session: &mut DirectRelationSession,
+        prefix_challenges: &[Fp128Limbs],
+        equality_schedule: &[DirectRelationResidentEqRound],
+        initial_round: DirectRelationRoundData<'_>,
+        chaining_value: &[u8; 64],
+        prior_squeezed_bytes: usize,
+    ) -> Result<DirectRelationResidentOutcome, MetalCommitError> {
+        let suffix_rounds = equality_schedule.len();
+        if suffix_rounds == 0
+            || prefix_challenges.len() != session.rounds_folded
+            || session.rounds_folded != 2
+            || suffix_rounds != session.current_len.trailing_zeros() as usize
+            || session.current_table.is_some()
+            || session.compact_prefix_rounds != 3
+            || initial_round.alpha.is_empty()
+            || initial_round.e_first != equality_schedule[0].e_first
+            || initial_round.e_second != equality_schedule[0].e_second
+        {
+            return Err(MetalCommitError::UnsupportedShape(
+                "resident direct relation suffix has malformed initial state".into(),
+            ));
+        }
+        let _ = direct_relation_params(
+            session,
+            session.current_len,
+            session.current_lane_count,
+            false,
+            &initial_round,
+        )?;
+        let additional_schedule = direct_relation_additional_fold_schedule(
+            initial_round.additional_pairs,
+            suffix_rounds.saturating_sub(1),
+        )?;
+
+        autoreleasepool(|| {
+            let setup_start = Instant::now();
+            let equality_buffers = equality_schedule
+                .iter()
+                .map(|round| {
+                    Ok((
+                        self.shared_buffer_from_slice(&round.e_first)?,
+                        self.shared_buffer_from_slice(&round.e_second)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, MetalCommitError>>()?;
+            let taus = equality_schedule
+                .iter()
+                .map(|round| round.tau)
+                .collect::<Vec<_>>();
+            let tau_buffer = self.shared_buffer_from_slice(&taus)?;
+
+            let alpha_bytes = size_of_val(initial_round.alpha);
+            let alpha_tables = [
+                self.shared_buffer_from_slice(initial_round.alpha)?,
+                self.private_buffer(alpha_bytes.max(size_of::<Fp128Limbs>()))?,
+            ];
+            let scalar_values = vec![initial_round.scalars; suffix_rounds];
+            let scalars = self.shared_buffer_from_slice(&scalar_values)?;
+
+            let zero_pair = DirectRelationAdditionalPair {
+                parent: 0,
+                reserved: 0,
+                linear: [Fp128Limbs::default(); 2],
+                binary: [Fp128Limbs::default(); 2],
+            };
+            let initial_pair_storage = if initial_round.additional_pairs.is_empty() {
+                std::slice::from_ref(&zero_pair)
+            } else {
+                initial_round.additional_pairs
+            };
+            let pair_capacity = initial_pair_storage.len();
+            let pair_bytes = pair_capacity
+                .checked_mul(size_of::<DirectRelationAdditionalPair>())
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct relation additional pairs",
+                ))?;
+            let additional_pairs = [
+                self.shared_buffer_from_slice(initial_pair_storage)?,
+                self.private_buffer(pair_bytes)?,
+            ];
+            let additional_mappings = additional_schedule
+                .iter()
+                .map(|mappings| {
+                    if mappings.is_empty() {
+                        Ok(None)
+                    } else {
+                        self.shared_buffer_from_slice(mappings).map(Some)
+                    }
+                })
+                .collect::<Result<Vec<_>, MetalCommitError>>()?;
+
+            let total_rounds = prefix_challenges.len().checked_add(suffix_rounds).ok_or(
+                MetalCommitError::ShapeOverflow("resident direct relation challenge count"),
+            )?;
+            let mut challenge_values = vec![Fp128Limbs::default(); total_rounds];
+            challenge_values[..prefix_challenges.len()].copy_from_slice(prefix_challenges);
+            let challenges = self.shared_buffer_from_slice(&challenge_values)?;
+            let proof_coefficient_count =
+                suffix_rounds
+                    .checked_mul(3)
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "resident direct relation proof coefficients",
+                    ))?;
+            let proof_bytes = proof_coefficient_count
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct relation proof bytes",
+                ))?;
+            let proof_coefficients = self.shared_buffer(proof_bytes)?;
+            let count_bytes = suffix_rounds.checked_mul(size_of::<u32>()).ok_or(
+                MetalCommitError::ShapeOverflow("resident direct relation coefficient counts"),
+            )?;
+            let coefficient_counts = self.shared_buffer(count_bytes)?;
+            let state = self.shared_buffer_from_slice(chaining_value)?;
+            let buffer_setup = setup_start.elapsed();
+
+            let command = self.queue.new_command_buffer();
+            command.set_label("Akita fp128 resident direct relation suffix");
+            let mut current_len = session.current_len;
+            let mut current_live_len = session.current_live_len;
+            let mut current_live_lane_count = initial_round.live_lane_count;
+            let mut current_alpha_len = initial_round.alpha.len();
+            let mut current_alpha_table = 0usize;
+            let mut current_additional_table = 0usize;
+            let mut current_additional_count = initial_round.additional_pairs.len();
+            let mut current_table = session.current_table;
+            let mut current_lane_weight_table = session.current_lane_weight_table;
+            let mut current_lane_count = session.current_lane_count;
+            let mut rounds_folded = session.rounds_folded;
+            let had_linear_terms = session.linear_mode != 0;
+
+            for suffix_round in 0..suffix_rounds {
+                session.rounds_folded = rounds_folded;
+                session.current_live_len = current_live_len;
+                let round_index = prefix_challenges.len() + suffix_round;
+                let challenge_offset = round_index.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+                    MetalCommitError::ShapeOverflow("resident direct relation challenge offset"),
+                )? as u64;
+                let proof_offset = suffix_round
+                    .checked_mul(3 * size_of::<Fp128Limbs>())
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "resident direct relation proof offset",
+                    ))? as u64;
+                let count_offset = suffix_round.checked_mul(size_of::<u32>()).ok_or(
+                    MetalCommitError::ShapeOverflow("resident direct relation count offset"),
+                )? as u64;
+                let transcript_params = DirectRelationTranscriptParams {
+                    prior_squeezed_bytes: if suffix_round == 0 {
+                        u64::try_from(prior_squeezed_bytes).map_err(|_| {
+                            MetalCommitError::ShapeOverflow(
+                                "resident direct relation prior squeeze length",
+                            )
+                        })?
+                    } else {
+                        32
+                    },
+                    has_additional: u64::from(current_additional_count != 0),
+                };
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 resident direct relation challenge");
+                encoder.set_compute_pipeline_state(
+                    &self.fp128_blake2b_relation_sumcheck_round_pipeline,
+                );
+                encoder.set_buffer(0, Some(&state), 0);
+                encoder.set_buffer(1, Some(&session.round_output), 0);
+                encoder.set_buffer(2, Some(&session.additional_output), 0);
+                encoder.set_buffer(3, Some(&proof_coefficients), proof_offset);
+                encoder.set_buffer(4, Some(&coefficient_counts), count_offset);
+                encoder.set_buffer(5, Some(&challenges), challenge_offset);
+                set_inline_bytes(encoder, 6, &transcript_params);
+                encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder.end_encoding();
+
+                let next_len = current_len / 2;
+                let next_live_len = current_live_len.div_ceil(2);
+                self.encode_direct_relation_linear_fold_from_buffer(
+                    command,
+                    session,
+                    &challenges,
+                    challenge_offset,
+                )?;
+                if next_len == 1 {
+                    let table = current_table.ok_or_else(|| {
+                        MetalCommitError::UnsupportedShape(
+                            "resident direct relation compact suffix reaches final fold".into(),
+                        )
+                    })?;
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 resident direct relation final fold");
+                    encoder.set_compute_pipeline_state(&self.fp128_direct_range_finalize_pipeline);
+                    encoder.set_buffer(0, Some(&session.tables[table]), 0);
+                    encoder.set_buffer(1, Some(&session.final_output), 0);
+                    encoder.set_buffer(2, Some(&challenges), challenge_offset);
+                    set_inline_bytes(encoder, 3, &(current_live_len as u64));
+                    encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                    encoder.end_encoding();
+                    if had_linear_terms {
+                        let encoder = command.new_blit_command_encoder();
+                        encoder.copy_from_buffer(
+                            &session.linear_tables[session.current_linear_table],
+                            0,
+                            &session.linear_final_output,
+                            0,
+                            size_of::<Fp128Limbs>() as u64,
+                        );
+                        encoder.end_encoding();
+                    }
+                    current_len = 1;
+                    current_live_len = next_live_len;
+                    rounds_folded += 1;
+                    break;
+                }
+
+                let fold_lane_weights = rounds_folded >= session.coefficient_rounds;
+                let next_alpha_len = if fold_lane_weights {
+                    current_alpha_len
+                } else {
+                    current_alpha_len / 2
+                };
+                let next_live_lane_count = if fold_lane_weights {
+                    current_live_lane_count.div_ceil(2)
+                } else {
+                    current_live_lane_count
+                };
+                let next_lane_count = if fold_lane_weights {
+                    current_lane_count / 2
+                } else {
+                    current_lane_count
+                };
+                let next_lane_weight_table = if fold_lane_weights {
+                    1 - current_lane_weight_table
+                } else {
+                    current_lane_weight_table
+                };
+
+                if !fold_lane_weights {
+                    let output_alpha_table = 1 - current_alpha_table;
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 resident direct relation alpha fold");
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_alpha_fold_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&alpha_tables[current_alpha_table]), 0);
+                    encoder.set_buffer(1, Some(&alpha_tables[output_alpha_table]), 0);
+                    encoder.set_buffer(2, Some(&challenges), challenge_offset);
+                    set_inline_bytes(encoder, 3, &(next_alpha_len as u64));
+                    encoder.dispatch_threads(
+                        MTLSize::new(next_alpha_len as u64, 1, 1),
+                        MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+                    );
+                    encoder.end_encoding();
+                    current_alpha_table = output_alpha_table;
+                }
+
+                let scalar_offset = suffix_round
+                    .checked_mul(size_of::<DirectRelationScalars>())
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "resident direct relation scalar offset",
+                    ))? as u64;
+                let next_scalar_offset = (suffix_round + 1)
+                    .checked_mul(size_of::<DirectRelationScalars>())
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "resident direct relation next scalar offset",
+                    ))? as u64;
+                let tau_offset = suffix_round.checked_mul(size_of::<Fp128Limbs>()).ok_or(
+                    MetalCommitError::ShapeOverflow("resident direct relation tau offset"),
+                )? as u64;
+                let next_tau_offset = (suffix_round + 1)
+                    .checked_mul(size_of::<Fp128Limbs>())
+                    .ok_or(MetalCommitError::ShapeOverflow(
+                        "resident direct relation next tau offset",
+                    ))? as u64;
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 resident direct relation scalar advance");
+                encoder.set_compute_pipeline_state(
+                    &self.fp128_direct_relation_scalar_advance_pipeline,
+                );
+                encoder.set_buffer(0, Some(&scalars), scalar_offset);
+                encoder.set_buffer(1, Some(&challenges), challenge_offset);
+                encoder.set_buffer(2, Some(&tau_buffer), tau_offset);
+                encoder.set_buffer(3, Some(&tau_buffer), next_tau_offset);
+                encoder.set_buffer(4, Some(&scalars), next_scalar_offset);
+                encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder.end_encoding();
+
+                let next_mappings = &additional_schedule[suffix_round];
+                let next_additional_count = next_mappings.len();
+                if current_additional_count != 0 {
+                    let mapping_buffer =
+                        additional_mappings[suffix_round].as_ref().ok_or_else(|| {
+                            MetalCommitError::UnsupportedShape(
+                                "resident direct relation additional topology vanished".into(),
+                            )
+                        })?;
+                    let output_additional_table = 1 - current_additional_table;
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 resident direct relation additional fold");
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_additional_fold_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&additional_pairs[current_additional_table]), 0);
+                    encoder.set_buffer(1, Some(&additional_pairs[output_additional_table]), 0);
+                    encoder.set_buffer(2, Some(mapping_buffer), 0);
+                    encoder.set_buffer(3, Some(&challenges), challenge_offset);
+                    set_inline_bytes(encoder, 4, &(next_additional_count as u64));
+                    encoder.dispatch_threads(
+                        MTLSize::new(next_additional_count as u64, 1, 1),
+                        MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+                    );
+                    encoder.end_encoding();
+                    current_additional_table = output_additional_table;
+                }
+
+                let next_eq = &equality_schedule[suffix_round + 1];
+                let additional_parents_in_range = next_mappings
+                    .last()
+                    .is_none_or(|mapping| mapping.parent < (next_len / 2) as u64);
+                let mut params = direct_relation_params_shape(
+                    session,
+                    next_len,
+                    next_lane_count,
+                    fold_lane_weights,
+                    next_eq.e_first.len(),
+                    next_eq.e_second.len(),
+                    next_alpha_len,
+                    next_live_lane_count,
+                    next_additional_count,
+                    additional_parents_in_range,
+                )?;
+                let output_table = current_table.map_or(0, |current| 1 - current);
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita fp128 resident direct relation fold and partials");
+                if let Some(table) = current_table {
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_field_fold_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&session.tables[table]), 0);
+                    encoder.set_buffer(12, Some(&challenges), challenge_offset);
+                    encoder.set_buffer(
+                        15,
+                        Some(&session.lane_weight_tables[current_lane_weight_table]),
+                        0,
+                    );
+                } else {
+                    params.prefix_size = 1u64 << (rounds_folded + 1);
+                    params.materialize_prefix =
+                        u64::from(rounds_folded + 1 >= session.compact_prefix_rounds);
+                    params.resident_challenges = 1;
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_direct_relation_compact_fold_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&session.compact_digits), 0);
+                    encoder.set_buffer(12, Some(&challenges), 0);
+                }
+                encoder.set_buffer(1, Some(&session.tables[output_table]), 0);
+                encoder.set_buffer(2, Some(&equality_buffers[suffix_round + 1].0), 0);
+                encoder.set_buffer(3, Some(&equality_buffers[suffix_round + 1].1), 0);
+                encoder.set_buffer(4, Some(&alpha_tables[current_alpha_table]), 0);
+                encoder.set_buffer(
+                    5,
+                    Some(&session.lane_weight_tables[next_lane_weight_table]),
+                    0,
+                );
+                encoder.set_buffer(
+                    6,
+                    Some(&session.linear_tables[session.current_linear_table]),
+                    0,
+                );
+                encoder.set_buffer(7, Some(&session.linear_source_lane_offsets), 0);
+                encoder.set_buffer(8, Some(&session.lane_offsets), 0);
+                encoder.set_buffer(9, Some(&session.lane_segments), 0);
+                encoder.set_buffer(10, Some(&session.linear_segments), 0);
+                encoder.set_buffer(11, Some(&session.partials), 0);
+                encoder.set_buffer(13, Some(&scalars), next_scalar_offset);
+                set_inline_bytes(encoder, 14, &params);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(params.workgroups, 1, 1),
+                    MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+                );
+                encoder.end_encoding();
+                encode_direct_relation_reduction(
+                    command,
+                    &self.fp128_direct_range_reduce_pipeline,
+                    &session.partials,
+                    &session.round_output,
+                    &params,
+                );
+
+                if next_additional_count != 0 {
+                    let encoder = command.new_compute_command_encoder();
+                    encoder.set_label("Akita fp128 resident direct relation additional round");
+                    if current_table.is_none() {
+                        encoder.set_compute_pipeline_state(
+                            &self.fp128_direct_relation_additional_compact_pipeline,
+                        );
+                        encoder.set_buffer(0, Some(&session.compact_digits), 0);
+                        encoder.set_buffer(1, Some(&challenges), 0);
+                        encoder.set_buffer(2, Some(&additional_pairs[current_additional_table]), 0);
+                        encoder.set_buffer(3, Some(&session.partials), 0);
+                        encoder.set_buffer(4, Some(&scalars), next_scalar_offset);
+                        set_inline_bytes(encoder, 5, &params);
+                    } else {
+                        encoder.set_compute_pipeline_state(
+                            &self.fp128_direct_relation_additional_field_pipeline,
+                        );
+                        encoder.set_buffer(0, Some(&session.tables[output_table]), 0);
+                        encoder.set_buffer(1, Some(&additional_pairs[current_additional_table]), 0);
+                        encoder.set_buffer(2, Some(&session.partials), 0);
+                        encoder.set_buffer(3, Some(&scalars), next_scalar_offset);
+                        set_inline_bytes(encoder, 4, &params);
+                    }
+                    encoder.dispatch_thread_groups(
+                        MTLSize::new(params.additional_workgroups, 1, 1),
+                        MTLSize::new(FP128_DIRECT_RANGE_THREADS as u64, 1, 1),
+                    );
+                    encoder.end_encoding();
+                    let mut reduction_params = params;
+                    reduction_params.workgroups = params.additional_workgroups;
+                    encode_direct_relation_reduction(
+                        command,
+                        &self.fp128_direct_range_reduce_pipeline,
+                        &session.partials,
+                        &session.additional_output,
+                        &reduction_params,
+                    );
+                }
+
+                if current_table.is_some() || rounds_folded + 1 >= session.compact_prefix_rounds {
+                    current_table = Some(output_table);
+                }
+                current_len = next_len;
+                current_live_len = next_live_len;
+                current_live_lane_count = next_live_lane_count;
+                current_alpha_len = next_alpha_len;
+                current_additional_count = next_additional_count;
+                current_lane_weight_table = next_lane_weight_table;
+                current_lane_count = next_lane_count;
+                rounds_folded += 1;
+            }
+
+            let (command_wall, gpu) = complete_command(command)?;
+            let readback_start = Instant::now();
+            // SAFETY: the completed command initialized all suffix proof slots.
+            let proof_values = unsafe {
+                std::slice::from_raw_parts(
+                    proof_coefficients.contents().cast::<Fp128Limbs>(),
+                    proof_coefficient_count,
+                )
+            };
+            let round_coefficients = proof_values
+                .chunks_exact(3)
+                .map(|values| std::array::from_fn(|index| values[index]))
+                .collect::<Vec<_>>();
+            // SAFETY: the completed command initialized one count per suffix round.
+            let coefficient_counts = unsafe {
+                std::slice::from_raw_parts(
+                    coefficient_counts.contents().cast::<u32>(),
+                    suffix_rounds,
+                )
+            }
+            .iter()
+            .map(|&count| count as usize)
+            .collect::<Vec<_>>();
+            // SAFETY: the completed command initialized every suffix challenge.
+            let challenge_values = unsafe {
+                std::slice::from_raw_parts(challenges.contents().cast::<Fp128Limbs>(), total_rounds)
+            }[prefix_challenges.len()..]
+                .to_vec();
+            // SAFETY: the final fold initialized both scalar outputs when present.
+            let final_evaluation = unsafe { *session.final_output.contents().cast() };
+            let final_linear_evaluation = if had_linear_terms {
+                unsafe { *session.linear_final_output.contents().cast() }
+            } else {
+                Fp128Limbs::default()
+            };
+            let mut next_chaining_value = [0u8; 64];
+            // SAFETY: `state` remains a 64-byte shared buffer after completion.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    state.contents().cast::<u8>(),
+                    next_chaining_value.as_mut_ptr(),
+                    next_chaining_value.len(),
+                );
+            }
+            let readback_copy = readback_start.elapsed();
+
+            session.current_len = current_len;
+            session.current_live_len = current_live_len;
+            session.current_table = current_table;
+            session.current_lane_weight_table = current_lane_weight_table;
+            session.current_lane_count = current_lane_count;
+            session.rounds_folded = rounds_folded;
+            let equality_bytes = equality_schedule
+                .iter()
+                .try_fold(0usize, |bytes, round| {
+                    bytes
+                        .checked_add(size_of_val(round.e_first.as_slice()))
+                        .and_then(|sum| sum.checked_add(size_of_val(round.e_second.as_slice())))
+                })
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct relation equality buffers",
+                ))?;
+            let mapping_bytes = additional_schedule
+                .iter()
+                .try_fold(0usize, |bytes, mappings| {
+                    bytes.checked_add(size_of_val(mappings.as_slice()))
+                })
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct relation additional mappings",
+                ))?;
+            let allocation_bytes = equality_bytes
+                .checked_add(size_of_val(taus.as_slice()))
+                .and_then(|bytes| bytes.checked_add(2 * alpha_bytes))
+                .and_then(|bytes| bytes.checked_add(size_of_val(scalar_values.as_slice())))
+                .and_then(|bytes| bytes.checked_add(2 * pair_bytes))
+                .and_then(|bytes| bytes.checked_add(mapping_bytes))
+                .and_then(|bytes| bytes.checked_add(size_of_val(challenge_values.as_slice())))
+                .and_then(|bytes| bytes.checked_add(proof_bytes))
+                .and_then(|bytes| bytes.checked_add(count_bytes + 64))
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "resident direct relation allocation bytes",
+                ))?;
+            Ok(DirectRelationResidentOutcome {
+                round_coefficients,
+                coefficient_counts,
+                challenges: challenge_values,
+                final_evaluation,
+                final_linear_evaluation,
+                chaining_value: next_chaining_value,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy,
+                },
+                allocation_bytes,
+            })
+        })
+    }
+
     pub(crate) fn dispatch_fp128_direct_relation_initial(
         &self,
         session: &DirectRelationSession,
@@ -3917,6 +5689,33 @@ impl MetalRuntime {
         session: &mut DirectRelationSession,
         challenge: Fp128Limbs,
     ) -> Result<(), MetalCommitError> {
+        self.encode_direct_relation_linear_fold_with_binding(
+            command,
+            session,
+            Fp128KernelBinding::Inline(challenge),
+        )
+    }
+
+    fn encode_direct_relation_linear_fold_from_buffer(
+        &self,
+        command: &CommandBufferRef,
+        session: &mut DirectRelationSession,
+        challenges: &Buffer,
+        challenge_offset: u64,
+    ) -> Result<(), MetalCommitError> {
+        self.encode_direct_relation_linear_fold_with_binding(
+            command,
+            session,
+            Fp128KernelBinding::Buffer(challenges, challenge_offset),
+        )
+    }
+
+    fn encode_direct_relation_linear_fold_with_binding(
+        &self,
+        command: &CommandBufferRef,
+        session: &mut DirectRelationSession,
+        challenge: Fp128KernelBinding<'_>,
+    ) -> Result<(), MetalCommitError> {
         if session.linear_mode == 0 {
             return Ok(());
         }
@@ -3979,7 +5778,7 @@ impl MetalRuntime {
         encoder.set_buffer(3, Some(&session.lane_offsets), 0);
         encoder.set_buffer(4, Some(&session.lane_segments), 0);
         encoder.set_buffer(5, Some(&session.linear_segments), 0);
-        set_inline_bytes(encoder, 6, &challenge);
+        set_fp128_binding(encoder, 6, challenge);
         set_inline_bytes(encoder, 7, &params);
         encoder.dispatch_threads(
             MTLSize::new(params.output_len, 1, 1),
@@ -4470,6 +6269,7 @@ fn direct_range_params(
         basis: basis as u64,
         prefix_size: 1,
         materialize_prefix: 0,
+        resident_challenges: 0,
     })
 }
 
@@ -4480,32 +6280,65 @@ fn direct_relation_params(
     fold_lane_weights: bool,
     round: &DirectRelationRoundData<'_>,
 ) -> Result<DirectRelationParams, MetalCommitError> {
+    direct_relation_params_shape(
+        session,
+        current_len,
+        lane_count,
+        fold_lane_weights,
+        round.e_first.len(),
+        round.e_second.len(),
+        round.alpha.len(),
+        round.live_lane_count,
+        round.additional_pairs.len(),
+        !round
+            .additional_pairs
+            .iter()
+            .any(|pair| pair.parent >= (current_len / 2) as u64),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resident relation rounds provide table geometry without host field values"
+)]
+fn direct_relation_params_shape(
+    session: &DirectRelationSession,
+    current_len: usize,
+    lane_count: usize,
+    fold_lane_weights: bool,
+    e_first_len: usize,
+    e_second_len: usize,
+    alpha_len: usize,
+    live_lane_count: usize,
+    additional_pair_count: usize,
+    additional_parents_in_range: bool,
+) -> Result<DirectRelationParams, MetalCommitError> {
     if current_len < 2 || !current_len.is_power_of_two() {
         return Err(MetalCommitError::UnsupportedShape(
             "direct relation round length is malformed".into(),
         ));
     }
     let domain_pair_count = current_len / 2;
-    let current_live_len = round.alpha.len().checked_mul(round.live_lane_count).ok_or(
-        MetalCommitError::ShapeOverflow("direct relation current live length"),
-    )?;
+    let current_live_len =
+        alpha_len
+            .checked_mul(live_lane_count)
+            .ok_or(MetalCommitError::ShapeOverflow(
+                "direct relation current live length",
+            ))?;
     let active_pair_count = current_live_len.div_ceil(2);
     let pair_count = if fold_lane_weights {
         domain_pair_count
     } else {
         active_pair_count
     };
-    let equality_entries = round
-        .e_first
-        .len()
-        .checked_mul(round.e_second.len())
-        .ok_or(MetalCommitError::ShapeOverflow(
-            "direct relation equality entries",
-        ))?;
+    let equality_entries =
+        e_first_len
+            .checked_mul(e_second_len)
+            .ok_or(MetalCommitError::ShapeOverflow(
+                "direct relation equality entries",
+            ))?;
     let relation_entries =
-        round
-            .alpha
-            .len()
+        alpha_len
             .checked_mul(lane_count)
             .ok_or(MetalCommitError::ShapeOverflow(
                 "direct relation rank-one entries",
@@ -4513,43 +6346,36 @@ fn direct_relation_params(
     let linear_is_valid = match session.linear_mode {
         0 => true,
         1 => {
-            session.linear_source_lane_count != 0
-                && session.linear_current_coeff_count == round.alpha.len()
+            session.linear_source_lane_count != 0 && session.linear_current_coeff_count == alpha_len
         }
-        2 => {
-            round.alpha.len() == 1
-                && session.linear_current_live_lane_count == round.live_lane_count
-        }
+        2 => alpha_len == 1 && session.linear_current_live_lane_count == live_lane_count,
         _ => false,
     };
-    if round.e_first.is_empty()
-        || round.e_second.is_empty()
-        || !round.e_first.len().is_power_of_two()
-        || !round.e_second.len().is_power_of_two()
+    if e_first_len == 0
+        || e_second_len == 0
+        || !e_first_len.is_power_of_two()
+        || !e_second_len.is_power_of_two()
         || equality_entries != domain_pair_count
-        || round.alpha.is_empty()
-        || !round.alpha.len().is_power_of_two()
+        || alpha_len == 0
+        || !alpha_len.is_power_of_two()
         || lane_count == 0
         || !lane_count.is_power_of_two()
         || relation_entries != current_len
         || current_live_len > current_len
         || active_pair_count > domain_pair_count
-        || round.live_lane_count > lane_count
-        || (fold_lane_weights && round.alpha.len() != 1)
+        || live_lane_count > lane_count
+        || (fold_lane_weights && alpha_len != 1)
         || !linear_is_valid
-        || round
-            .additional_pairs
-            .iter()
-            .any(|pair| pair.parent >= domain_pair_count as u64)
+        || !additional_parents_in_range
     {
         return Err(MetalCommitError::UnsupportedShape(
             "direct relation factors do not match the round geometry".into(),
         ));
     }
-    let additional_workgroups = if round.additional_pairs.is_empty() {
+    let additional_workgroups = if additional_pair_count == 0 {
         1
     } else {
-        direct_range_workgroups(round.additional_pairs.len())
+        direct_range_workgroups(additional_pair_count)
     };
     Ok(DirectRelationParams {
         live_len: u64::try_from(session.live_len)
@@ -4562,28 +6388,73 @@ fn direct_relation_params(
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation input live length"))?,
         pair_count: u64::try_from(pair_count)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation pair count"))?,
-        num_first: u64::try_from(round.e_first.len())
+        num_first: u64::try_from(e_first_len)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation first equality table"))?,
-        num_second: u64::try_from(round.e_second.len()).map_err(|_| {
+        num_second: u64::try_from(e_second_len).map_err(|_| {
             MetalCommitError::ShapeOverflow("direct relation second equality table")
         })?,
         workgroups: u64::try_from(direct_range_workgroups(pair_count))
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation workgroups"))?,
-        current_coeff_count: u64::try_from(round.alpha.len())
+        current_coeff_count: u64::try_from(alpha_len)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation coefficient count"))?,
-        live_lane_count: u64::try_from(round.live_lane_count)
+        live_lane_count: u64::try_from(live_lane_count)
             .map_err(|_| MetalCommitError::ShapeOverflow("direct relation live lanes"))?,
         prefix_size: 1,
         materialize_prefix: 0,
         linear_mode: session.linear_mode as u64,
-        additional_pair_count: u64::try_from(round.additional_pairs.len()).map_err(|_| {
+        additional_pair_count: u64::try_from(additional_pair_count).map_err(|_| {
             MetalCommitError::ShapeOverflow("direct relation additional pair count")
         })?,
         additional_workgroups: u64::try_from(additional_workgroups).map_err(|_| {
             MetalCommitError::ShapeOverflow("direct relation additional workgroups")
         })?,
         fold_lane_weights: u64::from(fold_lane_weights),
+        resident_challenges: 0,
     })
+}
+
+fn direct_relation_additional_fold_schedule(
+    initial_pairs: &[DirectRelationAdditionalPair],
+    transitions: usize,
+) -> Result<Vec<Vec<DirectRelationAdditionalFoldMapping>>, MetalCommitError> {
+    let mut parents = initial_pairs
+        .iter()
+        .map(|pair| pair.parent)
+        .collect::<Vec<_>>();
+    if parents.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(MetalCommitError::UnsupportedShape(
+            "direct relation additional parents are not strictly ordered".into(),
+        ));
+    }
+    let mut schedule = Vec::with_capacity(transitions);
+    for _ in 0..transitions {
+        let mut mappings = Vec::with_capacity(parents.len());
+        let mut cursor = 0usize;
+        while cursor < parents.len() {
+            let parent = parents[cursor] >> 1;
+            let mut left = u32::MAX;
+            let mut right = u32::MAX;
+            while cursor < parents.len() && parents[cursor] >> 1 == parent {
+                let index = u32::try_from(cursor).map_err(|_| {
+                    MetalCommitError::ShapeOverflow("direct relation additional topology")
+                })?;
+                if parents[cursor] & 1 == 0 {
+                    left = index;
+                } else {
+                    right = index;
+                }
+                cursor += 1;
+            }
+            mappings.push(DirectRelationAdditionalFoldMapping {
+                parent,
+                left,
+                right,
+            });
+        }
+        parents = mappings.iter().map(|mapping| mapping.parent).collect();
+        schedule.push(mappings);
+    }
+    Ok(schedule)
 }
 
 fn encode_direct_range_reduction(
@@ -4593,11 +6464,22 @@ fn encode_direct_range_reduction(
     output: &Buffer,
     params: &DirectRangeParams,
 ) {
+    encode_direct_range_reduction_at_offset(command, pipeline, partials, output, 0, params);
+}
+
+fn encode_direct_range_reduction_at_offset(
+    command: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    partials: &Buffer,
+    output: &Buffer,
+    output_offset: u64,
+    params: &DirectRangeParams,
+) {
     let encoder = command.new_compute_command_encoder();
     encoder.set_label("Akita fp128 direct range partial reduction");
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(partials), 0);
-    encoder.set_buffer(1, Some(output), 0);
+    encoder.set_buffer(1, Some(output), output_offset);
     set_inline_bytes(encoder, 2, params);
     encoder.dispatch_thread_groups(
         MTLSize::new(1, 1, 1),
@@ -4671,6 +6553,19 @@ fn set_inline_bytes<T>(encoder: &ComputeCommandEncoderRef, index: u64, value: &T
         size_of::<T>() as u64,
         std::ptr::from_ref(value).cast::<c_void>(),
     );
+}
+
+fn set_fp128_binding(
+    encoder: &ComputeCommandEncoderRef,
+    index: u64,
+    binding: Fp128KernelBinding<'_>,
+) {
+    match binding {
+        Fp128KernelBinding::Inline(value) => set_inline_bytes(encoder, index, &value),
+        Fp128KernelBinding::Buffer(buffer, offset) => {
+            encoder.set_buffer(index, Some(buffer), offset);
+        }
+    }
 }
 
 fn complete_command(
@@ -4775,11 +6670,131 @@ mod tests {
                 &lanes,
                 &challenge_positions,
                 &challenge_coefficients,
+                None,
                 params,
                 3,
                 |position_start, coefficients| {
                     chunk_starts.push(position_start);
                     streamed.extend_from_slice(coefficients);
+                },
+            )
+            .unwrap()
+            .centered_coefficients;
+        let mut expected = vec![0i32; POSITIONS * 512];
+        for position in 0..POSITIONS {
+            for trace_block in 0..BLOCKS_PER_COLUMN {
+                for column in 0..COLUMNS {
+                    for row_in_ring in 0..2 {
+                        let ring = trace_block * POSITIONS + position;
+                        let row = 2 * ring + row_in_ring;
+                        let hot = usize::from(lanes[row * COLUMNS + column]);
+                        if hot == 0 {
+                            continue;
+                        }
+                        let source_coefficient = row_in_ring * 256 + hot;
+                        let challenge = column * BLOCKS_PER_COLUMN + trace_block;
+                        let challenge_start = challenge * CHALLENGE_WEIGHT;
+                        for term in 0..CHALLENGE_WEIGHT {
+                            let mut destination = source_coefficient
+                                + usize::from(challenge_positions[challenge_start + term]);
+                            let mut value =
+                                i32::from(challenge_coefficients[challenge_start + term]);
+                            if destination >= 512 {
+                                destination -= 512;
+                                value = -value;
+                            }
+                            expected[position * 512 + destination] += value;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(streamed, expected);
+        assert_eq!(chunk_starts, [0, 3, 6]);
+    }
+
+    #[test]
+    fn packed_d512_subring64_decompose_fold_matches_cpu() {
+        const POSITIONS: usize = 9;
+        const BLOCKS_PER_COLUMN: usize = 1;
+        const COLUMNS: usize = 128;
+        const CHALLENGE_WEIGHT: usize = 4;
+        let runtime = MetalRuntime::new().unwrap();
+        let num_rows = 2 * POSITIONS * BLOCKS_PER_COLUMN;
+        let lanes = (0..num_rows * COLUMNS)
+            .map(|index| 1 + (8 * ((17 * index + 29) % 32)) as u8)
+            .collect::<Vec<_>>();
+        let mut challenge_positions = Vec::new();
+        let mut challenge_coefficients = Vec::new();
+        let mut dense_challenges = vec![0i8; COLUMNS * BLOCKS_PER_COLUMN * 64];
+        for challenge in 0..COLUMNS * BLOCKS_PER_COLUMN {
+            for term in 0..CHALLENGE_WEIGHT {
+                let subring_position = (13 * challenge + 17 * term) % 64;
+                let coefficient = [1, -2, 2, -1][term];
+                challenge_positions.push((subring_position * 8) as u16);
+                challenge_coefficients.push(coefficient);
+                dense_challenges[challenge * 64 + subring_position] = coefficient;
+            }
+        }
+        let params = PackedDecomposeFoldParams {
+            num_rows: num_rows as u64,
+            num_columns: COLUMNS as u64,
+            lane_stride: COLUMNS as u64,
+            num_positions: POSITIONS as u64,
+            position_start: 0,
+            blocks_per_column: BLOCKS_PER_COLUMN as u64,
+            challenge_weight: CHALLENGE_WEIGHT as u64,
+            output_coefficients: (POSITIONS * 512) as u64,
+        };
+        let actual = runtime
+            .dispatch_packed_fp128_d512_decompose_fold_streaming(
+                &lanes,
+                &challenge_positions,
+                &challenge_coefficients,
+                Some(&dense_challenges),
+                params,
+                POSITIONS,
+                |_, _| {},
+            )
+            .unwrap()
+            .centered_coefficients;
+        let tasks_per_position = BLOCKS_PER_COLUMN * COLUMNS * 2;
+        let tiles_per_position = tasks_per_position.div_ceil(256);
+        let index = runtime
+            .prepare_packed_fp128_d512_fold_index(
+                &lanes,
+                PackedFoldIndexParams {
+                    num_rows: num_rows as u64,
+                    num_columns: COLUMNS as u64,
+                    lane_stride: COLUMNS as u64,
+                    num_positions: POSITIONS as u64,
+                    position_start: 0,
+                    blocks_per_column: BLOCKS_PER_COLUMN as u64,
+                    tasks_per_position: tasks_per_position as u64,
+                    tiles_per_position: tiles_per_position as u64,
+                    record_slots: (POSITIONS * tiles_per_position * 256) as u64,
+                    count_entries: (POSITIONS * tiles_per_position * 8) as u64,
+                    output_coefficients: (POSITIONS * 512) as u64,
+                    fold_digits: 0,
+                    fold_log_basis: 0,
+                },
+            )
+            .unwrap();
+        let mut indexed_streamed = Vec::new();
+        let mut indexed_digits = Vec::new();
+        let indexed = runtime
+            .dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+                &lanes,
+                &dense_challenges,
+                &index,
+                params,
+                4,
+                4,
+                4,
+                |_, coefficients, digits| {
+                    indexed_streamed.extend_from_slice(coefficients);
+                    indexed_digits.extend_from_slice(digits);
                 },
             )
             .unwrap()
@@ -4815,8 +6830,19 @@ mod tests {
             }
         }
         assert_eq!(actual, expected);
-        assert_eq!(streamed, expected);
-        assert_eq!(chunk_starts, [0, 3, 6]);
+        assert_eq!(indexed, expected);
+        assert_eq!(indexed_streamed, expected);
+        for position in 0..POSITIONS {
+            for coefficient in 0..512 {
+                let reconstructed = (0..4).rev().fold(0i32, |value, digit| {
+                    let value_index = position * 4 * 512 + digit * 512 + coefficient;
+                    let value_digit = indexed_digits[value_index];
+                    assert!((-8..8).contains(&value_digit));
+                    value * 16 + i32::from(value_digit)
+                });
+                assert_eq!(reconstructed, expected[position * 512 + coefficient]);
+            }
+        }
     }
 
     #[test]

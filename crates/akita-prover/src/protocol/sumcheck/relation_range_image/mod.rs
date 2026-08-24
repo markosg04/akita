@@ -401,6 +401,102 @@ pub struct DirectRelationRangeProofState<E: FieldCore> {
     linear_layout: DirectLinearLayout<E>,
 }
 
+/// Stage-1-independent inputs for a direct Stage-2 backend.
+#[doc(hidden)]
+pub struct DirectRelationRangePreparationInput<'a, E: FieldCore> {
+    compact_witness: &'a [i8],
+    domain_len: usize,
+    coefficient_rounds: usize,
+    relation_lane_weights: &'a [E],
+    linear_terms: &'a mut PreparedProverLinearTerms<E>,
+}
+
+impl<'a, E: FieldCore> DirectRelationRangePreparationInput<'a, E> {
+    pub(crate) fn new(
+        compact_witness: &'a [i8],
+        domain_len: usize,
+        coefficient_rounds: usize,
+        relation_lane_weights: &'a [E],
+        linear_terms: &'a mut PreparedProverLinearTerms<E>,
+    ) -> Self {
+        Self {
+            compact_witness,
+            domain_len,
+            coefficient_rounds,
+            relation_lane_weights,
+            linear_terms,
+        }
+    }
+
+    /// Build preparation inputs for a standalone direct prover instance.
+    pub fn from_prover(prover: &'a mut RelationRangeImageProver<E>) -> Result<Self, AkitaError> {
+        let coefficient_count = prover.common_alpha_factor.len();
+        if !coefficient_count.is_power_of_two() {
+            return Err(AkitaError::InvalidSetup(
+                "direct relation coefficient count must be a power of two".into(),
+            ));
+        }
+        let coefficient_rounds = coefficient_count.trailing_zeros() as usize;
+        let domain_len = prover
+            .common_alpha_factor
+            .len()
+            .checked_mul(prover.relation_lane_weights.len())
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup("direct relation domain length overflow".into())
+            })?;
+        let compact_witness = match &prover.witness_state {
+            WitnessState::CompactPrefix(witness) => witness,
+            WitnessState::FoldedSuffix(_) => {
+                return Err(AkitaError::InvalidSetup(
+                    "direct relation preparation requires the compact witness".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            compact_witness: compact_witness.as_ref(),
+            domain_len,
+            coefficient_rounds,
+            relation_lane_weights: &prover.relation_lane_weights,
+            linear_terms: &mut prover.linear_terms,
+        })
+    }
+
+    /// Compact witness bytes read by the prepared backend.
+    pub fn compact_witness(&self) -> &[i8] {
+        self.compact_witness
+    }
+
+    /// Padded Stage-2 domain length.
+    pub const fn domain_len(&self) -> usize {
+        self.domain_len
+    }
+
+    /// Number of coefficient variables folded before lane variables.
+    pub const fn coefficient_rounds(&self) -> usize {
+        self.coefficient_rounds
+    }
+
+    /// Padded relation-lane weights.
+    pub const fn relation_lane_weights(&self) -> &[E] {
+        self.relation_lane_weights
+    }
+
+    /// Build the static structured-linear lane map.
+    pub fn linear_layout(&self) -> DirectLinearLayout<E> {
+        self.linear_terms.direct_layout()
+    }
+
+    /// Clone the structured-linear sources without changing the prover.
+    pub fn linear_round(&self) -> DirectLinearRound<E> {
+        self.linear_terms.direct_round()
+    }
+
+    /// Move structured-linear sources into a backend that cannot fall back.
+    pub fn take_linear_round(&mut self) -> DirectLinearRound<E> {
+        self.linear_terms.take_direct_round()
+    }
+}
+
 type DirectRelationRangeProofOutput<E> = (SumcheckProof<E>, Vec<E>, RelationRangeImageProver<E>);
 
 /// Backend operation for the complete fused relation/range-image sumcheck.
@@ -413,11 +509,22 @@ where
         + HasUnreducedOps
         + AkitaSerialize,
 {
+    /// Backend-owned state prepared before Stage 1.
+    type Preparation: Send;
+
+    /// Prepare the challenge-independent part of a direct Stage-2 proof.
+    fn prepare_direct_relation_range(
+        &self,
+        prepared: &Self::PreparedSetup,
+        input: DirectRelationRangePreparationInput<'_, E>,
+    ) -> Result<Self::Preparation, AkitaError>;
+
     /// Prove one Stage-2 instance while retaining its shrinking witness table.
     fn prove_direct_relation_range<T>(
         &self,
         prepared: &Self::PreparedSetup,
         prover: RelationRangeImageProver<E>,
+        preparation: Self::Preparation,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where

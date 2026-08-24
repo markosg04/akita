@@ -86,6 +86,21 @@ fn borrowed_view_checks_without_copying() {
 }
 
 #[test]
+fn owned_view_reuses_validated_storage_and_metadata() {
+    let lanes = vec![
+        0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12,
+    ];
+    let packed = PackedOneHotPoly::<F>::new(16, 4, 3, lanes).unwrap();
+    let view = packed.view::<64>().unwrap();
+    assert_eq!(view.lanes().as_ptr(), packed.lanes().as_ptr());
+    assert_eq!(view.num_rows(), packed.num_rows());
+    assert_eq!(view.num_columns(), packed.num_columns());
+    assert_eq!(view.column_capacity(), packed.column_capacity());
+    assert_eq!(view.onehot_k(), packed.onehot_k());
+    assert_eq!(view.hot_entries(), packed.hot_entries());
+}
+
+#[test]
 fn owned_packed_storage_is_device_buffer_aligned() {
     let packed = PackedOneHotPoly::<F>::new(16, 4, 3, vec![0; 24]).unwrap();
     assert_eq!(

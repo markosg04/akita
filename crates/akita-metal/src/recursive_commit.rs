@@ -1,7 +1,7 @@
-use akita_algebra::CyclotomicRing;
 use akita_field::AkitaError;
 use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
 use akita_prover::{CommitInnerWitness, SuffixWitnessView};
+use akita_types::RingVec;
 
 use crate::field::{MetalField, F};
 use crate::runtime::{RecursiveCommitParams, FP128_D512_LINEAR_RELATION_NUM_PRIMES};
@@ -67,44 +67,56 @@ impl<const D: usize> RootCommitKernel<SuffixWitnessView<'_, F, D>, F, D> for Met
             );
         }
 
-        let matrix = prepared.shared_matrix(runtime, D, plan.n_a, plan.num_positions_per_block)?;
         let output_coefficients = num_blocks
             .checked_mul(plan.n_a)
             .and_then(|count| count.checked_mul(D))
             .ok_or_else(|| {
                 MetalCommitError::ShapeOverflow("recursive commit output coefficients").into_akita()
             })?;
+        let params = RecursiveCommitParams {
+            num_blocks: num_blocks as u64,
+            blocks_per_group: BLOCKS_PER_GROUP as u64,
+            num_block_groups: num_blocks.div_ceil(BLOCKS_PER_GROUP) as u64,
+            num_rows: plan.n_a as u64,
+            num_cols: plan.num_positions_per_block as u64,
+            ring_d: D as u64,
+            num_primes: FP128_D512_LINEAR_RELATION_NUM_PRIMES as u64,
+            matrix_rings: plan.n_a.saturating_mul(plan.num_positions_per_block) as u64,
+            output_coefficients: output_coefficients as u64,
+            rhs_abs_bound: RHS_ABS_BOUND,
+        };
+        let matrix = prepared.recursive_commit_matrix::<D>(runtime, params)?;
         let outcome = runtime
             .dispatch_fp128_recursive_commit::<D>(
                 &matrix.buffer,
                 source.committed_i8_digits(),
-                RecursiveCommitParams {
-                    num_blocks: num_blocks as u64,
-                    blocks_per_group: BLOCKS_PER_GROUP as u64,
-                    num_block_groups: num_blocks.div_ceil(BLOCKS_PER_GROUP) as u64,
-                    num_rows: plan.n_a as u64,
-                    num_cols: plan.num_positions_per_block as u64,
-                    ring_d: D as u64,
-                    num_primes: FP128_D512_LINEAR_RELATION_NUM_PRIMES as u64,
-                    matrix_rings: plan.n_a.saturating_mul(plan.num_positions_per_block) as u64,
-                    output_coefficients: output_coefficients as u64,
-                    rhs_abs_bound: RHS_ABS_BOUND,
-                },
+                params,
             )
             .map_err(MetalCommitError::into_akita)?;
         let timings = outcome.timings;
         self.update_opening_metrics(|metrics| {
-            metrics.command_wall_time += timings.command_wall;
-            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
-            metrics.upload_time += timings.buffer_setup + matrix.prepare_time;
+            metrics.command_wall_time += timings.command_wall + matrix.timings.command_wall;
+            metrics.gpu_active_time +=
+                timings.gpu.unwrap_or_default() + matrix.timings.gpu.unwrap_or_default();
+            metrics.upload_time += timings.buffer_setup + matrix.timings.buffer_setup;
             metrics.readback_time += timings.readback_copy;
+            metrics.recursive_commit_matrix_cache_hits += usize::from(matrix.cache_hit);
+            metrics.recursive_commit_matrix_cache_misses += usize::from(!matrix.cache_hit);
+            metrics.recursive_commit_matrix_ntt_time += matrix.timings.command_wall;
+            metrics.recursive_commit_matrix_ntt_gpu_time += matrix.timings.gpu.unwrap_or_default();
+            if !matrix.cache_hit {
+                metrics.recursive_commit_matrix_ntt_bytes = metrics
+                    .recursive_commit_matrix_ntt_bytes
+                    .saturating_add(matrix.bytes);
+            }
             metrics.allocation_bytes = metrics
                 .allocation_bytes
                 .saturating_add(outcome.allocation_bytes)
-                .saturating_add(matrix.bytes.saturating_mul(usize::from(!matrix.zero_copy)));
+                .saturating_add(matrix.allocation_bytes);
         })
         .map_err(MetalCommitError::into_akita)?;
 
+        let _span = tracing::info_span!("recursive_commit_output_decode").entered();
         let coefficients = outcome
             .coefficients
             .into_iter()
@@ -112,15 +124,9 @@ impl<const D: usize> RootCommitKernel<SuffixWitnessView<'_, F, D>, F, D> for Met
             .map(|(index, value)| F::from_device(value, index))
             .collect::<Result<Vec<_>, _>>()
             .map_err(MetalCommitError::into_akita)?;
-        let rings = coefficients
-            .chunks_exact(D)
-            .map(CyclotomicRing::<F, D>::from_slice)
-            .collect::<Vec<_>>();
-        let rows = rings
-            .chunks_exact(plan.n_a)
-            .map(<[_]>::to_vec)
-            .collect::<Vec<_>>();
-        Ok(vec![CommitInnerWitness::from_rows(rows)])
+        Ok(vec![CommitInnerWitness {
+            inner_rows: RingVec::from_coeffs_with_ring_dim(coefficients, D)?,
+        }])
     }
 }
 
@@ -186,9 +192,15 @@ mod tests {
             .commit_inner_group(&metal_prepared, vec![witness.view::<F, D>().unwrap()], plan)
             .unwrap();
         assert_eq!(actual[0].inner_rows, expected[0].inner_rows);
+        let repeated = metal
+            .commit_inner_group(&metal_prepared, vec![witness.view::<F, D>().unwrap()], plan)
+            .unwrap();
+        assert_eq!(repeated[0].inner_rows, expected[0].inner_rows);
         let metrics = metal.last_opening_metrics().unwrap().unwrap();
         assert_eq!(metrics.cpu_fallback_calls, 0);
         assert!(metrics.gpu_active_time > std::time::Duration::ZERO);
+        assert_eq!(metrics.recursive_commit_matrix_cache_misses, 1);
+        assert_eq!(metrics.recursive_commit_matrix_cache_hits, 1);
     }
 
     #[test]

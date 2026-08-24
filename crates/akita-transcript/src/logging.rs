@@ -253,6 +253,10 @@ where
         self.inner.bind_instance_bytes(instance_bytes);
     }
 
+    fn execution_checkpoint(&self) -> Option<crate::TranscriptExecutionCheckpoint> {
+        self.inner.execution_checkpoint()
+    }
+
     fn record_wire_serde<S: AkitaSerialize>(&mut self, label: &[u8], s: &S) {
         let mut bytes = Vec::new();
         s.serialize_compressed(&mut bytes)

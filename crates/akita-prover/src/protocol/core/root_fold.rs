@@ -1,10 +1,13 @@
 use super::*;
 use crate::compute::{
-    ComputeBackendSetup, ComputeExecutionDomain, DecomposeFoldChunk, DecomposeFoldChunkSink,
-    DigitRowsComputeBackend, LevelProveStacks, OperationCtx, ProverComputeStack,
-    RuntimeCommitBackendFor, RuntimeRingSwitchProveBackend,
+    prewarm_ntt_requirements, BalancedDigitRequest, ComputeBackendSetup, ComputeExecutionDomain,
+    DecomposeFoldChunk, DecomposeFoldChunkSink, DigitRowsComputeBackend, LevelProveStacks,
+    NttExecutionRequirements, OperationCtx, ProverComputeStack, RuntimeCommitBackendFor,
+    RuntimeRingSwitchProveBackend,
 };
+use crate::kernels::linear::decompose_commit_blocks_into;
 use crate::protocol::fold_grind::FoldProbeSink;
+use crate::protocol::ring_relation::RingRelationPreFoldSink;
 use crate::protocol::ring_switch::{
     balanced_decompose_centered_i32_i8_into, merge_recursive_commit_prefixes,
     prepare_recursive_commit_prefix, RecursiveCommitPrefix,
@@ -13,10 +16,208 @@ use crate::RecursiveWitnessFlat;
 use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend};
 use akita_field::unreduced::ReduceTo;
 use akita_field::AdditiveGroup;
-use akita_types::{dispatch_for_field, CommittedSourceEncoding};
+use akita_types::{
+    dispatch_for_field, emit_witness_e_planes, emit_witness_t_planes, r_decomp_levels,
+    AkitaCommitmentHint, CommittedSourceEncoding, OpeningClaimsLayout, RelationWitnessGeometry,
+    WitnessLayout,
+};
 
 const ROOT_STREAM_TARGET_CHUNKS: usize = 8;
 const PIPELINE_MIN_WITNESS_COEFFS: usize = 64 * 1024 * 1024;
+
+struct RootEtCommitSink<'a, 'stack, F, C, Cfg>
+where
+    F: FieldCore + CanonicalField,
+    C: ComputeBackendSetup<F>,
+{
+    commit_params: &'a CommittedGroupParams,
+    expanded: &'a AkitaExpandedSetup<F>,
+    commit_ctx: &'a OperationCtx<'stack, F, C>,
+    prefix_start: Option<usize>,
+    prefix: Option<RecursiveCommitPrefix<F>>,
+    _config: core::marker::PhantomData<fn() -> Cfg>,
+}
+
+impl<'a, 'stack, F, C, Cfg> RootEtCommitSink<'a, 'stack, F, C, Cfg>
+where
+    F: FieldCore + CanonicalField,
+    C: ComputeBackendSetup<F>,
+{
+    const fn new(
+        commit_params: &'a CommittedGroupParams,
+        expanded: &'a AkitaExpandedSetup<F>,
+        commit_ctx: &'a OperationCtx<'stack, F, C>,
+    ) -> Self {
+        Self {
+            commit_params,
+            expanded,
+            commit_ctx,
+            prefix_start: None,
+            prefix: None,
+            _config: core::marker::PhantomData,
+        }
+    }
+
+    fn take_prefix(&mut self) -> Option<(usize, RecursiveCommitPrefix<F>)> {
+        self.prefix_start.take().zip(self.prefix.take())
+    }
+}
+
+impl<F, C, Cfg> RingRelationPreFoldSink<F> for RootEtCommitSink<'_, '_, F, C, Cfg>
+where
+    F: FieldCore + CanonicalField,
+    Cfg: CommitmentConfig<Field = F>,
+    C: RuntimeCommitBackendFor<F, RecursiveWitnessFlat> + ComputeBackendSetup<F>,
+{
+    fn prepare(
+        &mut self,
+        level_params: &CommittedGroupParams,
+        opening_batch: &OpeningClaimsLayout,
+        relation_geometry: &RelationWitnessGeometry,
+        e_hats: &[&akita_types::DigitBlocks],
+        hints: &[AkitaCommitmentHint<F>],
+    ) -> Result<(), AkitaError> {
+        let [e_hat] = e_hats else {
+            return Err(AkitaError::InvalidSetup(
+                "static E/T prefix requires one opening group".into(),
+            ));
+        };
+        let [hint] = hints else {
+            return Err(AkitaError::InvalidSetup(
+                "static E/T prefix requires one commitment hint".into(),
+            ));
+        };
+        let layout = WitnessLayout::new(
+            level_params,
+            opening_batch,
+            relation_geometry,
+            level_params.witness_chunk.num_chunks,
+            r_decomp_levels::<F>(level_params.log_basis_open),
+        )?;
+        let [unit] = layout.units() else {
+            return Err(AkitaError::InvalidSetup(
+                "static E/T prefix requires one witness unit".into(),
+            ));
+        };
+        let block_coeff_len = self
+            .commit_params
+            .num_positions_per_block
+            .checked_mul(self.commit_params.role_dims().d_a())
+            .ok_or_else(|| AkitaError::InvalidSetup("commit block width overflow".into()))?;
+        let z_end = unit.z_range().end;
+        let et_end = unit.t_range().end;
+        if !z_end.is_multiple_of(block_coeff_len) {
+            return Ok(());
+        }
+        let prefix_end = et_end / block_coeff_len * block_coeff_len;
+        if prefix_end <= z_end {
+            return Ok(());
+        }
+
+        let group_params = level_params.group_params_geometry(opening_batch, 0)?;
+        let group_dims = level_params.group_role_dims_geometry(opening_batch, 0)?;
+        let num_claims = opening_batch.group_layout(0)?.num_polynomials();
+        if hint.ring_dim() != group_dims.d_a() || hint.inner_rows().len() != num_claims {
+            return Err(AkitaError::InvalidInput(
+                "static E/T prefix hint shape mismatch".into(),
+            ));
+        }
+        let expected_rings_per_polynomial = group_params
+            .num_live_blocks()
+            .checked_mul(group_params.a_rows_len())
+            .ok_or_else(|| AkitaError::InvalidSetup("commitment hint row count overflow".into()))?;
+        let t_hat = dispatch_for_field!(
+            akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Inner),
+            F,
+            group_dims.d_a(),
+            |D_A| {
+                dispatch_for_field!(
+                    akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Outer),
+                    F,
+                    group_dims.d_b(),
+                    |D_B| {
+                        let mut blocks =
+                            Vec::with_capacity(num_claims * group_params.num_live_blocks());
+                        for rows in hint.inner_rows() {
+                            let typed_rows = rows.as_ring_slice::<D_A>()?;
+                            if typed_rows.len() != expected_rings_per_polynomial {
+                                return Err(AkitaError::InvalidSize {
+                                    expected: expected_rings_per_polynomial,
+                                    actual: typed_rows.len(),
+                                });
+                            }
+                            blocks.extend(typed_rows.chunks_exact(group_params.a_rows_len()));
+                        }
+                        decompose_commit_blocks_into::<F, D_A, D_B>(
+                            &blocks,
+                            group_params.num_digits_outer(),
+                            group_params.log_basis_outer(),
+                        )
+                    }
+                )
+            }
+        )?;
+
+        let mut digits = vec![0i8; et_end];
+        let opening_width = unit.e_geometry().physical_coefficient_width();
+        dispatch_for_field!(
+            akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Opening),
+            F,
+            group_dims.d_d(),
+            |D_D| emit_witness_e_planes::<D_D>(
+                &mut digits,
+                &layout,
+                0,
+                opening_width,
+                num_claims,
+                group_params.num_digits_open(),
+                e_hat,
+                group_params.num_live_blocks(),
+            )
+        )?;
+        dispatch_for_field!(
+            akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Inner),
+            F,
+            group_dims.d_a(),
+            |D_A| {
+                dispatch_for_field!(
+                    akita_types::ProtocolDispatchSlot::Role(akita_types::RingRole::Outer),
+                    F,
+                    group_dims.d_b(),
+                    |D_B| emit_witness_t_planes::<D_A, D_B>(
+                        &mut digits,
+                        &layout,
+                        0,
+                        num_claims,
+                        group_params.a_rows_len(),
+                        group_params.num_digits_outer(),
+                        &t_hat,
+                        group_params.num_live_blocks(),
+                    )
+                )
+            }
+        )?;
+        let known_balanced_log_basis = group_params
+            .log_basis_inner()
+            .max(group_params.log_basis_outer())
+            .max(group_params.log_basis_open());
+        self.prefix = Some(prepare_recursive_commit_prefix::<Cfg, C>(
+            self.commit_params,
+            self.expanded,
+            self.commit_ctx,
+            &digits[z_end..prefix_end],
+            known_balanced_log_basis,
+        )?);
+        self.prefix_start = Some(z_end);
+        tracing::info!(
+            prefix_start = z_end,
+            prefix_end,
+            prefix_bytes = prefix_end - z_end,
+            "prepared static root E/T commitment prefix"
+        );
+        Ok(())
+    }
+}
 
 struct RootZCommitSink<'a, 'stack, F, C, Cfg>
 where
@@ -127,18 +328,39 @@ where
                 actual: chunk.centered_coefficients().len(),
             });
         }
-        let digit_rows = centered_rows
-            .len()
-            .checked_mul(self.fold_digits)
-            .ok_or_else(|| AkitaError::InvalidSetup("streamed Z digit count overflow".into()))?;
-        let mut digits = vec![[0i8; D]; digit_rows];
-        for (centered, planes) in centered_rows
-            .iter()
-            .zip(digits.chunks_exact_mut(self.fold_digits))
-        {
-            balanced_decompose_centered_i32_i8_into(centered, planes, self.fold_log_basis);
+        let _span = tracing::info_span!("root_z_digit_append").entered();
+        if let Some(digits) = chunk.balanced_digits() {
+            if digits.request()
+                != (BalancedDigitRequest {
+                    num_digits: self.fold_digits,
+                    log_basis: self.fold_log_basis,
+                })
+            {
+                return Err(AkitaError::InvalidInput(
+                    "streamed root digit hint has the wrong decomposition".into(),
+                ));
+            }
+            self.pending_digits.extend_from_slice(digits.digits());
+        } else {
+            let digit_rows = centered_rows
+                .len()
+                .checked_mul(self.fold_digits)
+                .ok_or_else(|| {
+                    AkitaError::InvalidSetup("streamed Z digit count overflow".into())
+                })?;
+            let digits = {
+                let _span = tracing::info_span!("root_z_digit_decompose").entered();
+                let mut digits = vec![[0i8; D]; digit_rows];
+                for (centered, planes) in centered_rows
+                    .iter()
+                    .zip(digits.chunks_exact_mut(self.fold_digits))
+                {
+                    balanced_decompose_centered_i32_i8_into(centered, planes, self.fold_log_basis);
+                }
+                digits
+            };
+            self.pending_digits.extend(digits.into_flattened());
         }
-        self.pending_digits.extend(digits.into_flattened());
         self.next_position += chunk.position_count();
 
         let ready_len =
@@ -146,6 +368,7 @@ where
         if ready_len != 0 {
             let suffix = self.pending_digits.split_off(ready_len);
             let ready = core::mem::replace(&mut self.pending_digits, suffix);
+            let _span = tracing::info_span!("root_z_commit_prefix").entered();
             self.prefixes
                 .push(prepare_recursive_commit_prefix::<Cfg, C>(
                     self.commit_params,
@@ -168,6 +391,13 @@ where
     fn preferred_position_chunk_len(&self, total_positions: usize) -> usize {
         debug_assert_eq!(total_positions, self.root_positions);
         self.preferred_chunk_len
+    }
+
+    fn balanced_digit_request(&self) -> Option<BalancedDigitRequest> {
+        Some(BalancedDigitRequest {
+            num_digits: self.fold_digits,
+            log_basis: self.fold_log_basis,
+        })
     }
 
     fn consume(&mut self, chunk: DecomposeFoldChunk<'_>) -> Result<(), AkitaError> {
@@ -206,6 +436,7 @@ where
         }
         self.pending_digits.clear();
         if accepted {
+            let _span = tracing::info_span!("root_commit_prefix_merge").entered();
             self.accepted_prefix = Some(merge_recursive_commit_prefixes(core::mem::take(
                 &mut self.prefixes,
             ))?);
@@ -254,6 +485,8 @@ fn prepare_root<'p, F, E, T, P, C, O, TS, R>(
     root_params: &CommittedGroupParams,
     basis: BasisMode,
     fold_sink: Option<&'p mut dyn FoldProbeSink>,
+    pre_fold_task: Option<&'p mut (dyn FnMut() -> Result<(), AkitaError> + Send)>,
+    pre_fold_sink: Option<&'p mut dyn crate::protocol::ring_relation::RingRelationPreFoldSink<F>>,
 ) -> Result<PreparedFold<F, E>, AkitaError>
 where
     F: FieldCore
@@ -302,6 +535,8 @@ where
         root_params,
         basis,
         fold_sink,
+        pre_fold_task,
+        pre_fold_sink,
     )
 }
 
@@ -321,20 +556,15 @@ where
 pub(crate) fn prove_root<'stack, F, E, T, P, C, O, TS, R, Cfg>(
     expanded: &Arc<AkitaExpandedSetup<F>>,
     prefix_slots: &SetupPrefixProverRegistry<F>,
-    stacks: &'stack impl LevelProveStacks<
-        'stack,
-        F,
-        Commit = C,
-        Opening = O,
-        Tensor = TS,
-        RingSwitch = R,
-    >,
+    stacks: &'stack (impl LevelProveStacks<'stack, F, Commit = C, Opening = O, Tensor = TS, RingSwitch = R>
+                 + Sync),
     transcript: &mut T,
     claims: ProverOpeningData<'_, E, P, F>,
     scheduled: &akita_types::RootFoldStep,
     next_params: super::fold::FoldSuccessorParams<'_>,
     next_witness_binding: akita_types::NextWitnessBindingPolicy,
     basis: BasisMode,
+    deferred_ntt_requirements: Option<&NttExecutionRequirements>,
 ) -> Result<ProveLevelOutput<F, E>, AkitaError>
 where
     F: FieldCore
@@ -417,6 +647,15 @@ where
             )
         })
         .transpose()?;
+    let mut et_commit_sink = streamed_commit_params.map(|commit_params| {
+        RootEtCommitSink::<F, C, Cfg>::new(commit_params, expanded.as_ref(), stack.commit())
+    });
+    let mut prewarm_ntt = || {
+        let _span = tracing::info_span!("root_ntt_prewarm").entered();
+        deferred_ntt_requirements.map_or(Ok(()), |requirements| {
+            prewarm_ntt_requirements::<F, _>(stacks, requirements)
+        })
+    };
     let prepared_fold = prepare_root::<F, E, T, P, C, O, TS, R>(
         stack,
         transcript,
@@ -426,9 +665,14 @@ where
         fold_sink
             .as_mut()
             .map(|sink| sink as &mut dyn FoldProbeSink),
+        deferred_ntt_requirements
+            .map(|_| &mut prewarm_ntt as &mut (dyn FnMut() -> Result<(), AkitaError> + Send)),
+        et_commit_sink
+            .as_mut()
+            .map(|sink| sink as &mut dyn RingRelationPreFoldSink<F>),
     )
     .map_err(|err| AkitaError::InvalidInput(format!("prepare root failed: {err:?}")))?;
-    let early_commit_prefix = fold_sink
+    let mut early_commit_prefix = fold_sink
         .as_mut()
         .map(|sink| {
             sink.take_accepted_prefix().ok_or_else(|| {
@@ -438,6 +682,22 @@ where
             })
         })
         .transpose()?;
+    if let Some((prefix_start, et_prefix)) = et_commit_sink
+        .as_mut()
+        .and_then(RootEtCommitSink::take_prefix)
+    {
+        let z_prefix = early_commit_prefix.take().ok_or_else(|| {
+            AkitaError::InvalidInput(
+                "static E/T commitment prefix is missing its Z predecessor".into(),
+            )
+        })?;
+        if z_prefix.coeff_len() != prefix_start {
+            return Err(AkitaError::InvalidSetup(
+                "static E/T commitment prefix is not contiguous with Z".into(),
+            ));
+        }
+        early_commit_prefix = Some(merge_recursive_commit_prefixes(vec![z_prefix, et_prefix])?);
+    }
 
     prove_fold::<F, E, T, C, O, TS, R, Cfg>(
         expanded,

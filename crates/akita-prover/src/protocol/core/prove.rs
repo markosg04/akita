@@ -2,9 +2,9 @@ use super::*;
 use crate::backend::{RecursiveFoldSource, RecursiveWitnessFlat};
 use crate::compute::{
     prewarm_ntt_requirements, ComputeBackendSetup, DigitRowsComputeBackend, LevelProveStacks,
-    NttExecutionRequirements, RuntimeCoefficientPackingBackendFor, RuntimeCommitBackendFor,
-    RuntimeOpeningProveBackendFor, RuntimeRingSwitchProveBackend, RuntimeTensorBackendFor,
-    SuffixOpeningProveBackend, SuffixTensorProveBackend,
+    NttExecutionRequirements, NttPrewarmPhase, RuntimeCoefficientPackingBackendFor,
+    RuntimeCommitBackendFor, RuntimeOpeningProveBackendFor, RuntimeRingSwitchProveBackend,
+    RuntimeTensorBackendFor, SuffixOpeningProveBackend, SuffixTensorProveBackend,
 };
 use crate::SelectedProverOpeningData;
 use crate::{DirectDigitRangeProofBackend, DirectRelationRangeProofBackend};
@@ -28,14 +28,8 @@ use akita_field::{AdditiveGroup, CanonicalField};
 pub fn batched_prove<'a, Cfg, T, P, C, O, TS, R>(
     expanded: &Arc<AkitaExpandedSetup<Cfg::Field>>,
     prefix_slots: &SetupPrefixProverRegistry<Cfg::Field>,
-    stacks: &'a impl LevelProveStacks<
-        'a,
-        Cfg::Field,
-        Commit = C,
-        Opening = O,
-        Tensor = TS,
-        RingSwitch = R,
-    >,
+    stacks: &'a (impl LevelProveStacks<'a, Cfg::Field, Commit = C, Opening = O, Tensor = TS, RingSwitch = R>
+             + Sync),
     opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
     transcript: &mut T,
     basis: BasisMode,
@@ -98,7 +92,9 @@ where
     schedule.validate_nonterminal_opening_execution(Cfg::EXT_DEGREE)?;
     ensure_prover_schedule_fits_setup::<Cfg>(expanded.as_ref(), schedule, &opening_batch)?;
     let ntt_requirements = NttExecutionRequirements::from_prove_schedule(schedule)?;
-    prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)?;
+    if stacks.ntt_prewarm_phase() == NttPrewarmPhase::Eager {
+        prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)?;
+    }
     bind_transcript_instance_descriptor::<Cfg::Field, T, Cfg>(
         expanded.as_ref(),
         &opening_batch,
@@ -137,14 +133,8 @@ where
 pub fn prove<'a, Cfg, T, P, C, O, TS, R>(
     expanded: &Arc<AkitaExpandedSetup<Cfg::Field>>,
     prefix_slots: &SetupPrefixProverRegistry<Cfg::Field>,
-    stacks: &'a impl LevelProveStacks<
-        'a,
-        Cfg::Field,
-        Commit = C,
-        Opening = O,
-        Tensor = TS,
-        RingSwitch = R,
-    >,
+    stacks: &'a (impl LevelProveStacks<'a, Cfg::Field, Commit = C, Opening = O, Tensor = TS, RingSwitch = R>
+             + Sync),
     transcript: &mut T,
     claims: ProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
     schedule: &FoldSchedule,
@@ -199,6 +189,9 @@ where
     <R as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
 {
     schedule.validate_nonterminal_opening_execution(Cfg::EXT_DEGREE)?;
+    let deferred_ntt_requirements = (stacks.ntt_prewarm_phase() == NttPrewarmPhase::RootFold)
+        .then(|| NttExecutionRequirements::from_prove_schedule(schedule))
+        .transpose()?;
     let root_params = &schedule.root.params.final_group.commitment;
     {
         // Every public group commitment is the fixed terminal F payload. The
@@ -256,6 +249,7 @@ where
         next_params,
         next_binding,
         basis,
+        deferred_ntt_requirements.as_ref(),
     )
     .map_err(|err| AkitaError::InvalidInput(format!("root prove failed: {err:?}")))?;
     let next_state = root.next_state;

@@ -4,8 +4,7 @@
 //! [`RingRelationProver`].
 use crate::compute::{
     BatchDecomposeFoldOutcome, DecomposeFoldBatchPlan, DecomposeFoldPlan, OpeningBatchKernel,
-    OpeningFoldKernel, OperationCtx, RingSwitchProveBackend, RingSwitchRelationKernel,
-    RingSwitchRelationPlan, RootOpeningSource, RuntimeRingSwitchProveBackend,
+    OpeningFoldKernel, OperationCtx, RootOpeningSource, RuntimeRingSwitchProveBackend,
 };
 use crate::validation::validate_i8_setup_log_basis;
 use crate::{DecomposeFoldWitness, DigitRowsComputeBackend, ProverOpeningData};
@@ -23,7 +22,8 @@ use akita_types::RingMultiplierOpeningPoint;
 use akita_types::{assemble_compressed_relation_rhs, assemble_relation_rhs, RingVec};
 use akita_types::{gadget_row_scalars, DigitBlocks};
 use akita_types::{
-    CommittedGroupParams, OpeningFamily, RingRelationGroupOpening, RingRelationInstance,
+    AkitaCommitmentHint, CommittedGroupParams, OpeningClaimsLayout, OpeningFamily,
+    RelationWitnessGeometry, RingRelationGroupOpening, RingRelationInstance,
 };
 
 use super::coefficient_packing::{
@@ -35,8 +35,6 @@ use super::core::{
 };
 use super::fold_grind::{self, ProverTranscriptGrind};
 use super::ring_relation_witness::{RingRelationGroupWitness, RingRelationWitness};
-use crate::backend::RingSwitchRelationView;
-
 mod compression_witness;
 mod relation_quotient;
 
@@ -74,6 +72,17 @@ pub(crate) struct PreparedRingRelation<F: FieldCore, E: FieldCore> {
     pub(crate) instance: RingRelationInstance<F>,
     pub(crate) witness: RingRelationWitness<F>,
     pub(crate) groups: Vec<PreparedRelationGroup<F, E>>,
+}
+
+pub(crate) trait RingRelationPreFoldSink<F: FieldCore>: Send {
+    fn prepare(
+        &mut self,
+        level_params: &CommittedGroupParams,
+        opening_batch: &OpeningClaimsLayout,
+        relation_geometry: &RelationWitnessGeometry,
+        e_hats: &[&DigitBlocks],
+        hints: &[AkitaCommitmentHint<F>],
+    ) -> Result<(), AkitaError>;
 }
 
 impl<F: FieldCore, E: FieldCore> PreparedRelationGroup<F, E> {
@@ -343,7 +352,7 @@ fn compute_relation_d_rows<F, RB, const D: usize>(
 ) -> Result<RelationDRows<F, D>, AkitaError>
 where
     F: FieldCore + CanonicalField + HalvingField,
-    RB: RingSwitchProveBackend<F, D>,
+    RB: DigitRowsComputeBackend<F>,
 {
     let backend = ring_switch_ctx.backend();
     let prepared = ring_switch_ctx.prepared();
@@ -352,40 +361,22 @@ where
         e_hat_planes = e_hat.typed_planes::<D>()?.len()
     )
     .entered();
-    let rows = RingSwitchRelationKernel::relation_rows(
-        backend,
+    let mut products = backend.digit_rows_products_batch(
         prepared,
-        RingSwitchRelationView {
-            e_hat: e_hat.typed_planes::<D>()?,
-            t_hat: &[],
-            z_segment: &[],
-            z_folded_centered_inf_norm: 0,
-        },
-        RingSwitchRelationPlan {
-            n_d: d_row_len,
-            n_b: 0,
-            n_a: 0,
-            log_basis_open: log_basis,
-            log_basis_outer: log_basis,
-        },
+        d_row_len,
+        &[e_hat.typed_planes::<D>()?],
+        log_basis,
     )?;
-    if rows.d_negacyclic.len() != d_row_len
-        || rows.d_cyclic.len() != d_row_len
-        || !rows.b_cyclic.is_empty()
-        || !rows.a_quotients.is_empty()
-    {
+    if products.len() != 1 {
         return Err(AkitaError::InvalidProof);
     }
-    let quotients = rows
-        .d_cyclic
-        .iter()
-        .zip(&rows.d_negacyclic)
-        .map(|(cyclic, reduced)| {
-            relation_quotient::quotient_from_cyclic_and_reduced(cyclic, reduced)
-        })
-        .collect();
+    let product = products.pop().ok_or(AkitaError::InvalidProof)?;
+    let quotients = product.quotients.ok_or(AkitaError::InvalidProof)?;
+    if product.negacyclic.len() != d_row_len || quotients.len() != d_row_len {
+        return Err(AkitaError::InvalidProof);
+    }
     Ok(RelationDRows {
-        reduced: rows.d_negacyclic,
+        reduced: product.negacyclic,
         quotients,
     })
 }
@@ -462,6 +453,8 @@ impl RingRelationProver {
         lp: CommittedGroupParams,
         transcript: &mut T,
         fold_sink: Option<&mut dyn fold_grind::FoldProbeSink>,
+        pre_fold_task: Option<&mut (dyn FnMut() -> Result<(), AkitaError> + Send)>,
+        pre_fold_sink: Option<&mut dyn RingRelationPreFoldSink<F>>,
         bind_claims_after_payload: BindClaims,
     ) -> Result<(PreparedRingRelation<F, PointF>, BoundClaims), AkitaError>
     where
@@ -839,8 +832,8 @@ impl RingRelationProver {
                 })
             })
             .collect::<Result<Vec<_>, AkitaError>>()?;
-        let _grind_span = tracing::info_span!("fold_grind_sample").entered();
-        let (grind_outputs, fold_grind_nonce) =
+        let sample_fold = || {
+            let _grind_span = tracing::info_span!("fold_grind_sample").entered();
             fold_grind::sample_multi_group_fold_decompose_witnesses::<F, PointF, _, OB, T>(
                 opening_ctx,
                 transcript,
@@ -850,8 +843,40 @@ impl RingRelationProver {
                 None,
                 fold_sink,
             )
-            .map_err(|err| AkitaError::InvalidInput(format!("fold grind failed: {err:?}")))?;
-        drop(_grind_span);
+            .map_err(|err| AkitaError::InvalidInput(format!("fold grind failed: {err:?}")))
+        };
+        let (grind_outputs, fold_grind_nonce) =
+            if pre_fold_task.is_some() || pre_fold_sink.is_some() {
+                let e_hats = group_openings
+                    .iter()
+                    .map(GroupOpeningMaterial::e_hat)
+                    .collect::<Vec<_>>();
+                let prepare = || {
+                    if let Some(task) = pre_fold_task {
+                        task()?;
+                    }
+                    if let Some(sink) = pre_fold_sink {
+                        let _span = tracing::info_span!("root_static_et_commit_prefix").entered();
+                        sink.prepare(&lp, &opening_batch, &relation_geometry, &e_hats, &hints)?;
+                    }
+                    Ok(())
+                };
+                let (prepare_result, fold_result) = std::thread::scope(|scope| {
+                    let prepare_handle = scope.spawn(prepare);
+                    let fold_result = sample_fold();
+                    let prepare_result = match prepare_handle.join() {
+                        Ok(result) => result,
+                        Err(_) => Err(AkitaError::InvalidInput(
+                            "root pre-fold worker panicked".into(),
+                        )),
+                    };
+                    (prepare_result, fold_result)
+                });
+                prepare_result?;
+                fold_result?
+            } else {
+                sample_fold()?
+            };
         if grind_outputs.len() != num_groups || hints.len() != num_groups {
             return Err(AkitaError::InvalidProof);
         }

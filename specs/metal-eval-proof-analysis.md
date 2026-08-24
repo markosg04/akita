@@ -2891,6 +2891,1700 @@ commitment schedules and kernels. Repeated bivariate sumcheck rounds can reduce
 table traffic, but their 25-point Stage-1 grid raises arithmetic and register
 pressure. None is promoted ahead of the unchanged-protocol position split.
 
+### Lazy Stage-2 packing-lane index
+
+Stage-2 preparation rebuilt the same lane-to-segment CSR three times: once for
+coefficient-packing terms, once for negacyclic setup terms, and once after
+merging them. The direct Metal path only needs the merged index. Retain the
+compact checked segment geometry during construction and merge, then build the
+CSR once on first direct-layout access. This changes no proof data, arithmetic,
+or backend route.
+
+The focused coefficient-packing suite passed 22 tests. The single T28
+treatment preserved the proof digest, claimed evaluation, transcript replay,
+commitment parity, verifier acceptance, and memory guard. Stage-2 preparation
+fell from 321.108 ms to 18.252 ms, and complete opening fell from 8.143 s to
+7.979 s despite a noisy 122 ms increase in the enclosing Stage-2 span. Against
+the frozen 26.566 s CPU control, the retained stack is now 3.330x. The exact
+five-times ceiling is 5.313 s, leaving 2.665 s to remove from the non-root
+critical path.
+
+### Accelerator-owned Stage-2 lane-weight folding
+
+A command-level diagnostic at T28 measured about 444 ms of Stage-1 command
+waits inside its 580 ms span. Stage 2 was different: about 660 ms of command
+waits inside a 1.241 s span. The host still folds the full relation-lane weight
+table after every lane challenge even though the resident Metal session folds
+the same table for the next round. At T28 the first lane round starts from
+`2^25` fp128 entries; the geometric CPU fold performs about `2^25` field
+multiplications and reads or writes roughly 1 GiB in addition to the already
+measured Metal work.
+
+Keep the canonical host state for the equality factors, small coefficient
+factor, and sparse additional relation. Stop folding only the accelerator-owned
+lane-weight table. At the final round, read the two resident lane weights and
+fold them with the final transcript challenge before reconstructing the
+canonical final claim. This is a backend-state change only: round messages,
+challenges, proof bytes, and verifier equations are unchanged.
+
+The fast gate is one focused direct-proof parity test followed by one T25
+treatment. Retain only if all proof/transcript/evaluation/route guards pass,
+Stage 2 improves by at least 40 ms, and the complete opening improves by at
+least 30 ms. A pass authorizes one T28 treatment; require at least 0.30 s from
+Stage 2 there. Otherwise restore the host fold and do not tune it.
+
+The focused parity tests passed. The first integrated attempt exposed a private
+Metal-buffer read in the candidate's final scalar handoff; a 32-byte final blit
+and an odd-lane regression localized and fixed that implementation error before
+remeasurement. The corrected T25 treatment preserved every correctness and
+route guard, but Stage 2 improved only 17.4 ms, from 471.8 to 454.4 ms. Complete
+opening improved 39.9 ms, from 2.061 to 2.021 s, which is not credible evidence
+for a larger mechanism after the phase gate missed. Reject the candidate,
+remove its final handoff, and do not run it at T28.
+
+### Borrowed resident Stage-2 lane weights
+
+The previous treatment isolated only the geometric CPU fold. It left the larger
+boundary cost intact: the T28 `2^25`-element field table is converted into a
+second 512 MiB limb vector and then copied again into a Metal buffer. Akita's
+fp128 field is already stored as the same four canonical 32-bit limbs consumed
+by the kernel. The conversion therefore adds traffic and allocation but no
+representation change.
+
+Move the original lane-weight vector out of the canonical state for the Metal
+session, borrow its bytes as the initial shared Metal table, and keep it alive
+and immutable while the GPU owns subsequent folds. The no-copy route is used
+only when the allocation satisfies Metal's 16 KiB alignment and size rules;
+record its borrowed byte count explicitly. A 32-byte final blit reconstructs
+the canonical final lane scalar. CPU proving and unqualified Metal fallback keep
+the ordinary owned-vector path. No proof or transcript value changes.
+
+This combines two costs that cannot be removed independently: retaining the
+source is what makes the no-copy buffer safe, while accelerator-owned folding
+prevents the host from reallocating that source. The preregistered gate assumed
+the T25 main table was 256 MiB and required at least that much reported no-copy
+input, Stage 2 at most 0.40 s, upload at least 40 ms below the 76 ms parent, and
+complete opening at least 60 ms below 2.061 s.
+
+The focused parity cases passed, including odd lane counts and nonzero lane
+weights. The T25 treatment then reported 139,231,232 borrowed bytes, revealing
+that the main T25 table is 128 MiB, not the 256 MiB assumed by the gate (T28 is
+512 MiB). More importantly, zero-copy did not improve the critical path:
+Stage 2 was 454.8 ms versus 454.4 ms for accelerator-owned folding alone,
+upload was 80.2 ms versus the 76.3 ms parent, and complete opening was 2.060 s
+versus 2.061 s. The initial table copy is therefore not the missing Stage-2
+mechanism. Reject and remove this candidate without a T28 run.
+
+### Root-chain timeline and static E/T prefix
+
+One diagnostic T25 run recorded first-entry and last-exit times for the retained
+pipeline, then removed the probe. NTT preparation occupied the first 71 ms,
+root coefficient packing the next 97 ms, and ring-relation opening preparation
+ended at 242 ms. The streamed root fold then ran from 244 to 597 ms. Its Metal
+work was 269 ms and its host prefix consumer accumulated 301 ms, so those two
+branches already have essentially no spare T25 overlap.
+
+The next serialized interval is structurally different. Ring-switch group
+emission ended near 716 ms, but the build did not reach its tiny R emission
+until 904 ms. The intervening 188 ms is the CPU commitment of the complete
+E/T blocks following the already-committed Z prefix. E and T are available
+before fold grinding: E is fixed by opening-row preparation, and T is fixed by
+the retained commitment hint. Neither depends on the fold nonce or challenges.
+Committing their complete successor blocks early changes neither witness bytes
+nor transcript order.
+
+At T25 the root Metal time is shorter than the existing Z-prefix consumer, so
+early E/T work can save at most noise and may contend. At T28 the measured root
+Metal time is 2.345 s while the Z consumer accumulates 1.427 s, leaving about
+0.918 s of host work under the GPU critical path. The serialized E/T prefix is
+therefore a max-scale scheduling candidate, not a small-scale speedup claim.
+The implementation must validate that Z ends on a successor commitment-block
+boundary, commit only a contiguous complete-block E/T range, concatenate inner
+rows in canonical order, and leave the boundary block plus R/compression suffix
+on the existing path. Unsupported layouts retain the current schedule.
+
+The credibility gate is exact focused prefix composition followed by one T25
+treatment for contention telemetry. T25 may be neutral, but must not regress by
+more than 25 ms and must report the static-prefix byte count and CPU duration.
+Only a measured T28 overlap model of at least 0.40 s authorizes one T28 run; that
+run must improve complete opening by at least 0.35 s with exact proof,
+transcript, evaluation, commitment, verifier, route, and memory guards.
+
+The T25 treatment was exact and improved rather than merely holding steady.
+The static worker took 259 ms; root streaming rose from 353 to 431 ms under CPU
+contention, but ring-switch build fell from 283 to 93 ms and complete opening
+fell from 2.056 to 1.967 s. This exposed only 78 ms of the overlapped work and
+removed 190 ms from the serialized tail, authorizing the max-scale run.
+
+The single T28 milestone preserved every correctness, route, and memory guard.
+The static worker took 611 ms and remained entirely under the root critical
+path: root streaming was 2.578 s versus 2.600 s in the parent. Ring-switch build
+fell from 823 to 298 ms, and complete opening fell from 7.979 to 7.375 s, a
+604 ms gain. Against the frozen 26.566 s CPU control this is 3.602x. The exact
+five-times ceiling remains 5.313 s, leaving 2.062 s on the Metal critical path.
+Retain the generic pre-fold hook, complete-block range checks, and canonical
+prefix composition.
+
+### Subring-owned root fold
+
+The max-scale refresh also corrects an earlier operation count.  The root uses
+an ambient D512 ring, but its coefficient-packing challenges are sampled in
+the D64 subring and embedded with stride eight.  Each challenge therefore has
+the production D64 shell (31 coefficients of magnitude one and 10 of
+magnitude two), not the native D512 weight 19 assumed in the earlier roofline.
+The populated T28 fold performs
+
+```text
+253,779,321 rows * 30 columns * 41 terms = 312,148,564,830 atomics.
+```
+
+That embedding exposes a stronger factorization.  Write a source coefficient
+as `s = low + 8 * high`, with `low < 8`, and write the embedded challenge as
+`c(X^8)`.  Then
+
+```text
+X^s c(X^8) = X^low Y^high c(Y),  where Y = X^8 and Y^64 = -1.
+```
+
+Thus the D512 output is exactly eight independent D64 negacyclic histograms.
+Give one SIMDgroup to each `low` residue and two D64 destinations to each of
+its 32 lanes.  Source SIMDgroups partition each 256-task tile into the eight
+residues with ballots and a 4 KiB threadgroup queue.  After one barrier, the
+destination SIMDgroup reads a dense 64-byte challenge row and accumulates its
+two bins in `i32` registers.  A second barrier makes the queue reusable.  This
+removes all response-histogram atomics, preserves all eight active SIMDgroups,
+and uses no large threadgroup histogram.  It performs 64 ordinary signed-byte
+lookups/adds per selected source instead of 41 contended atomics; challenge
+storage is under 1 MiB at T28 and every accumulator is bounded by the existing
+response-digit check.
+
+This is distinct from the rejected register-distributed D512 kernel: that
+kernel routed each sparse contribution through 32 SIMD broadcasts.  Here the
+subring factorization makes ownership direct, so no contribution is shuffled.
+It is also distinct from the rejected 32 KiB private-histogram design: this
+kernel uses two scalar accumulators per lane and roughly 4.25 KiB of shared
+queue state.
+
+Pre-register the existing independent packed-fold oracle plus an embedded-D64
+focused case.  Promote to one T28 credibility run only after exact focused
+parity and a release build.  On T28 require exact proof bytes, transcript,
+evaluation, commitment, verifier, schedule, routes, and memory guards.  Retain
+only if packed-decompose GPU time is at most 1.35 s and complete opening is at
+most 6.45 s (at least 0.925 s better than the 7.374884 s parent).  A kernel
+compile failure, any parity failure, or either timing miss restores the atomic
+parent without tuning tile sizes.
+
+The focused oracle and the single T28 proof were exact, but both performance
+falsifiers triggered.  Packed-decompose GPU time fell only from 2.307 s to
+1.802 s, and complete opening fell from 7.374884 s to 7.006756 s.  This is a
+real 368 ms whole-proof gain, but only a 1.28x root-kernel gain and less than
+40% of the required treatment effect.  The result implies that the ordinary
+dense add/load path is only about twice as cheap as the shared atomic path;
+performing 64 dense operations for every 41 sparse operations consumes most of
+that advantage.  Restore the atomic parent and do not tune queue tiles or
+barrier placement.  A viable root replacement must also reduce arithmetic,
+not merely exchange sparse atomics for dense lane-owned additions.
+
+### Factored Stage-2 relation prefix
+
+For each of the eight relation grid points, the retained two-round prefix forms
+16 challenge-weighted digit quads per live lane and then multiplies the result
+by that lane's equality weight.  Exact distributivity permits the opposite
+order: reduce `lane_weight * witness_quad` over lanes first, then perform only
+16 full challenge products per workgroup.  A candidate mapped one SIMDgroup to
+each quad pair, cached at most 512 lane weights in threadgroup memory, and left
+the structured linear terms on their canonical lane-owned path.  It changed no
+message, challenge, proof field, or dispatch count and removed roughly 114
+million full fp128 products at T28.
+
+The existing 16-quad CPU/Metal parity test passed.  The single T25 gate retained
+the proof digest, transcript, claimed evaluation, verifier result, commitment,
+route, and memory guards.  Stage 2, however, was 470.466 ms versus 474.889 ms
+for the retained parent, and complete opening was 1.942101 s versus 1.966950 s.
+Both improvements are noise-scale and miss the preregistered 420 ms Stage-2 and
+1.920 s complete ceilings.  The mandatory digit scans, reductions, and
+structured terms control this kernel, not the displaced full products.  Revert
+the candidate and do not spend a T28 run on this algebraic ordering.
+
+### Block-batched root coefficient packing
+
+The most attractive apparent pass elimination would derive the sparse root-fold
+challenge before constructing the coefficient-packing opening payload, allowing
+the 1.098 s host packing scan to overlap the 2.578 s Metal fold.  Reject that
+reorder analytically.  The protocol deliberately absorbs the complete opening
+digit payload before drawing the fold challenge; moving the draw earlier would
+allow a prover to choose a high-dimensional opening witness after seeing the
+challenge.  A later scalar evaluation check does not by itself prove that the
+lost independence is harmless.  This needs a separate soundness argument or an
+additional binding commitment and is outside the minor protocol-change budget.
+
+The unchanged-protocol candidate instead attacks a host traversal defect.  At
+T28 the specialized root packing route launches 512 independent row-block
+tasks.  Every task walks the same `2^18 x 8` table of combined position and
+packing weights while accumulating its own `30 x 64` deferred fp128 histogram.
+Batch four blocks per Rayon task, visit one position at a time, load its eight
+weights once, and update four independent histograms.  This retains 128 T28
+tasks and 16 T25 tasks, keeps about 150 KiB of accumulator state per task, and
+does not change the source, output order, field reduction, transcript, or proof.
+
+The focused generic-versus-specialized oracle covers both stride-two and
+stride-eight geometries and must remain exact.  One T25 treatment is only a
+contention/non-regression gate: preserve every correctness and route guard,
+keep root coefficient packing at most 110 ms, and keep complete opening at most
+2.00 s.  A pass authorizes one T28 treatment.  Retain there only if root
+coefficient packing is at most 650 ms and complete opening is at most 6.95 s,
+with the frozen proof, transcript, evaluation, commitment, verifier, route, and
+memory guards unchanged.  Either T28 timing miss restores the one-block
+traversal without tuning the batch size.
+
+The exact stride-two/stride-eight oracle passed.  The T25 treatment preserved
+the proof digest, transcript, evaluation, commitment, verifier, route, and
+memory guards, but rejected the traversal before T28: root coefficient packing
+rose from 91.564 ms to 125.279 ms and complete opening rose from 1.966950 s to
+2.017813 s.  Interleaving four distant row-block streams costs more than the
+shared weight-row reuse saves.  Restore the one-block traversal and do not tune
+the batch size.
+
+### Fixed-shape raw-limb root packing loop
+
+The next candidate preserves the accepted one-block sequential traversal.  For
+the exact Jolt root shape (`30` live columns, embedding stride `8`, partial
+width `64`), predecode the combined weights to their two canonical limbs, use
+fixed loop bounds and the closed-form even/odd bucket map, and update the same
+deferred histograms.  The crate forbids unsafe code, so this remains a checked
+specialization; the benefit must come from removing field decoding and giving
+the optimizer fixed index ranges, not from bypassing the project invariant.
+All other shapes retain the generic loop.
+
+Require the existing stride-two/stride-eight generic oracle first.  One T25
+treatment must preserve every exactness and route guard, put root coefficient
+packing at or below 85 ms, and keep complete opening at or below 1.96 s.  Only
+then run T28.  Retain at T28 only if root coefficient packing is at most 800 ms
+and complete opening is at most 7.10 s, with every frozen correctness, route,
+and memory guard intact.  A miss restores the generic inner loop without
+tuning unroll factors or representation details.
+
+The focused oracle and T25 gate passed: packing fell from 91.564 ms to 76.907
+ms and complete opening reached 1.937607 s.  The one authorized T28 treatment
+also preserved every exactness, route, verifier, and memory guard, but rejected
+the mechanism.  Packing fell only from 1.097750 s to 979.611 ms, while complete
+opening fell from 7.374884 s to 7.334839 s.  These miss the 800 ms and 7.10 s
+ceilings; neighboring phase variation absorbs most of the 118 ms local gain.
+Restore the generic loop.  Together with the atomic, segmented, block-batched,
+and fixed-shape results, this closes local host root coefficient-packing loops
+as a route to five times.
+
+### Run-coalesced Metal root coefficient packing
+
+The packed Metal kernel originally emitted eight threadgroup atomics for every
+selected row.  In Jolt's T28 layout, a Metal thread visits rows 256 apart and
+those contributions remain in the same coefficient bucket for the full
+32,768-row partial.  An exact candidate accumulated that run canonically in an
+fp128 register and emitted only one eight-digit atomic flush.  An adversarial
+alternating-bucket test and a maximal-run test both matched the CPU definition;
+the Jolt stride-two and stride-eight oracle also passed.
+
+The T25 gate was exact and passed its loose credibility ceilings at 135.116 ms
+for root packing and 1.980265 s complete.  It nevertheless trailed the retained
+1.966950 s parent.  The one authorized T28 treatment was also exact, used zero
+planned CPU packing calls, and preserved every verifier, transcript,
+commitment, route, and memory guard.  Root packing was 1.034708 s versus the
+1.097750 s CPU route, while complete opening regressed from 7.374884 s to
+7.549810 s.  This rejects canonical run accumulation: it exchanges contended
+atomics for roughly eight billion modular fp128 additions and then scales almost
+exactly with the row count.
+
+The next representation candidate keeps the proven run ownership but stores
+eight independent radix-2^16 digit sums.  A run has at most 128 contributions,
+so each local digit fits in `uint`; the aggregate bound remains
+`32,768 * 65,535 < i32::MAX`, exactly the invariant already used to size row
+partials.  This removes carry propagation and modular reduction from every row;
+only the final existing wide reduction interprets the digit sums as a field
+element.  Require the same three parity oracles.  At T25 require root packing at
+most 80 ms and complete opening at most 1.94 s.  Only then authorize T28, where
+retention requires root packing at most 450 ms and complete opening at most
+6.70 s.  A miss restores the CPU route and the original generic Metal kernel.
+
+The three parity oracles passed, but the T25 treatment rejected the carry-free
+representation before T28.  Root packing was 132.215 ms, statistically
+indistinguishable from the 135.116 ms canonical-run candidate and still slower
+than the 91.564 ms CPU parent; complete opening was 2.060936 s.  Canonical carry
+propagation was therefore not material.  The remaining first-order defect is
+the memory traversal: one threadgroup owns one column, so adjacent SIMD lanes
+load bytes 30 apart and each row is revisited by all 30 column groups.
+
+A column-tiled candidate uses the same 8 KiB threadgroup digit budget to own
+four columns when the root subring dimension is 64 (two at dimension 128 and
+one at dimension 256).  Each thread consumes the columns for one row together,
+keeps one carry-free run per local column, and writes the unchanged
+column-major partial layout.  The qualified D512/K256/stride-eight index map is
+`position = row / 2`, `coefficient = 256 * (row & 1) + hot`, avoiding dynamic
+division in the dominant shape.  This reduces root threadgroups and lane-cache
+transactions by up to four without increasing shared memory.  Require the
+stride-two/stride-eight Jolt oracle plus long-run and alternating-run Metal
+oracles.  At T25 require packing at most 80 ms and complete opening at most
+1.94 s; at T28 require at most 450 ms and 6.70 s respectively.  Do not tune the
+tile width after either miss.
+
+All parity oracles passed, but the T25 treatment rejected before T28.  Root
+packing took 141.627 ms and complete opening took 2.072766 s, slower than both
+run-accumulation candidates and the retained CPU-packing parent.  Coalescing
+four source columns did not offset register-array indexing and unchanged
+weight traffic.  Restore the CPU route and generic Metal kernel.  The atomic,
+segmented, block-batched, canonical-run, carry-free-run, and column-tiled
+results close standalone Metal coefficient packing for this root shape.
+
+### Pair-packed subring-owned root fold
+
+Changing the production D64 challenge to D128--D512 is not a fair-ratio
+candidate.  The challenge weights would fall from 41 to 31, 23, or 19, but the
+same reduction applies to the 15.604 s CPU root decomposition.  A linear T28
+projection for D512 changes the CPU control from 26.566 s to about 18.193 s and
+the Metal treatment from 7.375 s to about 6.138 s: roughly 2.96x, farther from
+the matched-protocol five-times objective.  Keep the schedule fixed and attack
+only accelerator overhead.
+
+The atomic root kernel performs 312.149 billion threadgroup atomics.  The exact
+subring-owned treatment proved that dense D64 ownership works, but used 64
+ordinary challenge loads and additions per selected source and reached only
+1.802 s.  The next candidate removes its queue and barriers and packs two
+destination coefficients into one 32-bit accumulator.  Two SIMDgroups own four
+of the eight embedded D64 residue classes each.  A lane owns two adjacent D64
+coefficients.  For every selected source, only the owning SIMDgroup loads one
+prepacked challenge pair and performs one ordinary add per lane.  The pair uses
+two 16-bit biased fields; at most 30,720 sources contribute to a position, so
+`4 * 30,720 < 2^17` and each field is accumulated in a 32-bit lane without
+cross-field carry.  Subtracting twice the source count recovers the two exact
+signed sums.
+
+Store even- and odd-start challenge pairs once per production D64 challenge.
+The table is about 3.75 MiB at T28, versus roughly 1 TiB of logical sparse-term
+traffic in the atomic kernel, and is shared by the many simultaneously active
+position groups.  Each source now causes 32 coalesced ordinary pair loads/adds
+instead of 41 atomics or 64 dense scalar loads/adds.  The input scan is repeated
+by two SIMDgroups (about 16 GiB at T28), a small fraction of the challenge-term
+traffic.  The conservative extrapolation from the exact 1.802 s dense kernel is
+0.90--1.15 s of GPU time.
+
+This kernel alone cannot remove all of that interval from the complete proof.
+The streamed host Z-prefix consumer currently takes 1.586 s and becomes the
+critical branch once GPU time falls below it.  Therefore treat this as the first
+half of one architecture: first make the root fold sub-second, then keep its
+balanced Z digits resident and feed the successor commitment without the host
+stream.  The latter is authorized only by a successful kernel result.
+
+Require the generic arbitrary-position fallback oracle and a new embedded-D64
+oracle before timing.  At T25 require exact proof/transcript/evaluation/
+commitment/verifier parity, no fallback, root-fold GPU time at most 210 ms, and
+complete opening at most 1.97 s.  One passing gate authorizes T28.  At T28 retain
+only if root-fold GPU time is at most 1.15 s and complete opening is at most
+6.90 s.  A miss restores the atomic kernel without tile or SIMDgroup tuning.  A
+pass makes resident Z-to-successor commitment, rather than another root
+microkernel, the next candidate.
+
+Both exactness oracles passed, but the T25 credibility run rejected the kernel
+before T28.  Packed-decompose GPU time rose from 273.624 ms to 753.433 ms,
+streamed root wall time rose from 429.910 ms to 813.420 ms, and complete opening
+rose from 1.966950 s to 2.389943 s.  Replacing atomics did not compensate for
+serial task/address generation in two SIMDgroups and the much larger rotated
+pair lookup surface.  Restore the atomic kernel and sparse challenge buffers;
+do not tune the pair table or SIMDgroup count.
+
+### Column-major sidecar for root coefficient packing
+
+The standalone Metal packing kernels have so far consumed Jolt's row-major
+lane table directly.  A threadgroup owns one `(column, block, row-partial)`, so
+adjacent SIMD lanes read bytes 30 apart.  At T28 this turns an 8 GiB source pass
+into poorly coalesced cache-line traffic.  Tiling several columns inside the
+packing kernel increased register pressure and did not fix that input contract.
+
+Keep the row-major table used by the PIOP and commitment paths.  At the root
+opening boundary, transpose it once on device into a temporary column-major
+sidecar with a 32-by-32 byte tile.  The existing single-column packing kernel
+then reads consecutive rows from consecutive bytes, retaining its checked
+wide-digit accumulator, output order, and reduction.  The sidecar adds exactly
+one source-sized allocation and 16 GiB of linear T28 transpose traffic.  At the
+measured machine bandwidth that traffic has a tens-of-milliseconds floor; even
+a conservative 0.10--0.20 s transpose leaves room to reduce the 1.098 s host
+packing phase by 0.5--0.8 s.  Peak memory projects near 35 GiB, below the 90 GiB
+guard.  No Jolt layout, proof field, challenge, transcript, or verifier changes.
+
+Require stride-two and stride-eight CPU/Metal parity.  One T25 treatment must
+report zero planned CPU packing calls, root packing at most 110 ms, complete
+opening at most 2.00 s, and every correctness/route/memory guard exact.  Only a
+pass authorizes T28.  At T28 retain only if root packing is at most 550 ms and
+complete opening is at most 6.85 s.  Either miss restores the optimized CPU
+route and removes the sidecar without tuning the transpose tile.
+
+Exact stride-eight parity passed and the route reported zero planned CPU work,
+but the T25 treatment rejected before T28.  Root packing took 159.844 ms and
+complete opening took 2.073550 s, versus 91.564 ms and 1.966950 s for the
+retained CPU-packing parent.  The extra device transpose and allocation cost
+more than coalesced reads recovered.  Restore the optimized CPU route and
+remove the sidecar; the row-major source contract is not the limiting seam at
+this scale.
+
+### Microtiled eight-residue root fold
+
+The rejected pair-packed root kernel assigned four D64 residue classes to each
+of only two SIMDgroups.  It therefore serialized four queue drains per active
+group and left six SIMDgroups idle.  That result does not test packed arithmetic
+with the eight-residue occupancy of the exact 1.802 s dense-subring kernel.
+
+Retain one SIMDgroup per embedded D64 residue.  For each 256-source microtile,
+the group lanes own the 32 adjacent coefficient pairs, and each queued source
+adds one prepacked biased pair.  A coefficient in `[-2, 2]` is stored as
+`coefficient + 2`; at most 256 sources enter one residue queue, so each 16-bit
+half accumulates at most `4 * 256 = 1024` and cannot carry into its neighbor.
+After every microtile, subtract twice the queue count and add the two exact
+signed values to persistent `i32` accumulators.  Even- and odd-start D64 pair
+tables remain about 3.75 MiB at T28.  The generic sparse-atomic kernel remains
+the fail-closed route for non-embedded or wider challenges.
+
+This keeps the proven 8 KiB queue/barrier geometry, restores all eight active
+SIMDgroups, and performs 32 packed additions per selected source instead of 64
+dense additions or 41 atomics.  The exact dense result calibrates a 0.9--1.3 s
+T28 GPU interval; the 1.586 s host Z-prefix consumer will then control the root
+wall time.  This candidate is useful only if it makes resident Z commitment or
+later sumcheck work the next bottleneck.
+
+Require the arbitrary-position atomic fallback oracle and an embedded-D64
+pair oracle before timing.  One T25 treatment must keep every proof,
+transcript, evaluation, commitment, verifier, route, and memory guard exact,
+put packed-decompose GPU time at most 240 ms, and complete opening at most
+1.95 s.  Only a pass authorizes T28.  At T28 retain only if GPU time is at most
+1.30 s and complete opening is at most 6.60 s.  A miss restores the atomic
+kernel without changing the microtile or queue geometry.
+
+Both exactness oracles passed, but the T25 treatment rejected before T28.
+Packed-decompose GPU time was 258.893 ms, only 14.731 ms below the 273.624 ms
+atomic parent and above the 240 ms gate.  Complete opening regressed to
+2.055697 s.  Eight active residue owners removed the earlier serialization,
+but 256-source queue construction and its 240 threadgroup barriers now control
+the kernel; halving the dense add count is nearly immaterial.  Restore the
+sparse atomic kernel and remove the pair-table route.
+
+### Concurrent public NTT prewarm
+
+The retained T28 proof serializes 0.332 s of public NTT-cache construction
+before 1.098 s of root coefficient packing and the 2.578 s streamed root fold.
+The Metal facade builds these retained NTT slots through its CPU backend. A
+top-level overlap can therefore remove at most the full 0.332 s and may recover
+less if cache construction competes with CPU coefficient packing. It cannot by
+itself close the 2.062 s five-times gap; its purpose is to test whether this
+independent schedule/setup work belongs off the critical path before larger
+resident-root changes.
+
+For accelerator-root stacks only, build the already validated, schedule-derived
+NTT plan in a scoped worker while the ordinary prover proceeds. Lazy cache
+cells preserve exact ownership: a proof operation that reaches a slot early
+waits for the same construction rather than building a duplicate. CPU-only
+proving retains the serial order. No schedule, transcript event, proof field,
+opening value, or verifier operation changes, and the worker is joined before
+the proving call returns. Use the already validated 8 MiB worker-stack bound:
+the CRT preparation path contains large fixed arrays and overflows macOS's
+default spawned-thread stack before any measurement can begin.
+
+Require focused exact proof parity before timing. One T25 treatment must keep
+the proof, transcript, evaluation, commitment, verifier, route, and memory
+guards exact; complete opening must be at most 1.927 s, a 40 ms gain over the
+1.966950 s retained parent. A miss restores serial prewarm without tuning. Only
+a pass authorizes T28, where retention requires complete opening at most 7.175
+s, a 0.20 s gain over the 7.374884 s parent. The analytical T28 floor for this
+candidate alone is 7.043 s; any larger claim is impossible because all
+remaining work is unchanged.
+
+The single T25 treatment was exact but missed the gain gate. Complete opening
+was 1.951969 s, only 14.981 ms below the 1.966950 s parent and above the 1.927 s
+ceiling. Proof digest, transcript, evaluation, commitment, verifier, route, and
+memory guards all matched. Contention consumed nearly all of the nominal
+overlap: NTT preparation rose from 88.100 to 182.438 ms and root coefficient
+packing rose from 96.744 to 138.833 ms. Reject without T28, restore serial
+prewarm, and do not overlap two CPU-heavy setup/opening phases again. A useful
+prewarm overlap would need to start after coefficient packing and hide under
+the Metal root fold; that requires a deliberate phase-boundary API and remains
+bounded to 0.332 s at T28.
+
+### Four-shard root histogram
+
+For a fixed root position, adjacent tasks vary over `(block, column, row-half)`.
+The Jolt fixture's row residue is independent of block because the 65,536 root
+positions are divisible by 128. The embedded D64 challenge preserves the
+source residue, so 256 workers distribute as about 32 simultaneous writers to
+each 64-bucket residue class. Under an independent-bucket model those 32 writes
+occupy about 25.3 distinct buckets: roughly 21% serialize on a same-step
+collision before accounting for repeated structured values.
+
+Give each fixed set of 64 workers its own 512-entry threadgroup histogram and
+reduce four exact shard values only after the source scan. Each shard then has
+about eight writers per residue and an expected 7.58 distinct buckets, about
+5% collision loss. The kernel still performs the same 312.149 billion exact
+T28 atomics and reads the same source/challenges; it grows threadgroup storage
+from 2 to 8 KiB. Four 256-thread groups still fit a 32 KiB threadgroup-memory
+budget, so the mapping should not reduce the thread-count occupancy ceiling.
+This is a contention treatment, not a claim to have removed the atomic floor.
+
+Require the existing D512 packed-fold CPU/Metal oracle. One T25 treatment must
+keep every proof, transcript, evaluation, commitment, verifier, route, and
+memory guard exact, put packed-decompose GPU time at most 250 ms, and complete
+opening at most 1.94 s. Only a pass authorizes T28. At T28 retain only if GPU
+time is at most 2.05 s and complete opening is at most 7.15 s, gains of at least
+0.257 s locally and 0.225 s end to end. A miss restores the single histogram
+without changing shard count or layout.
+
+The focused oracle passed, but the single T25 treatment rejected before T28.
+Packed-decompose GPU time was 274.600 ms versus 273.624 ms for the single-
+histogram parent, and complete opening was 1.976056 s versus 1.966950 s. Every
+proof, transcript, evaluation, commitment, verifier, route, and memory guard
+remained exact. The collision estimate did not translate into throughput:
+threadgroup atomic issue rate, not same-bucket serialization, controls this
+kernel. Restore the single histogram and do not tune shard count or layout.
+
+### Barrier-free SIMDgroup-local subring histograms
+
+The dense subring-owned treatment removed atomics but retained a shared queue
+and 240 producer/consumer barriers per T28 position. Pair packing reduced its
+arithmetic but not that synchronization floor. Instead, let each of the eight
+SIMDgroups consume its own strided eighth of the source tasks and retain a
+complete D512 partial as sixteen `i32` accumulators per lane. For each 32-task
+batch, a ballot identifies the source residue; the 32 destination owners read
+the corresponding dense D64 challenge coefficients directly and apply the
+negacyclic sign. The eight SIMDgroups write their partials once, cross one
+threadgroup barrier, and reduce to the canonical D512 output.
+
+At T28 this performs 7.613 billion selected-source visits and 487.3 billion
+ordinary signed-byte load/add updates, versus 312.149 billion threadgroup
+atomics. The dense challenge table is 3.75 MiB and shared across all 65,536
+position groups. Per-group scratch is 16 KiB; one final store/read reduction is
+32 KiB and negligible beside the source loop. The scratch may halve resident
+threadgroups relative to the atomic kernel, while the sixteen lane accumulators
+may add register pressure. Those are explicit falsifiers, not omitted costs.
+Arbitrary D512 challenges retain the atomic path; only challenges whose support
+is exactly embedded at stride eight use the new kernel.
+
+Require both arbitrary-position fallback parity and embedded-D64 CPU/Metal
+parity. One T25 treatment must preserve every proof, transcript, evaluation,
+commitment, verifier, route, and memory guard, put packed-decompose GPU time at
+most 235 ms, and complete opening at most 1.94 s. Only a pass authorizes T28.
+At T28 retain only if GPU time is at most 1.45 s and complete opening is at most
+6.65 s. A miss removes the dense route without tuning batch size, scratch
+layout, or accumulator packing.
+
+Both focused routes passed, but the single T25 treatment rejected before T28.
+Packed-decompose GPU time rose to 322.490 ms from the 273.624 ms atomic parent,
+and complete opening was 1.971287 s, above the 1.94 s gate. Proof, transcript,
+evaluation, commitment, verifier, route, and memory guards remained exact. The
+extra 1.56x dense coefficient work plus the 16-accumulator and 16 KiB occupancy
+cost exceeded the saved atomics and barriers. Remove the dense route. Together
+with the queue-owned, pair-packed, microtiled, and sharded results, this closes
+dense/register histogram reformulations of the current root equation.
+
+### Large-tile residue-owned root gather
+
+The rejected residue kernels each retained one of two controlling costs. The
+two-SIMDgroup pair kernel serialized four residues per group. The eight-group
+microtile kernel routed each 256-task tile through a shared queue and crossed
+240 threadgroup barriers at T28. The barrier-free kernel instead gave every
+group a full D512 partial, requiring sixteen live `i32` accumulators per lane
+and 64 dense scalar updates per selected source.
+
+The next mapping combines none of those mechanisms. Stage 8,192 task selectors
+once into an 8 KiB threadgroup tile. Each of the eight SIMDgroups owns one
+embedded-D64 residue, scans the cheap staged bytes, and selects its tasks with
+a SIMD ballot. Its 32 lanes own two D64 coefficients each and accumulate only
+an `int2`. A selected source reads the canonical 64-byte dense challenge row,
+using the subring source shift to derive two negacyclic coefficients per lane.
+The tile needs two barriers, so T28's 30,720 tasks use eight barriers total
+rather than 240. The source table is read once; only the 8 KiB threadgroup tile
+is scanned eight times. The qualified dense challenge table is about 0.94 MiB
+at T28 and arbitrary D512 challenges retain the atomic kernel.
+
+This replaces 41 scalar threadgroup atomics per selected source with 32
+coalesced pairs of byte loads and ordinary `int2` accumulation. Its logical
+T28 challenge traffic is about 515 GB. Charging that entirely to the machine's
+advertised 546 GB/s gives a deliberately conservative 0.94 s traffic floor;
+the table is cache-reused across 262,144 positions, but address generation and
+SIMD selection add work. The calibrated prediction is 1.0--1.4 s of GPU time,
+versus the 2.307 s atomic parent. No source layout, challenge distribution,
+proof message, transcript event, or verifier equation changes.
+
+Require arbitrary-D512 fallback parity and embedded-D64 residue-gather parity.
+One T25 treatment must keep every proof, transcript, evaluation, commitment,
+verifier, route, and memory guard exact and put packed-decompose GPU time at
+most 220 ms; complete opening need only remain at most 2.00 s because its
+0.375 s host consumer already controls the T25 root branch. Only a pass
+authorizes T28. Retain there only if packed-decompose GPU time is at most
+1.45 s and complete opening is at most 6.65 s. A miss removes the pipeline and
+dense table without changing tile size or adding another treatment.
+
+Both exactness routes passed, but the T25 credibility gate rejected the
+candidate before T28. Packed-decompose GPU time rose from 273.624 ms to
+371.942 ms, missing the 220 ms gate, while complete opening was 1.991994 s.
+The eight repeated scans of each staged selector tile cost more than the
+atomics they replaced at this scale. Remove the residue-gather pipeline and
+dense table without tuning the tile size.
+
+### Audited D256 root packing challenge
+
+The sparse atomic root kernel is the only measured formulation that exploits
+the challenge support efficiently. Change the work count rather than its
+mapping: for the qualified Jolt K256 rows, constrain the already-supported
+subring coefficient-packing method from D64 to D256. This selects Akita's
+production D256 challenge family, 23 random signed unit coefficients with a
+131-bit support floor, instead of D64's 31 signed unit and 10 signed double
+coefficients. No sampler, verifier equation, transcript mechanism, or security
+floor changes.
+
+The exact planner comparison keeps the T28 root at D512/rank one with 262,144
+positions. Sparse fold work falls to `23 / 41 = 56.1%`. The wider challenge
+also distributes root histogram updates over four times as many buckets and
+removes the magnitude-two case. The offsetting costs are explicit. At T28 the
+root successor grows from 942,788,224 to 1,078,019,008 coefficients (14.3%),
+the first recursive successor grows from 18,329,408 to 25,446,016
+coefficients, proof payload grows from 76,138 to 76,760 bytes (0.82%), and
+setup capacity grows from 180,355,072 to 360,710,144 field elements. Root
+fold and opening digit depths remain unchanged at 4 and 43. At T25 the root
+successor grows 20.0%; proof payload is unchanged at 75,210 bytes.
+
+The local T28 prediction is 1.2--1.4 s of packed-decompose GPU time, down from
+2.307 s. The 1.586 s host Z-prefix consumer should then control that branch,
+while the wider relation and recursive successor add an estimated 0.25--0.45
+s elsewhere. The predicted complete interval is 6.5--6.9 s. This cannot reach
+five-times alone; it is useful only if it removes at least 0.575 s and leaves a
+smaller, measured Stage-1/Stage-2 target.
+
+Use one T25 credibility run under the regenerated schedule. Require every
+proof, transcript, evaluation, commitment, verifier, route, and memory guard,
+packed-decompose GPU time at most 190 ms, and complete opening at most 2.20 s.
+This gate permits the expected small-shape relation expansion because its job
+is to falsify the local work model. A pass authorizes one T28 run. Retain only
+if packed-decompose GPU time is at most 1.40 s, complete opening is at most
+6.80 s against the frozen 7.374884 s Metal parent, and peak RSS remains below
+90 GiB. Compare both the original frozen CPU control and a same-schedule CPU
+control; report both ratios. Any T28 miss restores the D64 catalog rows.
+
+The local work gate passed, but the end-to-end T25 gate rejected the treatment.
+Packed-decompose GPU time fell from 273.624 ms to 184.851 ms, while the host
+prefix consumer rose from 374.807 ms to 781.139 ms and ring-relation
+preparation rose from 639.872 ms to 1,441.997 ms. Complete opening therefore
+rose from 1.966950 s to 2.953407 s. The same-schedule CPU control took
+6.662883 s, so the treatment reached only 2.256x. Every proof, transcript,
+evaluation, commitment, verifier, route, and memory guard passed. Reject
+without T28 and restore D64. A wider root challenge is viable only after the
+prefix consumer and relation construction can consume the wider output without
+material host work.
+
+### On-demand large-root NTT preparation
+
+The retained T28 proof pays 331.552 ms to build every retained NTT slot before
+root coefficient packing. The earlier concurrent-prewarm treatment started at
+that same boundary and failed because construction competed with the 1.098 s
+CPU packing scan. The existing lazy cache provides a later boundary without a
+new worker: if eager prewarm is disabled, the static E/T prefix worker first
+requests the slots when fold grinding starts. Cache construction then runs
+beside the 2.307 s root GPU fold, and concurrent users wait on the same slot
+rather than building duplicates.
+
+This is safe only as a scheduling policy. Every operation retains its checked
+cache key and first-use construction path; the schedule, matrices, proof,
+transcript, and verifier are unchanged. The retained root's streamed host
+consumer takes 1.586 s and the static E/T worker takes 0.611 s. Adding the full
+0.332 s construction cost to either branch remains below the GPU interval, so
+the analytical best case is 7.043 s. Apply on-demand construction only to the
+41-variable Metal trace route; smaller routes keep eager preparation because
+their host consumer already controls root wall time.
+
+Use one T28 treatment against the frozen 7.374884 s parent. Require identical
+proof digest, transcript, evaluation, commitment, verifier, schedule, routes,
+and memory guard. Retain only if complete opening is at most 7.150 s, root
+streaming is at most 2.70 s, and no formerly retained cache is built after the
+root overlap. Any miss restores eager preparation and removes the policy from
+the Jolt route without tuning the variable threshold.
+
+The single T28 treatment was exact but rejected. Complete opening rose to
+7.538420 s, while packed-decompose GPU time remained 2.297 s and root streaming
+remained 2.557 s. NTT construction still took 333.840 ms; its first serialized
+demand was relation-opening preparation, which rose from 177.201 ms to
+506.535 ms. The static E/T worker therefore never owned the first cache demand,
+invalidating the overlap model. Restore eager construction and remove the stack
+policy rather than moving the threshold.
+
+### Stage-2 product-count reassessment
+
+An environment-gated T25 trace of the retained parent identified the dominant
+Stage-2 instance as a 2^29 domain with 5,269,135 live lanes, a 2^23 lane
+capacity, six coefficient variables, four structured-linear sources, and
+614,776 sparse lane segments. Its two-round compact prefix took 63.292 ms of
+GPU time. The remaining large coefficient dispatches took 42.997, 24.825,
+10.218, 5.208, and 2.294 ms; the geometric lane tail was negligible. Thus T28
+already has enough occupancy. The scalable target is the product count in the
+first six dispatches, not dispatch width or the late-round tail.
+
+For each post-prefix pair let `d = right - left`, `e` be the remaining equality
+factor, `l0` the Gruen linear factor at zero, `ld = l1 - l0`, and `p0,p1` the
+ordinary plus structured-linear relation factors. The retained kernel computes
+
+```text
+c0 += e*l0*left*(left + 1) + left*p0
+c2 += e*(l0*d^2 + ld*d*(2*left + 1)) + d*(p1 - p0)
+c3 += e*ld*d^2.
+```
+
+Factor the shared outer witness values instead:
+
+```text
+e0 = e*l0; ed = e*ld
+c0 += left*(e0*(left + 1) + p0)
+c2 += d*(e0*d + ed*(2*left + 1) + p1 - p0)
+c3 += ed*d^2.
+```
+
+This is the same polynomial and preserves every address, load, store, reduction,
+round, and transcript value. It removes three of the fifteen full field
+multiplications per pair while leaving structured-linear source products
+unchanged. The 20% arithmetic ceiling applies to the 85.542 ms T25 post-prefix
+root work, for a 17.108 ms local ceiling. At T28 the corresponding analytical
+ceiling is about 0.137 s under linear scaling; this candidate is incremental and
+cannot by itself close the 2.062 s end-to-end gap.
+
+Require focused direct Stage-2 CPU/Metal proof parity. The single T25 treatment
+must preserve the proof, transcript, evaluation, commitment, verifier, route,
+and memory guards. Retain only if the five traced root coefficient dispatches
+total at most 72.0 ms, a 15.8% local gain, and Stage-2 sumcheck is at most
+0.465 s. A miss restores the original coefficient equations without tuning.
+Only a pass authorizes T28, where retention requires Stage 2 at most 1.10 s and
+complete opening at most 7.30 s.
+
+Both focused parity tests passed, and the T25 treatment kept every end-to-end
+exactness and route guard, but the local gate rejected it. The five root
+coefficient dispatches totaled 78.453 ms, down 7.089 ms or 8.3% rather than the
+required 15.8%. Stage 2 fell from 474.889 to 464.456 ms and complete opening
+from 1.966950 to 1.956050 s. The smaller-than-product-count gain shows these
+rounds are only partly multiplier-bound. Do not spend a T28 run on the miss;
+restore the original equations and target compact-prefix work or field traffic.
+
+### Post-packing NTT prewarm at T28
+
+Deferring retained NTT construction until the root-fold worker owns the first
+request was exact and passed its T28 gate. Complete opening fell from
+7.006756 s to 6.746238 s, or 3.938x against the fixed 26.566117 s CPU anchor.
+Root coefficient packing remained on the specialized CPU route; NTT work was
+hidden beside the root fold rather than competing with that scan. The proof,
+transcript, evaluation, commitment route, verifier, and 90 GiB memory guard all
+passed. Retain this scheduling policy for the 41-variable Metal route.
+
+### Disjoint CPU/Metal root-packing columns
+
+The root coefficient-packing outputs are independent by column, so a 15/15
+CPU/Metal split appeared to have a 0.53--0.75 s local bound from the measured
+1.061 s CPU and 1.035 s full-Metal routes. Focused range-composition, maximal
+atomic-load, alternating-bucket, and Jolt routing oracles all passed.
+
+The single T28 treatment was exact but rejected. Root packing reached 0.732 s,
+meeting its 0.75 s local gate, while complete opening reached only 6.717749 s,
+missing the 6.45 s end-to-end gate. Metal GPU-active time rose by 0.749 s and
+the following packed root fold rose by 0.261 s; static E/T work rose another
+0.063 s. The 0.329 s packing gain therefore produced only a 0.028 s complete
+gain, or 3.955x overall. This is a unified-memory/power-domain coupling, not a
+column-independence failure. Remove the hybrid route, column-range API, and
+run-coalesced kernel rather than tuning split ratios.
+
+### Live-prefix factored Stage-1 equality rounds
+
+The earlier pair-coalesced treatment saved 124 ms complete and 90 ms GPU-active
+at T25 but was rejected because its 268.6 ms Stage 1 missed an absolute 260 ms
+gate. That mapping predated live-prefix dispatch and used four 256-entry fp128
+threadgroup reduction arrays. Reintroduce the algebra with two corrections:
+
+1. launch only `ceil(live_pairs / num_first)` high buckets, with a bounded final
+   bucket, so the retained zero suffix stays skipped; and
+2. reduce four accumulators within SIMDgroups, cross one threadgroup barrier,
+   and reduce eight SIMDgroup totals, cutting scratch from 16 KiB to 512 B.
+
+For every live pair the flat kernel forms `e_first * e_second` and then applies
+four coefficient products. The factored kernel applies the four products to
+`e_first`, reduces by high bucket, and multiplies four totals by `e_second`.
+It removes one full fp128 multiply per live pair and changes no table fold,
+round polynomial, transcript event, proof field, or verifier equation. Use it
+while `num_first >= 512`; smaller rounds keep the flat mapping.
+
+The prior exact T25 treatment is sufficient scale evidence. Require one
+live-prefix focused CPU/Metal proof-parity test, then one T28 treatment against
+the retained 6.746238 s parent. Retain only with exact proof, transcript,
+evaluation, commitment route, verifier, and memory; Stage 1 at most 0.50 s,
+GPU-active at most 2.72 s, and complete opening at most 6.64 s. Any miss removes
+the three factored pipelines without threshold or workgroup tuning.
+
+The focused sparse-live-prefix proof matched CPU exactly, and the T28 treatment
+preserved the proof, transcript, evaluation, commitment route, verifier, and
+memory guard. Stage 1 fell to 498.735 ms and cleared its 500 ms gate. Aggregate
+GPU-active time was unchanged at 2.786 s, however, and complete opening rose to
+7.017111 s after the earlier CPU root-packing scan varied from 1.061 s to
+1.287 s. The candidate therefore missed both remaining gates. Remove the three
+factored pipelines and focused test without a repeat or threshold change. The
+74.5 ms local reduction is evidence for equality factorization, but is too
+small to survive the complete-call noise floor or close the 1.433 s gap.
+
+### Aligned coefficient-subgroup Stage 2
+
+The rejected coefficient-lane suffix assigned a whole relation lane to one
+thread. It saved common products but changed adjacent coefficient reads into
+strided lane reads and kept seven fp128 accumulators live across a loop. The
+tested mapping preserved the pair-major access pattern. During the remaining
+coefficient rounds, an aligned SIMD subgroup owns one relation lane: eight,
+four, or two adjacent lanes each process one adjacent coefficient pair, reduce
+their factored terms with SIMD shuffles, and let the subgroup leader apply the
+lane equality and ordinary-relation weights once.
+
+For eight pairs, the flat kernel performs about fifteen full fp128 products per
+pair. The subgroup form performs ten per pair plus nine per relation lane,
+reducing that part from about 120 to 89 products. The four-pair round falls from
+about 60 to 49. Unlike the prior lane-owned treatment, every thread holds one
+pair rather than a seven-accumulator loop, and adjacent SIMD lanes retain
+coalesced witness, alpha, equality, and structured-linear reads. The final
+partial reduction also uses SIMDgroup sums and one threadgroup barrier instead
+of four 256-entry arrays and nine barriers. Ordinary proof messages,
+challenges, variable order, resident tables, transcript events, and verifier
+equations are unchanged.
+
+The exact T28 parent spends 1.160862 s in Stage 2. The two eligible coefficient
+dispatches account for most of the post-prefix geometric work. The calibrated
+prediction is 0.90--1.00 s for Stage 2, a 0.16--0.26 s complete-call ceiling;
+this cannot close the 1.433 s gap alone. Because prior small-scale gates
+misclassified mechanisms whose work scales with the coefficient-domain table,
+the campaign is now explicitly T28-only. Require the existing virtual-only and
+nonzero structured-relation CPU/Metal proof parity tests before one T28 run.
+Retain only if proof bytes, transcript, evaluation, commitment route, verifier,
+and memory remain exact, Stage 2 is at most 1.00 s, and complete opening does
+not exceed 6.75 s. Reject without subgroup-width or workgroup tuning if Stage 2
+is at least 1.05 s or either exactness or end-to-end guard fails.
+
+The exact virtual-only and nonzero structured-relation parity tests passed.
+The one T28 treatment was nevertheless a clear rejection: Stage 2 increased
+from 1.160862 s to 1.237700 s and complete opening increased from 6.746238 s
+to 7.097380 s. GPU-active time also rose by 103.5 ms. The fp128 SIMD shuffle
+and segmented-reduction cost did not repay the saved products. Remove the
+three pipelines and do not tune subgroup widths or workgroup counts.
+
+### Barrier-free pair-packed subring root fold
+
+The retained D512 root-fold kernel spends 1.805 s of GPU time at T28. Each
+output position has 30,720 source tasks. Its 256-task tiles use eight ballots
+per SIMDgroup to partition tasks by the low three source bits, write and drain
+a 2,048-entry threadgroup queue, and cross two barriers. That is 120 tiles and
+240 barriers per output position. The queue makes all eight SIMDgroups useful,
+but each selected source still performs 64 scalar challenge loads and adds.
+
+Use one SIMDgroup for each low residue and let every SIMDgroup scan the source
+tasks directly. One ballot selects its residue from each 32-task batch; set-bit
+lanes broadcast the source high bits while the 32 destination lanes own
+adjacent D64 coefficient pairs. Two 32-entry packed tables per challenge cover
+even- and odd-source shifts. A lane rotation plus a pair-wide wrap negation
+implements the negacyclic sign; the odd boundary negates only the low member of
+one pair. This is 64 packed `u32` entries per challenge, about 3.75 MiB at T28,
+instead of a source-by-destination table.
+
+Bias each signed byte by 128 in a 16-bit half. Drain after at most three
+capacity-32 trace blocks: at most 192 selected terms times the maximum encoded
+value 256 is 49,152, so neither half can carry into the other. Subtract
+`128 * selected_count` from each half on drain. This supports the full i8
+coefficient range, including negating -128, and accumulates into the same i32
+centered output. Compared with the retained kernel, the ballot count is
+unchanged, source-byte traffic rises eightfold, and cached challenge traffic
+doubles in bytes; in exchange it removes every queue access and barrier and
+replaces 64 scalar additions per selected source with 32 packed additions.
+The extra source scan is under 8 GiB for the measured T28 root source and is
+not the roofline constraint on this machine.
+
+Require the existing arbitrary-source CPU oracle, extended to extreme i8
+coefficients, before one T28 treatment. Preserve proof bytes, transcript,
+evaluation, commitment route, verifier acceptance, and the 90 GiB memory guard.
+Retain only if packed root-fold GPU time is at most 1.25 s and complete opening
+is at most 6.55 s, versus the fixed 1.805 s and 6.746238 s parent. A successful
+kernel makes the 1.633 s CPU streamed consumer the root critical path, so it
+then authorizes a matrix-stationary CPU recursive-prefix commit candidate. A
+miss removes the packed tables and kernel without tuning tile sizes.
+
+The full-column extreme-i8 CPU oracle passed, and the T28 proof, transcript,
+evaluation, commitment, verifier, and memory checks remained exact. The timing
+gate rejected the architecture decisively. Packed root-fold GPU time rose from
+1.804525 s to 2.412536 s, its wall time rose from 2.058016 s to 2.715247 s, and
+complete opening rose from 6.746238 s to 7.546650 s. Total GPU-active time rose
+by 0.668153 s, while unified-memory and power contention also raised the CPU
+consumer from 1.632966 s to 1.833557 s and root coefficient packing by 0.126020
+s. The retained shared task scan and queue amortize source decoding better than
+eight independent SIMDgroup scans; pair packing does not repay the duplicated
+source and wider challenge traffic. Restore the retained kernel and do not tune
+the scan tile or packed bias.
+
+### Matrix-stationary streamed recursive prefixes
+
+The retained root path overlaps Metal folding with CPU commitment of completed
+Z chunks. The successor uses a large D64 inner matrix, while each of the eight
+streamed calls contains only tens of complete witness blocks and at most seven
+matrix rows. The generic CPU mat-vec therefore selects block parallelism: every
+worker block walks the entire matrix. This supplies abundant Rayon tasks but
+logically rereads a matrix with at least eight 4 MiB L2 tiles for every block.
+The one-shot CPU baseline has hundreds of blocks and remains correctly served
+by that mapping.
+
+Use Akita's existing exact column-tiled mat-vec only when all of the following
+hold: the normal small-row block route is otherwise eligible, there are 16--64
+blocks, and the matrix spans at least eight cache tiles. A tile then retains all
+block accumulators, reuses its matrix working set across the streamed batch,
+and still exposes at least eight Rayon tasks. The arithmetic, CRT parameters,
+reconstruction order within each accumulator, inner rows, commitment, proof,
+and transcript are unchanged. Larger one-shot commits and smaller matrices keep
+block parallelism, so this is an accelerator-pipeline host optimization rather
+than a new CPU control.
+
+The expected local effect is to reduce the 1.632966 s streamed consumer to
+1.25--1.40 s and reduce shared-memory/power contention enough to lower the
+concurrent 1.804525 s root GPU span to 1.65--1.75 s. Require the existing
+block-parallel/column-tiled fp128 parity test, then one T28 treatment. Retain
+only if the consumer is at most 1.40 s, root GPU time at most 1.75 s, root wall
+time at most 1.90 s, and complete opening at most 6.50 s, with exact proof,
+transcript, evaluation, commitment, verifier, and memory guards. A miss restores
+the original routing predicate without threshold tuning.
+
+The fp128 parity test passed, and the single T28 treatment preserved every
+correctness and memory guard, but the route failed by a wide margin. The
+matrix-stationary mat-vecs themselves took 2.270384 s, the streamed consumer
+rose from 1.632966 s to 3.449563 s, root wall time rose from 2.058016 s to
+3.767709 s, and complete opening rose from 6.746238 s to 8.751451 s. Root GPU
+time also increased to 1.895570 s under the extra host contention. At this
+shape, cache reuse cannot repay the loss of block-level Rayon fanout. Restore
+block parallelism and remove the diagnostic bucket without trying intermediate
+block or tile thresholds.
+
+### T28 resident Stage-2 source handoff
+
+The max-scale-only diagnostic separates occupancy from orchestration.  In the
+exact T28 treatment, Stage 2 took 1.254484 s while its Metal timestamp intervals
+totaled 0.575855 s.  The host spent 0.125444 s preparing the direct session,
+0.119075 s constructing dispatch buffers, 0.035852 s folding canonical state,
+and 0.011136 s constructing per-round data.  Session construction occupied
+0.234597 s, overlapping the reported buffer and source-command intervals.  The
+first two terms include an unnecessary 512 MiB boundary traversal: the
+`2^25` canonical fp128 lane weights are converted to an equal limb vector and
+then copied into a new shared Metal buffer, although the canonical fp128 storage
+is already the kernel ABI.
+
+Revisit the earlier borrowed-lane treatment only at its actual target scale and
+combine the inseparable pieces.  Move the canonical lane-weight vector out of
+the direct prover state, expose its bytes through the existing alignment-checked
+no-copy Metal buffer helper, and keep the owner alive for the session.  The GPU
+owns all lane folds after the coefficient boundary; two private geometric
+scratch buffers preserve the borrowed source, and a 32-byte final readback
+restores the one canonical lane value needed by the final-claim check.  The host
+continues to fold equality, alpha, and sparse additional terms.  This changes no
+round polynomial, transcript event, proof field, or verifier equation.
+
+The measured removable ceiling is 0.28--0.36 s: about 0.125 s of conversion,
+most of 0.119 s of initial buffer setup, and 0.036 s of duplicate host folding,
+with allocator traffic as upside.  It cannot close the 1.433015 s five-times gap
+alone; it is retained only as a prerequisite resident boundary for a later
+static/dynamic Stage-2 split.  Require focused direct-proof parity, then one
+exact T28 treatment.  Preserve proof bytes, transcript, evaluation, commitment,
+verifier, schedule, route, and memory guards.  Retain only if Stage 2 is at most
+1.02 s, Stage-2 host preparation is at most 30 ms, Stage-2 buffer setup is at
+most 55 ms, and complete opening is at most 6.75 s when root coefficient packing
+is within 100 ms of its 1.060554 s parent.  If root packing is outside that
+noise band, the local gates decide retention but the run is not evidence toward
+the end-to-end five-times claim.  Do not tune alignment thresholds after a miss.
+
+Both focused direct-proof parity cases passed, including odd live lanes and
+nonzero structured relation weights.  The exact T28 proof, transcript,
+evaluation, commitment, verifier, schedule, route, and memory guards also
+passed.  The performance gates rejected the mechanism.  Stage 2 fell only from
+1.254484 s to 1.151672 s, host preparation fell from 125.444 ms to 102.360 ms,
+and buffer setup fell from 119.075 ms to 95.163 ms.  Duplicate host binding did
+fall from 35.852 ms to 8.989 ms, but the combined treatment removed only
+102.812 ms from Stage 2.  Complete opening was 7.216811 s with a noisy
+1.364550 s root packing scan, so it is not end-to-end evidence.  Remove the
+borrowed source, extra ping-pong table, and final scalar handoff without tuning
+alignment.  The diagnostic also prices the next boundary: sparse additional
+terms take 13.872 ms and direct-state construction takes 18.102 ms; neither is
+the missing mechanism.  The 102 ms host-preparation residual is the
+structured-linear layout conversion, and its corresponding buffers dominate
+the remaining 95 ms setup interval.
+
+### Direct D-role product dispatch at T28
+
+The exact diagnostic treatment localizes 416.908 ms of the 477.081 ms
+relation-opening-row phase in `compute_relation_v`. This is not an inherent
+D64 floor. The generic ring-switch entry admits Metal only for the root D512 A
+relation, so the D64 opening product silently takes its CPU fallback even though
+Akita Metal already has an exact D64 digit-row operation for this shape,
+including retained quotient rows. The T28 admission oracle covers one row, two
+vectors, and 1,409,024 D64 digit columns.
+
+Route D-only opening products through `DigitRowsComputeBackend` and consume its
+negacyclic rows plus retained quotients directly. CPU and other backends keep
+their existing exact implementation through the same generic operation. This
+changes no matrix, digit order, arithmetic result, proof field, transcript
+event, schedule, or verifier equation; it removes an accidental operation-trait
+detour and one reported CPU fallback.
+
+The removable ceiling is about 0.30--0.38 s, not the full five-times gap. Run
+the existing D64 product CPU/Metal parity test, then one exact T28 treatment.
+Require the frozen proof digest, transcript, evaluation, commitment, verifier,
+schedule, route, and memory guards. Retain only if `compute_relation_v` is at
+most 180 ms and the opening-row phase is at most 240 ms. When root coefficient
+packing is within 100 ms of its 1.060554 s retained value, also require complete
+opening at most 6.55 s; otherwise the local gates decide retention and the run
+does not update the end-to-end record. A miss restores the fused ring-switch
+entry without tuning column-partial width.
+
+The focused D64 product parity test passed. The exact T28 treatment preserved
+the proof digest, transcript, evaluation, commitment, verifier, schedule,
+route, and memory guards. `compute_relation_v` fell from 416.908 ms to
+102.155 ms and its enclosing opening-row phase fell from 477.081 ms to
+163.439 ms, clearing both local gates. Reported CPU fallbacks fell from 28 to
+26 and CPU-tail work fell by 92,654,336 units. Retain the generic product
+dispatch. Complete opening was 7.357703 s, but root coefficient packing drifted
+to 1.469749 s, 409 ms above the retained value and outside the declared noise
+band; this run therefore does not replace the 6.746238 s end-to-end record.
+The supported 314.8 ms local gain projects that record to roughly 6.43 s and
+leaves about 1.12 s to remove for five times.
+
+### Barrier-free four-byte root fold with direct successor digits
+
+The retained subring-owned root fold is fully occupied at T28: it launches one
+256-thread group for each of 262,144 positions. Its 1.804525 s GPU interval is
+therefore not a small-grid problem. For each position it scans 30,720 source
+tasks in 120 tiles, compacts them into eight residue queues, and crosses two
+threadgroup barriers per tile. Each selected source is then handled as 64
+separate signed-byte loads and additions. The root's concurrent host consumer
+takes 1.632966 s, of which 927.356 ms is the balanced decomposition of the
+accepted centered output and 688.970 ms is the successor commitment prefix.
+A faster fold alone would consequently expose the host branch rather than
+reduce root wall time by its full local gain.
+
+Use one SIMDgroup for each of the eight embedded D64 residues, but give every
+SIMDgroup its own read-only scan of the packed selectors. A ballot filters that
+scan to the group's residue without a threadgroup queue or barrier. Sixteen
+lanes own four consecutive D64 destinations each; the other sixteen lanes take
+alternate selected sources for the same destinations. Before the fold, a
+small Metal expansion kernel stores one positive and one negative biased
+four-byte word for each of the 64 cyclic starts of every challenge. A lane
+usually loads one word; the unique four-destination group that straddles the
+negacyclic boundary combines the corresponding positive and negative words
+with a byte mask. Accumulate at most 63 sources per lane half, unpack the four
+bytes, subtract the exact bias, and combine the two halves with one SIMD
+shuffle. No byte can carry because every partial byte is at most
+`63 * 4 = 252`.
+
+At T28 the packed table is 15,360 challenges times 512 bytes, or exactly
+7.5 MiB. The mapping repeats the 8.05 GB selector scan eight times, but retains
+the existing approximately 487 GB of logical challenge bytes: sixteen
+coalesced four-byte loads replace 64 scalar loads for each selected source.
+It removes 62.9 million queue barriers across the grid and reduces accumulator
+add instructions by four. The extra selector traffic has a roughly 0.12 s
+bandwidth floor at 546 GB/s; table construction and storage are small beside
+the retained challenge traffic.
+
+Pair this kernel with a generic optional streaming hint. The root sink requests
+its existing balanced base and digit count; the kernel writes those exact
+digits beside each centered coefficient after the final accumulation. The sink
+then appends the device-produced bytes directly and skips its 927 ms CPU
+decomposition. Backends that cannot produce the hint, roots with more than one
+inner digit, coefficients outside `[-2, 2]`, and non-D64 embeddings retain the
+current exact path. This changes no sampled challenge, arithmetic value,
+message, transcript event, proof field, schedule, or verifier equation.
+
+Require an embedded-D64 oracle that checks both centered coefficients and every
+balanced digit, plus the arbitrary-position fallback oracle. Then run one exact
+T28 treatment. Preserve the frozen proof digest, transcript, evaluation,
+commitment, verifier, schedule, route, and 90 GiB memory guard. Retain locally
+only if packed-decompose GPU time is at most 1.30 s, its streamed consumer is at
+most 0.85 s, and root wall time is at most 1.50 s, versus 1.804525 s,
+1.632966 s, and 2.063250 s. If root coefficient packing is within 100 ms of its
+1.060554 s retained value, also require complete opening at most 6.00 s;
+otherwise local gates decide retention and the run is not an end-to-end record.
+A miss restores the queue kernel and host decomposition without tuning batch
+size, table layout, or admission thresholds.
+
+Both focused oracles passed, including enough selected sources to cross the
+126-source packed-byte flush, and the exact T28 proof preserved the frozen
+proof digest, transcript, evaluation, commitment, verifier, schedule, route,
+and memory guards. Direct successor digits behaved as modeled: the streamed
+consumer fell from 1.632966 s to 668.642 ms, with digit append taking 37.233 ms
+and recursive prefix commitment taking 592.671 ms. The fold kernel failed its
+local gate catastrophically, however. Packed-decompose GPU time rose from
+1.804525 s to 10.011945 s, root wall time rose from 2.063250 s to 10.193080 s,
+and complete opening rose to 15.080456 s.
+
+The compact lookup preserved logical byte count but not transaction locality.
+For one source, the sixteen destination owners address four-byte words at
+different cyclic starts, spreading 64 useful bytes across roughly 512 table
+bytes instead of the retained kernel's two contiguous 32-byte destination
+ranges. The source-dependent rotations also defeat reuse across neighboring
+tasks, and each SIMDgroup repeats the selector address generation. Reject the
+kernel and optional digit handoff together as preregistered; do not tune the
+table layout. The measured consumer result remains evidence that direct digits
+are worth pairing with a future root kernel whose primary output is already
+coalesced.
+
+### Source-contiguous global residue queues
+
+The rejected barrier-free treatment localized its loss to transaction layout,
+not packed arithmetic or direct digits. Preserve those two successful pieces
+but change both sides of the source handoff. One 256-thread group scans a
+512-task tile once, with each thread decoding two selectors. SIMD ballots count
+the eight residues per producer group; one short group-wide prefix places all
+live tasks into a single 512-entry array in eight contiguous residue ranges.
+The eight consumer SIMDgroups then drain one range each. This uses about 2.5 KiB
+of threadgroup state, versus the retained partitioned queue's roughly 8 KiB,
+and crosses three barriers per 512 tasks: 180 barriers per T28 position instead
+of 240.
+
+Transpose the packed challenge expansion to `[challenge][source_high][quad]`.
+Each `(challenge, source_high)` row contains the sixteen already-signed,
+four-byte-biased destination quads consecutively. The row is 64 bytes, so the
+sixteen active lanes issue one coalesced cache-line access per queued source;
+the rejected treatment spread those same 64 useful bytes over about 512 bytes.
+The table is 15,360 times 64 times 64 bytes, or 60 MiB at T28. It is larger
+than the rejected 7.5 MiB lookup but restores the physical traffic model:
+approximately 487 GB of challenge rows plus one 8.05 GB selector scan. Four
+coefficient additions remain packed into one carry-safe `uint`, and the final
+owner writes both the centered result and its requested balanced successor
+digits.
+
+This is a new mapping rather than a table-size retry: the producer scan changes
+from eight independent scans to one global compaction, the queue changes from
+64 fixed producer partitions to eight globally contiguous ranges, and the
+consumer access changes from strided words to a single coalesced row. Require
+the centered/digit CPU oracle across a 512-task tile plus the arbitrary-D512
+fallback oracle. Then run one T25 credibility treatment. Preserve every frozen
+correctness, route, and memory guard; require packed-decompose GPU time at most
+220 ms and its consumer at most 120 ms. Only a pass authorizes T28.
+
+At T28 retain only if packed-decompose GPU time is at most 1.35 s, consumer time
+is at most 0.85 s, and root wall time is at most 1.55 s. If root coefficient
+packing is within 100 ms of 1.060554 s, also require complete opening at most
+6.05 s. Otherwise the local gates decide retention and the run is not an
+end-to-end record. A miss restores the retained dense queue and host digits;
+do not tune the tile, queue, or table dimensions.
+
+The centered/digit and arbitrary-position oracles passed, but the single T25
+credibility treatment rejected the architecture before T28. Packed-decompose
+GPU time was 452.978 ms, versus 273.624 ms for the retained parent and more than
+twice the 220 ms gate. Direct digits again helped the host branch, reducing its
+consumer from 374.807 ms to 231.607 ms, but root wall time still rose from
+429.910 ms to 500.384 ms and complete opening rose from 1.966950 s to
+2.054479 s. Every proof, transcript, evaluation, commitment, verifier, route,
+and memory guard remained exact.
+
+Restoring one source scan and coalesced 64-byte rows removed the catastrophic
+transaction amplification, but the 60 MiB source-specific table turns the
+logical 64-byte update into real streaming traffic and the global prefix adds a
+third barrier. Those costs exceed the packed-add reduction. Remove the table,
+queue, and digit handoff without a T28 run. Together with the partitioned,
+pair-packed, microtiled, barrier-free, large-tile, and source-contiguous results,
+this closes shared-queue and dense-row remappings of the current root equation.
+
+### Commit-retained residue index and direct successor digits
+
+The closed root mappings all rebuild selector locality after the fold challenge
+is known.  That restriction is unnecessary: selector positions and their D64
+residue classes are witness data, not Fiat--Shamir data.  The Metal commitment
+already consumes the same immutable packed source before the timed opening and
+may retain a prover-only acceleration hint without changing the commitment,
+proof, transcript, or verifier.
+
+For each root position and 256-task tile, build eight contiguous residue runs.
+Each live run entry is the existing 20-bit `(challenge_index, source_high)`
+record stored in a `u32`; eight `u16` counts describe the runs.  Slots remain
+fixed at 256 per tile, so no global prefix or variable-size allocation is
+needed.  The T28 source has about 8.05 billion task slots: records require about
+32.2 GB and counts about 0.50 GB.  Combined with the measured 25.7 GB proof
+peak, the conservative resident projection is below 60 GB and the existing
+90 GiB guard.  Index construction reads the source once and writes the records
+once.  Its traffic floor is about 0.08 seconds at the measured 406 GB/s copy
+rate, but its per-tile ballot and barrier work must be charged to the Metal
+commit phase and reported separately.
+
+The opening kernel assigns one SIMDgroup to each embedded D64 residue.  A group
+walks only its prebuilt run, while its 32 lanes retain the two coalesced
+destination accumulators of the current exact subring kernel.  There is no
+producer queue and no threadgroup barrier.  Challenge traffic and arithmetic
+remain the same 64 dense signed-byte loads/adds per selected source; this
+treatment removes only the measured partition/synchronization machinery.  At
+the final store, each lane also performs the existing balanced decomposition
+and writes the exact successor digit planes.  The generic chunk sink advertises
+the requested basis and digit count; CPU and unsupported Metal routes retain
+host decomposition.
+
+Against the retained T28 root, the calibrated target is 1.05--1.25 seconds of
+indexed GPU work and 0.60--0.75 seconds in the remaining recursive-prefix
+consumer, for a 1.25--1.45 second root wall interval instead of 2.063 seconds.
+The supported D64 dispatch projects the complete parent to roughly 6.43
+seconds, so this mechanism is necessary but not sufficient: its expected
+0.61--0.81 second complete gain leaves 0.31--0.51 seconds for the already
+localized resident Stage-2, Stage-1 factor, and command/session boundaries.
+
+First require focused index-order, centered-fold, and emitted-digit parity.
+Then run one T25 credibility treatment.  It must preserve proof bytes,
+transcript, evaluation, commitment, verifier, schedule, required route, and
+fallback counts; indexed GPU time must be at most 0.22 seconds, the streamed
+consumer at most 0.15 seconds, root wall time at most 0.30 seconds, and complete
+opening at most 1.84 seconds.  Only a pass authorizes one T28 treatment.  At
+T28 retain only if indexed GPU time is at most 1.30 seconds, the consumer at
+most 0.80 seconds, root wall time at most 1.50 seconds, complete opening at most
+5.90 seconds when root packing is within its declared noise band, peak RSS is
+at most 90 GiB, and index construction adds at most 1.0 second to Metal commit.
+Any exactness, route, memory, or local timing miss removes the index and digit
+hint without tuning tile dimensions.
+
+The focused parity test passed for index order, centered coefficients, chunk
+offsets, and balanced-digit reconstruction.  Two identical T25 treatments also
+preserved the commitment, proof digest, transcript, evaluation, verifier, route,
+and memory guards.  They reported one indexed call and 134,217,728 direct digit
+bytes.  Root GPU time was stable at 155.42 ms and root wall time was 287.97--
+302.29 ms, clearing the two mechanism gates.  The streamed consumer was
+259.58--269.10 ms because that counter includes the exact successor commitment,
+not only the eliminated decomposition.  Complete opening was 1.927--1.948 s;
+Stage 2 was 0.519--0.527 s versus 0.408 s in the older T25 parent.  The candidate
+therefore did not pass the preregistered T25 promotion gate.
+
+Do not silently promote it.  One T28 run is nevertheless authorized as a
+diagnostic, not a retained-result claim: the campaign target is now explicitly
+T28-only, the root mechanism itself met its scale-predictive GPU and wall gates,
+and the diagnostic directly measures whether the 8x index, root consumer, and
+Stage-2 terms leave a tractable residual.  A miss still requires a new mechanism
+before any confirmation run; a 5x diagnostic result still requires an unchanged
+confirmation before the claim is accepted.
+
+The first T28 diagnostic localized a lifetime defect and a needless index-width
+cost.  Root arithmetic itself reached 1.197926 s, but the 32.716 GB `u32` index
+remained cached after its only use.  Stage 1 rose to 0.817918 s and Stage 2 to
+1.995420 s, versus 0.573203 s and 1.160862 s in the retained T28 parent.  Complete
+opening was 7.574916 s.  Root wall was 1.856189 s, with a 0.771274 s streamed
+consumer, and index construction took 1.804118 s wall / 1.004396 s GPU.  Exactness,
+route, and the host RSS guard passed, but every promotion timing gate failed.
+
+The next bounded treatment changes the index representation and lifetime, not
+the protocol or tile geometry.  A record needs only its 8-bit task offset within
+the fixed 256-task tile and its 6-bit source high part, so it fits in `u16`.
+Lane zero reconstructs `(column, trace_block)` from the tile-local task once and
+broadcasts the challenge index across the SIMDgroup.  The opening takes, rather
+than clones, the one-shot cache entry, releasing it before Stage 1.  Exact index
+storage is then 2,076,180,480 bytes at T25 and 16,609,443,840 bytes at T28.
+
+Require the same focused parity test, then one T25 treatment.  It must report
+the exact compact byte count, one indexed call, exact proof/transcript/verifier,
+root GPU at most 0.20 s, root wall at most 0.34 s, and index construction at most
+0.20 s.  A pass authorizes one T28 treatment.  At T28 require exact compact bytes,
+index construction at most 1.20 s, root GPU at most 1.30 s, root wall at most
+1.60 s, Stage 1 at most 0.68 s, Stage 2 at most 1.40 s, and complete opening at
+most 6.20 s.  These are mechanism gates, not a 5x claim.
+
+The compact record family did not clear its GPU gate.  Direct task-to-challenge
+division produced 0.286315 s of T25 root GPU time.  Replacing division with a
+30 KiB invariant lookup reduced that to 0.220552 s, and lane-zero broadcast was
+0.222433 s.  All forms were exact; the latter two used 2,076,211,200 index bytes,
+and the broadcast form reached 1.806573 s complete.  They still miss the 0.20 s
+root-GPU bar and project materially above the accepted `u32` kernel at T28.
+Close compact records without a T28 run.  Restore direct `u32` challenge/source
+records while retaining the one-shot cache eviction.
+
+### Cached recursive-commit matrix transforms
+
+Each streamed root Z chunk invokes the same successor inner commitment, but the
+current Metal call allocates and recomputes the setup-matrix NTT every time.
+The transform depends only on `(setup, D, n_a, active_a_cols)`, not on witness
+digits, fold challenges, or the chunk's block count.  Cache the exact private
+transform on `MetalPreparedSetup`; static E/T, all Z chunks, and a matching tail
+commit can then reuse it.  The cache key is setup-scoped, so a larger unrelated
+matrix cannot alias an exact recursive geometry.  Proof values and transcript
+order are unchanged.
+
+Require D64 and D128 repeated-commit parity, with one cache miss followed by one
+hit, then one T25 treatment.  Preserve every existing exactness and route guard,
+report at least one transform hit, keep root GPU at most 0.18 s, reduce the root
+Z commitment span below 0.20 s and root wall below 0.28 s, and keep complete
+opening below 1.82 s.  A pass authorizes one T28 treatment with the restored
+one-shot index lifetime.  There require root GPU at most 1.30 s, root wall at
+most 1.60 s, Stage 1 at most 0.68 s, Stage 2 at most 1.40 s, and complete opening
+at most 6.10 s.  A local miss removes the transform cache without cache-shape or
+chunk-count tuning.
+
+The repeated D64/D128 oracle passed, but the T25 treatment reported zero cache
+hits and zero misses.  It was exact and reached 1.788661 s complete, 0.155321 s
+of root GPU time, and 0.283944 s of root wall time, but its 0.231385 s root Z
+commitment span remained unchanged.  The cause is schedule geometry, not cache
+lookup failure: after root folding, T25 reinterprets the digit byte stream in
+the first recursive level's D256 ring, which is outside this Metal kernel's
+D64/D128 domain.  Thus the preregistered T25 cache gate rejects the candidate
+but does not test the T28 mechanism.
+
+The T28 diagnostic was exact and reached 6.198161 s complete, 1.188603 s of
+root GPU time, 1.793973 s of root wall time, 0.577206 s in Stage 1, and
+1.154537 s in Stage 2.  It also reported zero cache hits and zero misses.  The
+schedule does reinterpret each root chunk as a D128 witness with 16,384
+positions per block, but those streamed prefix commitments execute on the CPU
+commit cluster.  The opening backend is Metal; the commit and tensor clusters
+remain CPU so that prefix work can overlap the root fold.  The recursive Metal
+cache is therefore unreachable on the actual proof path.
+
+An exact-shape standalone probe closes the question of routing that cluster to
+Metal.  For D128, one row, 16,384 columns, and 32 blocks, the first Metal call
+took 161.242 ms wall / 153.615 ms GPU, including 9.474 ms for the matrix
+transform.  A cached call still took 143.334 ms wall / 137.368 ms GPU.  Eight
+chunks project to about 1.15 s of additional device work, compared with the
+measured 0.702 s CPU prefix span, before accounting for contention with the
+1.189 s root fold.  Do not integrate the recursive Metal route into the root
+stream.  Keep the generic cache candidate isolated until cleanup; it is not a
+5x mechanism.
+
+The T28 diagnostic leaves 0.884938 s above the 5x threshold of 5.313223358 s.
+Its root GPU and CPU consumer account for 1.980041 s of work but overlap by only
+0.186068 s inside a 1.793973 s wall interval.  The next bounded experiment uses
+two disjoint output/digit buffer pairs and submits chunk `i + 2` only after the
+CPU has consumed chunk `i`.  With GPU chunks near 149 ms and consumers near
+99 ms, the device remains critical and the ideal root wall is about 1.29 s.
+Require exact centered coefficients, balanced digits, callback order, proof,
+transcript, evaluation, commitment, verifier, and required routes.  Promote a
+T28 treatment only if root wall is at most 1.45 s without increasing root GPU
+above 1.30 s; otherwise remove the pipeline candidate.
+
+The treatment was exact but failed the mechanism gate.  Complete opening rose
+to 6.576235 s, root wall rose to 1.987200 s, and measured root GPU work rose to
+1.801904 s.  The consumer fell to 0.687141 s, but repeated fresh shared-buffer
+writes and a 46.573 ms readback replaced the full output's efficient no-copy
+backing.  This is not an overlap limitation that slot-count tuning can fix.
+Remove the double-buffer implementation and retain the original full-buffer
+dispatch.
+
+### Nibble-packed indexed root gather
+
+The retained indexed kernel remains bandwidth-bound after queue and lifetime
+changes.  For every selected source it loads 64 signed challenge bytes: two
+scalar bytes in each of 32 SIMD lanes.  At T28 this is about 515 GB of logical
+challenge traffic.  The measured 1.188603 s GPU interval therefore corresponds
+to about 433 GB/s before record, count, output, and instruction traffic.  Queue
+tuning cannot remove this floor.
+
+Production D64 challenges have coefficients in `[-2, 2]`.  Store biased
+coefficients in four-bit nibbles and precompute eight source-phase rows.  Each
+row has eight 32-bit words, where one word supplies the eight consecutive
+destination coefficients owned by a lane.  Split each SIMDgroup into four
+eight-lane groups so that it consumes four independent index records at once.
+The eight loads for one record are a contiguous 32-byte permutation; this is
+32 bytes per selected source instead of 64.  Accumulate even and odd nibbles as
+packed bytes for at most 63 records per batch, then debias into signed `int4`
+accumulators.  The 252-record batch bound prevents cross-byte carry.  Preserve
+the current index, full output buffer, direct balanced digits, callback order,
+and protocol.
+
+This differs from the rejected preexpanded challenge table: that layout spread
+64 useful bytes for a source across roughly 512 bytes and required a 60 MB
+table.  The phase table is 256 bytes per challenge (about 3.75 MB at T28), and
+all 32 useful bytes for one source are contiguous.  At the measured device
+bandwidth its challenge-traffic floor is about 0.47 s.  Allowing record traffic,
+nibble expansion, shuffles, and occupancy gives a preregistered root-GPU range
+of 0.70--0.90 s.
+
+First require focused centered-coefficient and balanced-digit parity, including
+an out-of-range challenge fallback.  Then run one exact T25 treatment.  Promote
+to T28 only if root GPU is at most 0.13 s (from 0.155321 s) with exact proof,
+transcript, evaluation, commitment, verifier, and indexed-route evidence.  At
+T28 require root GPU at most 0.90 s, root wall at most 1.50 s, and complete
+opening at most 5.90 s.  This is a milestone mechanism gate, not a 5x claim;
+the remaining gap must then come from the measured Stage 1/2 overhead without
+an invasive protocol change.
+
+The focused test passed with a full 256-record single-residue tile, exercising
+the 252/4 batch boundary while matching CPU centered coefficients and every
+balanced digit.  The exact T25 treatment also passed: root GPU fell from
+0.155321 s to 0.094822 s, root wall was 0.283992 s, and complete opening was
+1.781748 s.  Proof bytes, transcript, claimed evaluation, commitment, verifier,
+indexed-route count, and direct-digit count all matched.  The root wall is now
+limited by the 0.267079 s streamed CPU consumer at this scale.  This clears the
+preregistered local gate and authorizes one T28 treatment.
+
+The exact T28 treatment preserved the frozen proof digest, transcript, claimed
+evaluation, commitment, verifier, indexed route, direct-digit count, and memory
+guard.  Root GPU time fell from 1.188603 s to 0.725943 s, a 1.64x local speedup,
+and cleared the 0.90 s gate.  Root wall fell from 1.793973 s to 1.549965 s but
+missed the 1.50 s gate because the CPU prefix consumer rose from 0.791438 s to
+0.918106 s.  Complete opening was 6.230682 s, versus 6.198161 s in the parent,
+so this is not end-to-end promotion evidence.  The unrelated root coefficient
+packing span also rose by 0.157594 s while relation preparation fell by
+0.188158 s, confirming that one treatment cannot resolve those concurrent host
+spans below roughly 0.2 s.
+
+Retain the packed kernel mechanism: its GPU result reproduced the T25 ratio at
+T28 and removed 0.462660 s of measured device work without changing any proof
+artifact.  Do not claim a complete-proof gain from this run.  Against the exact
+5x threshold, the measured residual is 0.917459 s.  The hard lower bounds from
+this record are 0.918106 s for the streamed CPU prefix work, 0.573146 s for
+Stage 1 (0.391323 s of Metal commands), and 1.201278 s for Stage 2 (0.561451 s
+of Metal commands).  Further progress must reduce those work terms or their
+boundaries; additional root queue or command-buffer tuning cannot supply the
+remaining gain.
+
+### Ternary indexed root gather
+
+The root's embedded challenges come from the production D512 family, whose 19
+nonzero coefficients are all `+/-1`; the nibble kernel conservatively supports
+`+/-2`.  Bias the actual ternary table by one and store sixteen two-bit values
+per word.  Sixteen source phases and four destination quads still require 64
+words per challenge, so preparation storage remains about 3.75 MB at T28, but
+only four contiguous words (16 bytes) are read per selected source.
+
+Split each SIMDgroup into eight four-lane source groups.  A lane owns sixteen
+destinations.  Masks at bit offsets 0, 2, 4, and 6 turn one word directly into
+four packed-byte accumulators; each byte holds four destinations separated by
+four coefficients.  At most 32 records reach one source group in a 256-record
+tile, so the biased sum is at most 64 and cannot carry across bytes.  Negacyclic
+signs replace a selected biased byte `b` by `2-b`, followed by one exact bias
+subtraction per group.  Custom challenges containing `+/-2` use the existing
+generic dense Metal route.
+
+The logical challenge traffic falls from about 257 GB to 129 GB.  The measured
+nibble kernel sustains an effective 354 GB/s including its other traffic and
+integer work, giving a traffic-only floor near 0.36 s.  Allow 0.45--0.58 s at
+T28 for extra record decoding, four packed accumulators, and final SIMD
+reductions.  Require the existing full-residue 256-record centered/digit oracle,
+then one exact T25 treatment.  Promote only if root GPU is at most 0.075 s,
+with all proof, transcript, evaluation, commitment, verifier, route, and memory
+guards intact.  At T28 require root GPU at most 0.58 s, root wall at most
+1.40 s, and complete opening at most 6.05 s.  A local miss restores the nibble
+kernel without subgroup or packing-width tuning.
+
+The focused synthetic ternary oracle passed, but the exact T25 treatment did
+not select the route: the production root includes magnitude-two coefficients.
+The qualification guard correctly used the generic dense Metal kernel, reported
+zero indexed calls and zero direct-digit bytes, and took 0.224967 s of root GPU
+time.  This both misses the 0.075 s gate and falsifies the production-family
+premise.  Do not change the sampled challenge distribution to fit the kernel.
+Restore the nibble route and do not run T28.
+
+### Root stream contention panel
+
+The nibble treatment changes the root balance: 0.725943 s of GPU work now runs
+beside 0.918106 s of CPU prefix work, but their 1.549965 s wall interval hides
+only 0.094084 s. The eight queued chunks therefore do not provide useful
+pipeline overlap at T28. They instead make the all-core D128 prefix commits
+compete with the indexed kernel for the unified memory and power domains.
+
+Measure one exact T28 panel at 1, 2, 4, and 8 equal position chunks from the
+same release binary. The diagnostic switch changes only execution boundaries;
+the centered coefficients, balanced digits, prefix merge order, transcript,
+proof, and verifier remain fixed. Retain the fastest fixed chunk count only if
+all exactness and route guards pass and root wall improves by at least 100 ms
+against the same-panel eight-chunk control. The one-chunk endpoint deliberately
+removes overlap: it is useful if lower GPU/CPU contention and one larger CPU
+commit call repay serialization. Remove the diagnostic environment switch
+after selecting or rejecting the fixed policy.
+
+All four T28 proofs were exact. The same-binary results were:
+
+| chunks | root wall | root GPU | consumer | complete |
+|---:|---:|---:|---:|---:|
+| 8 | 1.520660 s | 0.722430 s | 0.864705 s | 6.035833 s |
+| 4 | 1.611182 s | 0.734020 s | 0.847616 s | 6.347841 s |
+| 2 | 1.778337 s | 0.732743 s | 0.878090 s | 6.606341 s |
+| 1 | 2.141562 s | 0.761734 s | 0.762775 s | 7.352025 s |
+
+Larger chunks do not lower either kernel work or CPU commit work enough to
+repay their delayed first handoff. The one-chunk endpoint also exposes about
+0.62 s outside the reported GPU and consumer intervals, so serializing the two
+workers is especially harmful. Retain eight chunks and remove the diagnostic
+switch. The fresh eight-chunk control is the current end-to-end record, 4.401x
+against the frozen CPU time, and leaves 0.722610 s to the 5x threshold.
+
+### Paired Stage-2 prefix grid
+
+The canonical two-round Stage-2 prefix asks for eight norm and eight relation
+grid values. With the default omitted norm corner, both sets use the identical
+eight nonzero grid points, but the retained kernel dispatches separate
+threadgroups and repeats digit interpolation for each set. Pair the norm and
+relation accumulators in one threadgroup per point. This halves point-group
+count and shares digit loads and interpolation; it does not remove either
+field-weighted accumulation, change the compressed grid, or change any proof
+message.
+
+The 63.292 ms T25 prefix is the local target. Because field arithmetic remains,
+the expected improvement is 15--30%, not 2x. Require both direct Stage-2
+CPU/Metal parity cases, including structured linear terms. Admit one T25 exact
+treatment only if the focused tests pass. Retain for T28 only if Stage-2 GPU
+time falls by at least 8% and Stage-2 wall does not regress; otherwise restore
+the separate point groups without workgroup tuning.
+
+Both focused parity cases passed and the T25 proof, transcript, evaluation,
+commitment, verifier, route, and memory guards were exact. The local mechanism
+missed: Stage-2 GPU time fell only from 213.195 ms to 206.520 ms (3.1%), and
+Stage-2 wall fell from 478.578 ms to 470.237 ms. Field-weighted accumulation,
+not repeated digit interpolation or point-group launch count, controls the
+prefix. Reject without T28 and restore the separate point groups.
+
+### Native-u32 fp128 multiplication
+
+The Stage-2 prefix remained field-accumulation-bound after point pairing. The
+shared field primitive currently implements a 128-by-128 product with sixteen
+MSL `ulong` multiplies, then reduces modulo the fp128 pseudo-Mersenne prime.
+Replace the product only with a seven-diagonal Comba accumulator using `uint`
+low products, `mulhi` high products, and explicit carries. Apply the same
+32-bit carry form to field-by-signed-i32 multiplication, which dominates the
+compact Stage-1 and Stage-2 prefix terms. Keep the existing reduction and all
+field representations unchanged.
+
+The operation count does not predict the Apple GPU mapping: this wins only if
+native 32-bit multiply-high and carry chains beat compiler lowering of 64-bit
+integer multiplication. Require all Akita Metal tests that exercise field
+arithmetic and the focused Stage-1/Stage-2 CPU parity cases. Then run one exact
+T25 treatment. Retain for T28 only if aggregate Stage-1 plus Stage-2 GPU time
+falls by at least 15% without increasing any exact Metal commitment or relation
+failure; otherwise restore the original product immediately.
+
+All 33 Akita Metal tests passed, including full and recursive commitments,
+D64/D512 relations, and both sumchecks. The exact T25 treatment also preserved
+every proof and route guard, but the performance gate rejected the primitive:
+direct-range plus direct-relation GPU time rose from 373.044 ms to 497.424 ms,
+or 33.3%. The explicit `mulhi` carry dependency chain is worse than the Metal
+compiler's `ulong` lowering on this Apple GPU. Restore the original primitive
+and do not tune Comba unrolling or limb width in this campaign.
+
+### Dense known-balanced recursive-prefix commit
+
+The current T28 root interval is 1.520660 s: 0.722430 s in the indexed Metal
+producer and 0.864705 s in the CPU successor-commit consumer, with only
+0.066475 s of overlap. Routing the consumer to the existing exact Metal
+D128 commit is already falsified: a cached 32-block call costs 0.143334 s, or
+about 1.15 s for the eight stream chunks, before contending with the producer.
+Keep the CPU route.
+
+The CPU consumer nevertheless uses the generic sparse digit mat-vec after the
+root producer has supplied an authenticated `known_balanced_log_basis`. That
+path first validates every byte and then tests every D128 digit plane for zero
+inside the NTT mat-vec. The random fold response is dense; those scans do not
+change its arithmetic and almost never skip a transform. Dispatch a
+known-balanced recursive source through the existing dense digit mat-vec,
+which removes both scans while preserving the same cached setup transform and
+exact CRT arithmetic. Unknown sources retain validation and sparse skipping.
+This is an execution-only CPU-consumer change, not a proof or schedule change.
+
+First require the recursive witness and root-fold tests that exercise known
+balanced prefixes. Then run one exact T25 treatment. Promote to T28 only if the
+root Z-prefix span is at most 0.225 s (from 0.246202 s), the streamed consumer
+is at most 0.245 s (from 0.267079 s), and every proof, transcript, evaluation,
+commitment, verifier, route, and memory guard passes. At T28 retain only if the
+root Z-prefix span and consumer each improve by at least 80 ms and complete
+opening improves by at least 50 ms against the 6.035833 s same-campaign record.
+The candidate is complementary to Stage 1/2 work; it is not by itself a 5x
+claim.
+
+The Akita prover suite exercised the affected recursive-commit path before two
+unrelated schedule-generation tests failed on the dirty campaign parent. The
+exact T25 treatment preserved all proof and route guards. Its root Z-prefix
+span fell only from 0.246202 s to 0.236235 s, and its streamed consumer fell
+from 0.267079 s to 0.258596 s. Both 3--4% changes miss the local gates, while
+complete opening rose from 1.781748 s to 1.805370 s. The consumer is controlled
+by the exact CRT mat-vec, not its validation and zero-plane scans. Restore the
+sparse path and do not run T28.
+
+### P-core-sized streamed D128 commit tasks
+
+The fresh T28 root interval contains 0.722430 s of Metal work and 0.864705 s of
+CPU prefix commitment but takes 1.520660 s wall, so only 0.066475 s overlaps.
+The existing producer already submits all eight disjoint commands before it
+waits for the first callback; another queue or buffer pipeline cannot create
+the missing overlap. The 16-worker CPU mat-vec instead saturates all 12
+performance and four efficiency cores while the GPU is active, forcing the two
+branches to share the package and memory controller nearly serially.
+
+For only the measured large streamed shape (D128, one A row, at least 16,384
+columns, and 16--64 blocks), group blocks into 12 ordered Rayon tasks. Each
+task processes two or three blocks sequentially. This keeps the performance
+cores occupied, avoids scheduling the four efficiency cores as independent
+matrix walkers, and gives each worker short-term reuse of the transformed A
+row. Every block still runs the same exact CRT/NTT operations and results are
+flattened in canonical block order. Other commit shapes, including the frozen
+CPU control's one-shot path, retain ordinary block parallelism.
+
+Require the affected Akita commit composition tests, then one exact T28 Metal
+treatment. Preserve proof bytes, transcript, evaluation, commitment, verifier,
+schedule, route counters, and the memory guard. Retain only if the streamed
+consumer is at most 1.05 s, root GPU is at most 0.80 s, root wall is at most
+1.30 s, and complete opening is at most 5.85 s against the 6.035833 s record.
+Any miss restores per-block parallelism without trying intermediate task
+counts; the fixed 12 has a hardware rationale, not a search rationale.
+
+The exact T28 treatment preserved the proof digest, transcript, evaluation,
+commitment, verifier result, required routes, and memory guard, but failed both
+end-to-end timing gates. The streamed consumer was 0.886344 s and root GPU work
+was unchanged at 0.724338 s, yet root wall rose from 1.520660 s to 1.562907 s
+and complete opening rose from 6.035833 s to 6.207277 s. Grouping work onto 12
+tasks neither created useful CPU/GPU overlap nor exposed meaningful transform
+reuse. Restore ordinary block parallelism and do not search intermediate task
+counts.
+
+### Cross-stage compact-witness residency
+
+Stage 1 and Stage 2 consume the same `Arc<[i8]>` compact witness. The retained
+Metal path nevertheless allocates and copies that 1.344 GB source into a new
+shared buffer for each session. At T28, Stage-2 session setup takes 180.888 ms;
+the aggregate Metal upload/setup counter is 256.775 ms. Stage 1 has completed
+all commands before Stage 2 starts, so its immutable source buffer can be moved
+between sessions without synchronization or protocol changes.
+
+Retain the Stage-1 buffer behind the exact `Arc` allocation identity and take it
+when Stage 2 presents the same allocation. A weak source reference prevents an
+address-reuse match and lets abandoned entries be pruned. A miss performs the
+existing copy. Proof messages, transcript operations, field tables, fold order,
+and command boundaries are unchanged. The saved-work ceiling is one 1.344 GB
+allocation-and-copy, not the whole Stage-2 setup span.
+
+Require direct Stage-1 and Stage-2 parity tests, then one exact T25 treatment.
+Retain for T28 only if the T25 Stage-2 session-setup span falls by at least
+15 ms without increasing Stage-1 wall time, and every proof, transcript,
+evaluation, commitment, verifier, route, and memory guard passes. At T28 require
+the Stage-2 session-setup span to fall by at least 40 ms and complete opening to
+improve by at least 30 ms against the 6.035833 s record. A miss restores the
+copy; do not add pointer-only or digest-based cache matching.
+
+All three focused direct-proof parity tests passed. The exact T25 treatment
+also preserved the proof digest, transcript, evaluation, commitment, verifier,
+routes, and memory guard, and reported three exact-allocation reuse hits across
+the recursive levels. Stage-2 session setup fell from 68.292 ms to 57.221 ms,
+only 11.071 ms, while complete opening rose from 1.781748 s to 1.798787 s. The
+local gate rejects the mechanism, and its measured T28 projection is below the
+40 ms promotion threshold. Restore independent session buffers and do not run
+T28.
+
+### SIMDgroup sumcheck partial reductions
+
+Every ordinary direct-range and direct-relation workgroup currently stores
+three or four fp128 accumulators for all 256 threads, then crosses nine full
+threadgroup barriers to reduce them. The two-round Stage-2 prefix already uses
+the appropriate Apple-GPU hierarchy: reduce within each 32-lane SIMDgroup,
+store eight sums per accumulator, cross one barrier, and let the first
+SIMDgroup finish. Apply that exact pattern to the ordinary Stage-1 and Stage-2
+partial kernels and their final reducer. Threadgroup storage falls from 16 KiB
+to 512 bytes for Stage 1 and from 16 KiB to 384 bytes for Stage 2. Contributions,
+canonical field additions, partial layout, messages, and command boundaries are
+unchanged.
+
+Require all three direct-proof parity tests, then one exact T25 treatment. The
+retained T25 parent spends 373.044 ms of GPU time in the two direct sessions.
+Promote to T28 only if their aggregate is at most 345 ms, complete opening is at
+most 1.75 s, and all proof, transcript, evaluation, commitment, verifier, route,
+and memory guards pass. At T28 retain only if aggregate direct GPU time improves
+by at least 70 ms and complete opening improves by at least 50 ms against the
+6.035833 s record. A T25 miss restores the shared-memory tree without tuning
+thread count or SIMD width.
+
+The three focused parity tests and the exact T25 proof passed every correctness,
+route, and memory guard. Performance moved in the wrong direction: direct-range
+plus direct-relation GPU time rose from 373.044 ms to 388.917 ms, and complete
+opening rose from 1.781748 s to 1.813275 s. SIMD shuffle plus canonical field-add
+work costs more than the shared-memory tree on this kernel, while the smaller
+threadgroup allocation does not expose useful occupancy. Restore the original
+tree reduction and do not run T28.
+
 ## Claim-to-code map
 
 | Claim | Current code seam | Intended change |
@@ -2913,3 +4607,476 @@ pressure. None is promoted ahead of the unchanged-protocol position split.
 | Exact CPU-tail cutoff | Derive from one warm treatment using table-size counters; keep it fixed and public-shape-derived afterward |
 | Whether the canonical schedule can clear 5x | Preserve it until a measured uncovered floor exceeds the target; isolate any later schedule change from kernels |
 | Whether CPU A-relation overlap is still a useful route | Resolved negatively for this campaign: both serial and windowed treatments lost; preserve the Metal relation and capacity-parallel exactness |
+## Resident sumcheck transcript checkpoint
+
+### Question and bound
+
+Can the existing direct F128 Stage-1 and Stage-2 proofs execute all dependent
+sumcheck rounds in one Metal command buffer while preserving the exact proof
+and verifier?  At T28 the retained implementation spends 1.725 s of wall time
+in these stages (0.571 s Stage 1 and 1.154 s Stage 2), but only about 0.952 s in
+GPU timestamp intervals.  Eliminating only command submission cannot close the
+0.723 s complete-proof gap to 5x; a useful resident path must also remove the
+per-round host transcript, equality/source reconstruction, uploads, and binds.
+
+The first falsifiable prerequisite is exact transcript continuation.  Akita's
+Blake2b sponge state at a sumcheck boundary must be exportable in bounded space,
+and an independent replay must produce every subsequent 32-byte challenge
+exactly.  This is execution metadata only: transcript messages, proof bytes,
+challenge reduction, and verifier behavior remain unchanged.
+
+### Candidate
+
+Replace the opaque default Blake2b bridge with a byte-identical local bridge
+whose state has an explicit checkpoint.  Validate it against Spongefish's
+current Blake2b bridge over transitions through start, streaming absorb,
+ratchet, partial squeeze, and resumed absorb, as well as Akita's existing golden
+challenge.  Expose the checkpoint through an optional generic transcript hook;
+non-Blake2b and custom transcripts return no checkpoint and retain the current
+backend path.
+
+### Credibility gate
+
+Do not write an all-round Metal sumcheck kernel unless all of the following hold:
+
+- the differential sponge test is byte-exact for every squeeze;
+- the existing Akita transcript golden challenge is unchanged;
+- a checkpoint taken after a partial squeeze resumes byte-exactly across an
+  absorb and at least two further challenges;
+- direct Stage-1 and Stage-2 proof parity tests remain exact after the substrate
+  change.
+
+Reject the route if exact continuation requires changing a transcript message
+or verifier schedule.  Passing this gate authorizes only a Stage-1 resident
+prototype at T25; T28 remains gated on exact proof parity and a measured
+Stage-1 wall-time saving of at least 60 ms at T25 or a complete-proof saving of
+at least 40 ms.
+
+The checkpoint substrate passed differential Spongefish transitions, the
+existing golden challenge, partial-squeeze continuation, and all three direct
+proof parity tests. A one-command Stage-1 prototype was therefore measured at
+T25. It preserved the proof digest and every verifier/transcript guard, but
+Stage 1 rose from 247.297 ms to 291.058 ms and complete opening rose from
+1.781748 s to 1.790656 s. Direct-range command wall rose from 192.584 ms to
+237.212 ms and GPU time from 159.849 ms to 217.574 ms. Batching removed only
+about 13 ms of command-submission gap while the serial one-thread Blake2b work
+added about 58 ms of GPU time; post-command host replay left the roughly 54 ms
+non-command portion unchanged. Reject and remove the resident Stage-1 route;
+do not run it at T28. Retain only the byte-exact checkpoint/challenge
+prerequisite while evaluating Stage 2, whose larger challenge-dependent host
+state transition can plausibly amortize it.
+
+### Resident Stage-2 suffix after the bivariate prefix
+
+The retained T25 Stage 2 takes 478.578 ms, of which 280.738 ms is Metal command
+wall and 213.195 ms is GPU time. At T28 it takes 1.153783 s, while the direct
+relation command accounts for 722.567 ms wall and 561.119 ms GPU. The T28
+stage therefore contains about 593 ms outside GPU timestamp intervals. That is
+the useful ceiling for a resident design; command batching alone can recover
+only the 161 ms command-wall/GPU difference.
+
+Keep the canonical two-round bivariate prefix. After its second challenge the
+host and device are at the same ordinary-round boundary: the transcript has an
+exact checkpoint, the device retains the compact witness and structured-linear
+tables, and the next round polynomial is already in the resident output
+buffers. Execute rounds 2 through the final round in one command buffer. Each
+round must:
+
+- absorb the exact trimmed compressed polynomial and derive the ordinary
+  Blake2b challenge;
+- update the split-equality scalar while selecting a precomputed,
+  challenge-independent equality-table layer;
+- fold the coefficient-alpha or lane-weight table and the structured-linear
+  source;
+- fold sparse additional weights using a fixed parent topology, retaining
+  algebraic zeros rather than changing support according to a challenge; and
+- fold the witness and produce the next ordinary and additional coefficients.
+
+The proof format, transcript labels and bytes, round count, polynomial degree,
+two-round prefix, verifier, and protocol configuration are unchanged. The host
+replays returned messages and challenges after the command to construct the
+canonical prover state and independently checks the final claim. Transcripts
+without an executable Blake2b checkpoint retain the existing round-at-a-time
+path.
+
+The added device work is one serial Blake2b transition per remaining round plus
+small geometric folds. The rejected Stage-1 prototype measured about 58 ms for
+its complete challenge chain, so a T25 Stage-2 suffix is expected to add roughly
+60--80 ms of GPU work while removing most later command waits, equality/alpha
+uploads, and host round construction. It deliberately does not claim the full
+593 ms T28 ceiling: host replay remains, and the first two rounds and source
+construction remain separate.
+
+Before T28, require both direct Stage-2 CPU-parity tests, including nonzero
+additional terms, and one exact T25 treatment. Preserve proof bytes, transcript,
+evaluation, verifier, required routes, and memory guard. Promote only if Stage 2
+is at most 390 ms (an 88 ms saving) and complete opening is at most 1.710 s (a
+72 ms saving) against the 1.781748 s retained parent. A miss removes the
+resident route without tuning Blake2b or changing the protocol. At T28 retain
+only if complete opening improves by at least 180 ms against 6.035833 s; then
+remeasure the uncovered floor before selecting the next mechanism toward the
+5.313223 s target.
+
+Both focused Stage-2 parity tests passed, including the nonzero compression and
+restricted-binary addends. The exact T25 treatment also preserved the proof
+digest, transcript, evaluation, verifier, routes, and memory guard, but missed
+both performance gates. Stage 2 rose from 478.578 ms to 499.275 ms and complete
+opening rose from 1.781748 s to 1.799908 s. Direct-relation GPU time increased
+27.080 ms, while reducing the command-wall/GPU gap recovered only about 9 ms;
+host prepare, bind, round construction, buffer setup, and session setup improved
+by roughly 11 ms in aggregate. Applying the measured fixed GPU cost and the
+larger T28 command gap projects less than 100 ms of T28 benefit, below the
+180 ms promotion gate and far below the 723 ms complete-proof deficit. Remove
+the resident Stage-2 route and do not run it at T28. Exact transcript execution
+remains a validated primitive, but neither sumcheck has enough avoidable host
+work to amortize serial device-side Blake2b on this GPU.
+
+## Commit-retained destination index for root coefficient packing
+
+The current exact T28 record is 6.035833292 seconds against a frozen CPU time
+of 26.566116792 seconds. Five times therefore requires at most 5.313223358
+seconds, a 0.722609934-second reduction. Root coefficient packing is a serial
+1.200439958-second host phase. Prior local treatments do not have that ceiling:
+four-block weight reuse regressed, fixed-shape raw limbs saved only 0.118
+seconds, and a 15/15 CPU/Metal column split saved 0.329 seconds locally but
+almost none end to end because it contended with the following root kernel.
+
+Build a second, one-shot opening index while Metal commitment already owns the
+packed D512/K256 source. For each `(trace block, column, row parity, 256-position
+tile)`, partition the 256 selectors into the 32 `hot >> 3` buckets. Store a
+`u16` record containing the eight-bit position within the tile and the three
+low selector bits, plus 33 `u16` bucket offsets. T28 contains 8,053,317,376
+selectors, so records require 16.107 GB and offsets about 2.08 GB. This index
+is independent of every Fiat--Shamir value and changes neither commitment nor
+protocol. It is consumed and released by coefficient packing before the
+position-major root-fold index is consumed.
+
+At opening time, assign one 256-thread group to each output
+`(column, trace block, parity bucket)`. A thread owns one or four position tiles,
+reads only the prepartitioned records for its bucket, and gathers the exact
+precomputed `position_weight * packing_weight[low]`. Instead of a canonical
+fp128 addition per selector, it accumulates the four 32-bit limbs independently
+in four 64-bit counters. At most `2^18` records contribute to an output, so
+every counter is below `2^50`. One group reduction and one final carry/fold by
+`2^128 = MODULUS_OFFSET (mod p)` produce the canonical field value. Output
+ownership removes atomics; maximal selector skew changes load balance but not
+the bound or arithmetic.
+
+The conservative T28 opening traffic is 32.2 GB of record/offset reads plus
+128.9 GB of logical weight reads. The 32 MB weight table is reused across
+neighboring bucket groups, so 161.1 GB is an upper traffic model rather than a
+cache-adjusted claim. Charging all of it to the measured 400 GB/s class device
+bandwidth gives a 0.40-second floor. The candidate has enough isolated ceiling
+only if root packing reaches at most 0.45 seconds; that saves at least 0.75
+seconds and can cross the fixed 5x threshold without relying on another phase.
+
+First require focused generic-versus-indexed parity at stride eight, including
+all-one-bucket skew, padded columns, partial final rows, and exact canonical
+limb reduction. One T25 credibility treatment must preserve commitment, proof
+bytes, transcript, evaluation, verifier, route, and memory guards; use exactly
+one indexed packing call; keep root packing at most 60 ms; and keep complete
+opening at most 1.76 seconds. Only a pass authorizes T28. At T28 retain only if
+root packing is at most 0.45 seconds, complete opening is at most 5.313223358
+seconds, peak live memory remains below 90 GiB, and total Metal commitment
+remains below 39.183 seconds (five times the frozen 195.915989-second CPU
+commit). Any miss removes the destination index and gather kernel without
+tuning tile size or weakening an exactness gate.
+
+The index and gather passed the focused exactness suite and the T25 gate. T25
+root packing fell from 100.175 ms to 54.522 ms and complete opening fell from
+1.781748 s to 1.696212 s. The exact T28 treatment did not preserve that
+scaling: root packing took 866.719 ms and complete opening took 5.839570 s, or
+4.549x against the frozen CPU anchor. The proof, transcript, evaluation,
+commitment, verifier, route, 26.87 GB peak RSS, and 37.723-second Metal commit
+all passed. Retain the challenge-independent index as a substrate, but reject
+the output-major gather.
+
+The miss is a cache-boundary error in the original traffic model. The combined
+weight table is 8 MiB at T25 and 32 MiB at T28. T25 moves about 18.6 GB of
+records, offsets, and logical weights in 54.5 ms, approximately 342 GB/s. T28
+moves about 139 GB in 866.7 ms, approximately 161 GB/s. The output-major kernel
+visits one bucket across the entire position domain, so each group gathers
+sparsely and effectively randomly from the full weight table. Treating those
+loads as streaming device bandwidth was therefore invalid once the table
+crossed the effective cache size.
+
+## Chunk-local all-bucket root packing
+
+Keep the exact retained index, but transpose only its opening traversal. One
+threadgroup handles all 32 buckets for one `(trace block, column, parity)`
+stream over a fixed 32-tile window. Eight threads own each bucket. They read its
+prepartitioned records, gather weights only from the window, accumulate limbs
+in `u64`, and reduce within the eight-thread bucket group. Thirty-two tiles
+cover 8,192 positions, so the combined-weight working set is exactly 1 MiB.
+Dispatch windows outermost so consecutive groups reuse that window across
+streams. Do not change the retained record layout or protocol.
+
+At T28 this produces 32 partials for each of 983,040 live outputs over 32
+windows: 503.3 MB of partial storage and about 1.0 GB of added write/read
+traffic. Record and offset traffic remains one pass and every logical weight is
+still loaded once, but the full-table random working set is removed. The first
+pass uses three threadgroup barriers rather than the output-major tree's eight;
+a second flat kernel adds the 32 canonical partials per output. A twofold
+recovery from the observed 161 GB/s would put packing near 0.43 seconds and
+complete opening near the fixed 5.313223-second threshold.
+
+Use 32 tiles because its 1 MiB working set is safely below both measured table
+regimes; do not sweep it. Require the existing varied, zero, padding,
+multi-tile, partial-tile, maximal-skew, and one-shot cache tests. At T25 require
+root packing at most 75 ms and complete opening at most 1.76 seconds. Only then
+run T28. Retain at max scale only if root packing is at most 0.43 seconds,
+complete opening is at most 5.313223358 seconds, peak RSS remains below 90 GiB,
+and Metal commit remains below 39.183 seconds.
+
+The chunk-local implementation passed focused exactness and T25: root packing
+was 34.883 ms and complete opening was 1.755302 s. At T28 it reduced root
+packing to 446.700 ms, but missed the 430 ms local gate; complete opening was
+5.573686 s (4.766x), and the otherwise unchanged commit measured 39.620
+seconds. Exactness and the 27.26 GB RSS guard passed. Do not tune the 32-tile
+window. The locality premise is validated by the 420 ms improvement over the
+output-major gather, but 983,040 short groups, three barriers per group, a
+503.3 MB allocation, and the second pass are now exposed overhead.
+
+## Monotone all-bucket stream traversal
+
+Assign one 256-threadgroup to each complete `(trace block, column, parity)`
+stream, with eight threads per bucket as in the chunk-local kernel. Traverse
+all position tiles monotonically, keep the 32 bucket sums live in registers and
+threadgroup state, reduce once, and write final coefficients directly. Dispatch
+trace block outermost so the 60 live streams for a block advance through the
+same weight region together. This preserves cache-line locality without a
+window buffer and reduces the group count from 983,040 to 32,768, barriers from
+about 2.95 million to 98,304, and intermediate traffic from 1.0 GB to zero.
+The maximum-skew sum remains below `2^50` at the T28 schedule, so deferred limb
+arithmetic is unchanged.
+
+This mechanism can recover at most the 446.7 ms packing phase and therefore is
+not by itself an analytical guarantee of 5x; it must expose a packing floor
+before choosing the final non-packing target. Require the same exactness suite,
+then one T25 treatment with root packing at most 55 ms and complete opening at
+most 1.76 seconds. At T28 retain only if packing is at most 0.32 seconds and
+complete opening is at most 5.45 seconds. The hard 5.313223-second proof and
+39.183-second commit gates remain unchanged for final acceptance.
+
+The monotone traversal passed exactness and its ambiguity-band T25 repeat at
+34.413 ms packing and 1.752686 s complete. It failed at T28: groups drifted
+across the full 32 MiB weight table, packing regressed to 615.251 ms, and
+complete opening regressed to 5.825263 s. Reject it and restore bounded windows.
+
+## Four-stream SIMD-pair window packing
+
+The bounded-window kernel still launches 983,040 groups, assigns eight threads
+to each bucket, crosses three barriers per group, and writes 503 MB of partials.
+Instead, one group handles four streams in the same 32-tile window. Two SIMD
+lanes own each bucket; each 32-lane SIMDgroup therefore covers sixteen adjacent
+buckets of one stream. This matches the observed Jolt half-range selector
+distribution without forcing inactive and active buckets through the same
+divergent loop. Normalize the two deferred limb sums, exchange them with a SIMD
+shuffle, and let the even lane write the exact bucket partial. No threadgroup
+memory or barrier remains.
+
+At T28 the group count falls fourfold to 262,144. Logical record and weight
+traffic is unchanged, the live weight window remains 1 MiB, and padded columns
+add only zero partials. Partial storage is 536.9 MB because it now uses the
+canonical output layout. Require the existing exactness suite, then one T25
+treatment with packing at most 35 ms and complete opening at most 1.76 seconds.
+At T28 retain only if packing is at most 0.30 seconds and complete opening is at
+most 5.40 seconds. This is the last packing traversal in this campaign; a miss
+restores the 32-tile eight-thread winner and moves to a non-packing mechanism.
+
+The four-stream kernel passed exactness and T25 at 30.110 ms packing and
+1.744464 s complete opening. It failed both T28 gates: packing was 406.503 ms
+and complete opening was 5.567019 s. The 40.196 ms local packing improvement
+over the chunk-local parent produced only a 6.667 ms complete-opening gain,
+while the unrelated root consumer grew by 45.365 ms. Reject the kernel and
+restore the 32-tile eight-thread implementation. The result also closes further
+packing-layout tuning as the path to 5x: even removing the remaining 406.503 ms
+entirely would leave too little robust margin once cross-phase contention is
+included.
+
+## Wider opening-basis audit
+
+Changing the root opening basis from log basis 3 to log basis 4 would reduce
+the balanced root digit count from four to three, but it is not a small
+admissible schedule change. The Metal direct Stage 1 implementation supports
+log bases 2 and 3; log basis 4 selects the tree protocol. More importantly, an
+exhaustive schedule-generator query found no T28 row with log basis 4 under the
+current audited SIS policy: not at the existing D512/B64/D64 geometry, not at
+any admitted rank, not with B or D widened to 128, and not across any admitted
+dimension or block geometry. The original generated schedule was restored
+byte-for-byte. Reopening this path would require changing the challenge or
+security policy as well as implementing a new Metal protocol path, so it is
+outside the approved minor-change scope.
+
+## Disjoint-resource root pipeline
+
+The retained T28 root decompose/recursive-commit pipeline takes 1.604709 s.
+Inside that wall interval, eight Metal chunks account for 755.303 ms of GPU
+span and their ordered CPU consumers account for 918.453 ms. With average
+chunk service times of about 94.4 ms and 114.8 ms, an unconstrained two-stage
+pipeline has the lower-bound schedule
+
+```text
+G + 8 C = 94.4 ms + 8 * 114.8 ms = 1.013 s,
+```
+
+which exposes roughly 592 ms of analytical headroom. Only 260.463 ms is needed
+to move the frozen 5.573686-second parent below the 5.313223-second 5x limit.
+The present implementation commits all eight commands before consuming them,
+but every command writes a disjoint offset of the same two Metal buffer
+resources. CPU reads from those resources while later commands remain GPU
+writers. The observed wall time is only 69.048 ms below GPU-plus-consumer time,
+consistent with resource/coherence serialization rather than the intended
+chunk pipeline.
+
+Give every chunk its own shared output and digit buffers. Commands continue to
+share the immutable index and challenge buffer, are committed in order, and are
+consumed in order. Copy each completed centered-output chunk into the existing
+global result vector; consume its digit buffer directly. This changes no
+arithmetic, proof data, transcript, protocol, chunk count, or total live byte
+count. Distinct writable Metal resources are the only experimental variable.
+
+T25 is a correctness and regression gate, not a speedup oracle: its 97.210 ms
+GPU span is already almost fully hidden behind its 255.256 ms consumer, and its
+273.639 ms wall is near the 267 ms two-stage floor. Require exact commitment,
+proof bytes, transcript, evaluation, verifier, route, and one indexed dispatch;
+require complete opening at most 1.80 seconds and packed-decompose wall at most
+0.30 seconds. Then run one exact T28 treatment. Retain only if complete opening
+is at most 5.313223358 seconds, packed-decompose wall improves by at least
+0.30 seconds to at most 1.304709 seconds, peak RSS stays below 90 GiB, and all
+exactness and routing gates pass. A miss closes buffer identity as the cause
+without changing chunk count or adding another sweep.
+
+The focused indexed fold/digit oracle and both restored packing oracles passed.
+T25 also passed its regression gate at 1.748185 s complete and 280.570 ms packed
+decompose wall, with exact commitment, proof, transcript, evaluation, verifier,
+and route behavior. The single T28 treatment falsified the mechanism. It was
+exact, but packed-decompose wall regressed to 1.632787 s and complete opening to
+5.637833 s. GPU span was 797.325 ms and consumer time was 840.713 ms; their sum
+is only 5.251 ms above the measured wall. Distinct output and digit buffer
+identities therefore did not create material T28 overlap. Restore the shared
+buffers and do not sweep chunk count. The remaining target must reduce one of
+the two services rather than trying to overlap them through Metal resource
+identity.
+
+## Q128 CRT-prime audit
+
+The proposed CPU recursive-commit reduction from six CRT primes to five is
+already the retained implementation. `Q128_NUM_PRIMES` is five, the selected
+capacity profile is `Q128/5xi32`, and five roughly 30-bit primes are the exact
+Q128 reconstruction set. The six-prime constants elsewhere in the Metal code
+belong to D512 relation and recursive kernels with different accumulation
+bounds; they are not the streamed D128 CPU commitment denominator. Reducing the
+D128 path further would no longer reconstruct every Q128 value. Close this
+candidate without code or a benchmark.
+
+## Stage-2 static-session overlap
+
+The retained T28 opening is 5.573686375 s, 260.463017 ms above the fixed
+5.313223358-second five-times threshold. Its direct Stage-2 call is 1.218878250
+s. The following measured intervals are independent of the Stage-1 challenges
+and transcript messages:
+
+| Work | T28 wall |
+|---|---:|
+| opening-term preparation | 25.359084 ms |
+| direct layout and field-to-limb preparation | 121.535209 ms |
+| resident Metal session construction | 219.110750 ms |
+| **overlap ceiling** | **365.850084 ms** |
+
+The 0.154959 ms equality-prefix preparation inside the host interval is
+challenge-dependent; subtracting it does not change the displayed precision.
+The static inputs already exist after ring-switch finalization: the compact
+witness, relation-weight factorization, opening semantics, setup-linear terms,
+and relation geometry. Stage 1 reads the compact witness, tau0, geometry, and
+basis but does not consume the relation factorization or structured-linear
+terms. Stage 2 alone needs the equality prefix derived from the Stage-1 point,
+the batching challenges sampled afterward, and sparse additional-relation
+terms derived from those values.
+
+Add a backend preparation token to the direct relation-proof operation. For an
+accelerator backend, build the structured-linear terms and the complete static
+Metal session on one scoped host worker while the caller proves Stage 1. The
+ordinary CPU backend returns an empty token and keeps the current sequential
+path. The Metal token owns its buffers, converted layout, and setup timings;
+the later proof call supplies only the equality-prefix and transcript-dependent
+round data. The worker is joined before Stage 2, so errors cannot escape the
+proof call and no detached work survives it. This changes neither a sumcheck
+message nor its order.
+
+The static session writes the same buffers and runs the same 55.241834 ms GPU
+linear-source kernel. Its compulsory device work cannot disappear. Charging
+that entire GPU interval as serialized Stage-1 interference gives the
+conservative critical-path estimate
+
+```text
+5.573686375 - 0.365850084 + 0.055241834 = 5.263078125 s
+26.566116792 / 5.263078125 = 5.048x.
+```
+
+This estimate gives only 50.145 ms of margin. The independently exact
+live-prefix Stage-1 factorization reduced T28 Stage 1 by 74.5 ms; applying it
+after this candidate would move the estimate to 5.188578125 s, or 5.120x.
+It remains a separate candidate and is not used to excuse a static-session
+regression.
+
+The scheduling change adds no total buffer traffic. It overlaps the Stage-2
+session with the approximately 5.5 GiB Stage-1 resident session, raising peak
+residency but remaining far below the 90 GiB limit from the current 27.26 GiB
+peak. The source kernel's observed 55.24 ms is a stronger floor than pricing
+its traffic at the measured 406.4 GB/s copy rate. Host allocation and copy work
+may contend with Stage 1; that contention is the principal falsifier.
+
+Implement only this static/dynamic split. First require focused direct Stage-2
+CPU/Metal proof parity and a T25 exact regression run no slower than 1.85 s.
+Then run one T28 treatment. The mechanism is locally retained only if Stage-2
+sumcheck falls to at most 0.94 s, the post-Stage-1 join wait is at most 25 ms,
+all proof, transcript, evaluation, commitment, verifier, route, and 90 GiB
+guards pass, and complete opening is at most 5.36 s. Final success still
+requires at most 5.313223358 s. If the local gates pass but the hard gate misses,
+restore the exact Stage-1 factorization and run one combined T28 treatment. If
+either local gate fails, remove the preparation token and do not tune worker or
+queue counts.
+
+Both focused direct-proof parity cases passed. The T25 treatment was exact and
+improved complete opening from 1.755302 s to 1.598440 s, below its 1.85-second
+regression limit. The first T28 treatment also passed every proof, transcript,
+evaluation, commitment, verifier, route, and memory guard:
+
+| Metric | Retained parent | Static session |
+|---|---:|---:|
+| complete opening | 5.573686 s | **5.032946 s** |
+| speedup over 26.566117 s CPU | 4.766x | **5.278x** |
+| Stage 1 | 0.582471 s | 0.643429 s |
+| Stage 2 sumcheck body | 1.218878 s | 0.744129 s |
+| root coefficient packing | 0.446700 s | 0.451829 s |
+| root streamed decompose/fold | 1.629001 s | 1.554023 s |
+| aggregate GPU-active time | 2.003677 s | 2.015088 s |
+| peak RSS | 27.256 GB | 27.115 GB |
+
+The unchanged source kernel and buffer work increased Stage 1 by 60.958 ms
+through queue and memory contention, as the conservative model allowed. The
+Stage-2 body nevertheless fell by 474.749 ms, and the complete call improved by
+540.740 ms. Root streaming happened to improve by 74.977 ms in this run, but
+removing that entire favorable movement still leaves 5.107923 s, safely below
+the 5.313223-second threshold. The candidate therefore does not rely on the
+root-phase fluctuation to clear five times. The exact proof digest remains
+`b9139d872029400fe920feebea66e643eac957f8f4f8b445efee9f6c203f6dea`.
+Do not restore the Stage-1 factorization; it is unnecessary complexity now that
+the single architectural change clears the target with margin. Revalidate the
+cleaned head once at T28 before promotion.
+
+The cleaned-head T28 validation measured 5.175134666 s, or 5.133x against the
+same 26.566116792-second CPU anchor. This is 138.089 ms below the exact
+five-times limit. The two candidate observations are therefore 5.278x and
+5.133x; the worse observation clears the target. The final run again matched
+the proof digest above, CPU proof, transcript, claimed evaluation, commitment,
+and verifier, with 27.104 GB peak RSS and no fallback on qualified operations.
+Its Metal commitment was 37.991499208 s versus the frozen 195.915989208-second
+CPU commitment, or 5.157x, so the concurrent preparation did not sacrifice the
+T28 commitment target.
+
+This accepts the T28-only eval-proof claim at the revalidated evidence stage.
+The T25 regression sentinel remains exact and improved to 1.598440458 s, but it
+is 3.963x against its 6.335011958-second CPU anchor and is not part of the
+re-scoped five-times claim.

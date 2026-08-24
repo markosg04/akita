@@ -473,6 +473,14 @@ impl<E: FieldCore + FromPrimitiveInt + HasOptimizedFold + HasUnreducedOps>
     /// Consume the canonical prover into accelerator-owned auxiliary state.
     pub fn new(prover: RelationRangeImageProver<E>) -> Self {
         let linear_layout = prover.linear_terms.direct_layout();
+        Self::with_linear_layout(prover, linear_layout)
+    }
+
+    /// Use a layout built before the prover received Stage-1 challenges.
+    pub fn with_linear_layout(
+        prover: RelationRangeImageProver<E>,
+        linear_layout: DirectLinearLayout<E>,
+    ) -> Self {
         Self {
             prover,
             linear_layout,
@@ -718,10 +726,21 @@ where
         + HasUnreducedOps
         + AkitaSerialize,
 {
+    type Preparation = ();
+
+    fn prepare_direct_relation_range(
+        &self,
+        _prepared: &Self::PreparedSetup,
+        _input: DirectRelationRangePreparationInput<'_, E>,
+    ) -> Result<Self::Preparation, AkitaError> {
+        Ok(())
+    }
+
     fn prove_direct_relation_range<T>(
         &self,
         prepared: &Self::PreparedSetup,
         prover: RelationRangeImageProver<E>,
+        (): Self::Preparation,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where
@@ -740,10 +759,21 @@ where
         + HasUnreducedOps
         + AkitaSerialize,
 {
+    type Preparation = ();
+
+    fn prepare_direct_relation_range(
+        &self,
+        _prepared: &Self::PreparedSetup,
+        _input: DirectRelationRangePreparationInput<'_, E>,
+    ) -> Result<Self::Preparation, AkitaError> {
+        Ok(())
+    }
+
     fn prove_direct_relation_range<T>(
         &self,
         prepared: &Self::PreparedSetup,
         prover: RelationRangeImageProver<E>,
+        (): Self::Preparation,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where
@@ -761,6 +791,7 @@ where
     pub fn prove_with_backend<F, T, B>(
         self,
         backend: &OperationCtx<'_, F, B>,
+        preparation: B::Preparation,
         transcript: &mut T,
     ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
     where
@@ -769,8 +800,11 @@ where
         T: Transcript<F>,
         B: DirectRelationRangeProofBackend<F, E>,
     {
-        backend
-            .backend()
-            .prove_direct_relation_range(backend.prepared(), self, transcript)
+        backend.backend().prove_direct_relation_range(
+            backend.prepared(),
+            self,
+            preparation,
+            transcript,
+        )
     }
 }

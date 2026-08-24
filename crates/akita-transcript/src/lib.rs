@@ -1,5 +1,7 @@
 //! Protocol transcript contracts and implementations.
 
+#[cfg(feature = "transcript-blake2b")]
+mod blake2b;
 mod label;
 pub mod labels;
 #[cfg(feature = "logging-transcript")]
@@ -19,6 +21,8 @@ compile_error!("enable exactly one transcript backend: transcript-blake2b or tra
 use akita_field::{CanonicalField, ExtField, FieldCore};
 use akita_serialization::AkitaSerialize;
 
+#[cfg(feature = "transcript-blake2b")]
+pub use blake2b::{Blake2b512Checkpoint, Blake2b512CheckpointMode, CheckpointBlake2b512};
 pub use label::Label;
 #[cfg(feature = "logging-transcript")]
 pub use logging::{clear_thread_events, thread_events, LoggingTranscript, TranscriptEvent};
@@ -27,6 +31,14 @@ pub use logging::{clear_thread_events, thread_events, LoggingTranscript, Transcr
     all(feature = "transcript-keccak", not(feature = "transcript-blake2b"))
 ))]
 pub use sponge::{AkitaTranscript, TranscriptSponge, PROTOCOL_TAG};
+
+/// Optional public Fiat-Shamir state used by accelerator execution paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptExecutionCheckpoint {
+    /// State of Akita's Blake2b-512 hash duplex.
+    #[cfg(feature = "transcript-blake2b")]
+    Blake2b512(Blake2b512Checkpoint),
+}
 
 /// Transcript interface for protocol Fiat-Shamir transforms.
 ///
@@ -45,6 +57,12 @@ where
     /// separation. The method is required so custom transcript backends cannot
     /// accidentally skip Akita instance binding.
     fn bind_instance_bytes(&mut self, instance_bytes: &[u8]);
+
+    /// Export public transcript state when the implementation supports exact
+    /// accelerator-side continuation.
+    fn execution_checkpoint(&self) -> Option<TranscriptExecutionCheckpoint> {
+        None
+    }
 
     /// Record a verifier-side structured proof-field use for logging checks.
     fn record_wire_serde<S: AkitaSerialize>(&mut self, _label: &[u8], _s: &S) {}

@@ -45,6 +45,35 @@ pub struct DecomposeFoldChunk<'a> {
     ring_dimension: usize,
     witness_digits: usize,
     centered_coefficients: &'a [i32],
+    balanced_digits: Option<BalancedDigitChunk<'a>>,
+}
+
+/// Balanced digit layout that a streaming consumer can accept directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BalancedDigitRequest {
+    /// Number of digit planes per centered coefficient row.
+    pub num_digits: usize,
+    /// Base-two logarithm of the balanced decomposition basis.
+    pub log_basis: u32,
+}
+
+/// Device-produced balanced digits attached to one completed fold chunk.
+#[derive(Clone, Copy, Debug)]
+pub struct BalancedDigitChunk<'a> {
+    request: BalancedDigitRequest,
+    digits: &'a [i8],
+}
+
+impl BalancedDigitChunk<'_> {
+    /// Decomposition shape used by the producer.
+    pub const fn request(&self) -> BalancedDigitRequest {
+        self.request
+    }
+
+    /// Canonical `[row][digit][coefficient]` bytes.
+    pub const fn digits(&self) -> &[i8] {
+        self.digits
+    }
 }
 
 impl<'a> DecomposeFoldChunk<'a> {
@@ -78,7 +107,34 @@ impl<'a> DecomposeFoldChunk<'a> {
             ring_dimension,
             witness_digits,
             centered_coefficients,
+            balanced_digits: None,
         })
+    }
+
+    /// Attach checked balanced digits in canonical row-major plane order.
+    pub fn with_balanced_digits(
+        mut self,
+        request: BalancedDigitRequest,
+        digits: &'a [i8],
+    ) -> Result<Self, AkitaError> {
+        let expected = self
+            .position_count
+            .checked_mul(self.witness_digits)
+            .and_then(|count| count.checked_mul(request.num_digits))
+            .and_then(|count| count.checked_mul(self.ring_dimension))
+            .ok_or_else(|| AkitaError::InvalidSetup("balanced digit chunk overflow".into()))?;
+        if request.num_digits == 0
+            || request.log_basis == 0
+            || request.log_basis > 8
+            || digits.len() != expected
+        {
+            return Err(AkitaError::InvalidSize {
+                expected,
+                actual: digits.len(),
+            });
+        }
+        self.balanced_digits = Some(BalancedDigitChunk { request, digits });
+        Ok(self)
     }
 
     pub fn position_start(&self) -> usize {
@@ -100,6 +156,11 @@ impl<'a> DecomposeFoldChunk<'a> {
     pub fn centered_coefficients(&self) -> &'a [i32] {
         self.centered_coefficients
     }
+
+    /// Device-produced balanced digits, when the backend supplied them.
+    pub const fn balanced_digits(&self) -> Option<BalancedDigitChunk<'a>> {
+        self.balanced_digits
+    }
 }
 
 /// Ordered consumer for decompose-fold position chunks.
@@ -108,6 +169,11 @@ pub trait DecomposeFoldChunkSink {
     /// larger aligned chunk, but chunks must remain ordered and disjoint.
     fn preferred_position_chunk_len(&self, total_positions: usize) -> usize {
         total_positions
+    }
+
+    /// Exact balanced digit layout accepted by this consumer, if any.
+    fn balanced_digit_request(&self) -> Option<BalancedDigitRequest> {
+        None
     }
 
     /// Consume one completed chunk.

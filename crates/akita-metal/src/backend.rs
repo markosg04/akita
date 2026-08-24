@@ -7,7 +7,7 @@ use akita_algebra::split_eq::GruenSplitEq;
 use akita_algebra::CyclotomicRing;
 use akita_field::{AkitaError, ExtField, MulBaseUnreduced};
 use akita_prover::compute::{
-    CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
+    BalancedDigitRequest, CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
     ComputeExecutionDomain, CyclicRowsComputeBackend, DecomposeFoldBatchPlan, DecomposeFoldChunk,
     DecomposeFoldChunkSink, DecomposeFoldPlan, DigitRowsComputeBackend, DigitRowsProducts,
     OpeningBatchKernel, OpeningFoldKernel, OpeningFoldOutput, OpeningFoldPlan, TensorPackedWitness,
@@ -15,28 +15,48 @@ use akita_prover::compute::{
 };
 use akita_prover::{
     CpuBackend, CpuPreparedSetup, DirectDigitRangeProofBackend, DirectDigitRangeProofInput,
-    DirectLinearSource, DirectRelationRangeProofBackend, DirectRelationRangeProofState,
-    NttCacheOwnerId, NttOperationCluster, PackedOneHotView, RecursiveFoldBatchView,
-    RecursiveFoldView, RelationRangeImageProver, SuffixWitnessBatchView, SuffixWitnessView,
+    DirectLinearLayout, DirectLinearSource, DirectRelationRangePreparationInput,
+    DirectRelationRangeProofBackend, DirectRelationRangeProofState, NttCacheOwnerId,
+    NttOperationCluster, PackedOneHotView, RecursiveFoldBatchView, RecursiveFoldView,
+    RelationRangeImageProver, SuffixWitnessBatchView, SuffixWitnessView,
 };
 use akita_sumcheck::{
     CompressedUniPoly, EqFactoredSumcheckProof, EqFactoredUniPoly, SumcheckProof,
 };
-use akita_transcript::{labels, sample_ext_challenge, Transcript};
+use akita_transcript::{
+    labels, sample_ext_challenge, Blake2b512CheckpointMode, Transcript,
+    TranscriptExecutionCheckpoint,
+};
 use akita_types::{AkitaExpandedSetup, AkitaStage1Proof, AkitaStage1StageProof, NttCacheKey};
 use metal::Device;
 
 use crate::field::{MetalField, F};
+use crate::packed_onehot_fp128_d512::{opening_index_plan, DeferredFoldIndex};
 use crate::prepared::MetalPreparedSetup;
 use crate::runtime::{
     DigitRowsParams, DirectRangeRoundOutcome, DirectRelationAdditionalPair,
     DirectRelationLinearSegment, DirectRelationLinearSourceInput, DirectRelationRoundData,
     DirectRelationRoundOutcome, DirectRelationScalars, MetalDeviceCapabilities, MetalOneHotKernel,
-    MetalRuntime, PackedDecomposeFoldParams, FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
+    MetalRuntime, PackedDecomposeFoldParams, PackedFp128D512FoldIndex,
+    FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
 };
-use crate::{MetalCommitError, MetalExecutionPolicy};
+use crate::{MetalCommitError, MetalExecutionPolicy, OpeningAccelerationPolicy};
 
 type DirectRelationProofOutput = (SumcheckProof<F>, Vec<F>, RelationRangeImageProver<F>);
+
+struct PreparedMetalDirectRelation {
+    session: crate::runtime::DirectRelationSession,
+    setup_timings: crate::runtime::DispatchTimings,
+    linear_layout: DirectLinearLayout<F>,
+    domain_len: usize,
+    coefficient_rounds: usize,
+}
+
+/// Opaque challenge-independent state for one direct Stage-2 proof.
+#[doc(hidden)]
+pub struct MetalDirectRelationPreparation {
+    prepared: Option<Box<PreparedMetalDirectRelation>>,
+}
 
 /// Timings and structural counters from the most recent Metal one-hot dispatch.
 #[derive(Clone, Debug, Default)]
@@ -105,6 +125,12 @@ pub struct MetalCommitMetrics {
     pub matrix_prepare_time: Duration,
     /// Hot-index packing time.
     pub index_pack_time: Duration,
+    /// Commit-time construction of a retained packed-opening index.
+    pub opening_index_time: Duration,
+    /// GPU timestamp interval for retained opening-index construction.
+    pub opening_index_gpu_time: Duration,
+    /// Bytes retained by the packed-opening index.
+    pub opening_index_bytes: usize,
     /// Per-call Metal input/output buffer setup.
     pub buffer_setup_time: Duration,
     /// Wall time from command commit through completion.
@@ -148,10 +174,54 @@ pub struct MetalOpeningMetrics {
     pub command_wall_time: Duration,
     /// Sum of GPU timestamp intervals reported by Metal.
     pub gpu_active_time: Duration,
+    /// Wall time spent building packed-opening indices after commitment.
+    pub opening_index_time: Duration,
+    /// GPU timestamp interval spent building deferred packed-opening indices.
+    pub opening_index_gpu_time: Duration,
+    /// Cumulative bytes allocated for deferred packed-opening indices.
+    pub opening_index_bytes: usize,
+    /// Wall time of packed root decompose/fold dispatches, including streamed consumers.
+    pub packed_decompose_wall_time: Duration,
+    /// GPU timestamp interval of packed root decompose/fold dispatches.
+    pub packed_decompose_gpu_time: Duration,
+    /// Host callback time while consuming completed packed root chunks.
+    pub packed_decompose_consumer_time: Duration,
+    /// Host preparation before entering the packed root runtime dispatch.
+    pub packed_decompose_prepare_time: Duration,
+    /// Host postprocessing after the packed root runtime dispatch returns.
+    pub packed_decompose_postprocess_time: Duration,
+    /// Complete packed root backend-call wall time.
+    pub packed_decompose_total_time: Duration,
+    /// Packed root calls that consumed a commit-retained residue index.
+    pub packed_decompose_indexed_calls: usize,
+    /// Device-produced balanced digit bytes consumed by the successor commit.
+    pub packed_decompose_direct_digit_bytes: usize,
+    /// Recursive-commit calls that reused a transformed setup matrix.
+    pub recursive_commit_matrix_cache_hits: usize,
+    /// Recursive-commit calls that transformed a setup matrix.
+    pub recursive_commit_matrix_cache_misses: usize,
+    /// Wall time spent transforming recursive-commit setup matrices.
+    pub recursive_commit_matrix_ntt_time: Duration,
+    /// GPU timestamp interval spent transforming recursive-commit setup matrices.
+    pub recursive_commit_matrix_ntt_gpu_time: Duration,
+    /// Bytes retained by transformed recursive-commit setup matrices.
+    pub recursive_commit_matrix_ntt_bytes: usize,
     /// Wall time for resident direct-relation linear-source construction.
     pub linear_source_command_wall_time: Duration,
     /// GPU timestamp interval for resident direct-relation linear-source construction.
     pub linear_source_gpu_time: Duration,
+    /// Wall time for direct Stage-1 range-proof commands.
+    pub direct_range_command_wall_time: Duration,
+    /// GPU timestamp interval for direct Stage-1 range-proof commands.
+    pub direct_range_gpu_time: Duration,
+    /// Host buffer-construction time for direct Stage-1 range proofs.
+    pub direct_range_buffer_setup_time: Duration,
+    /// Wall time for direct Stage-2 relation-proof commands.
+    pub direct_relation_command_wall_time: Duration,
+    /// GPU timestamp interval for direct Stage-2 relation-proof commands.
+    pub direct_relation_gpu_time: Duration,
+    /// Host buffer-construction time for direct Stage-2 relation proofs.
+    pub direct_relation_buffer_setup_time: Duration,
     /// Host time spent constructing and populating transient dispatch buffers.
     pub upload_time: Duration,
     /// Host time spent copying shared output storage.
@@ -182,6 +252,7 @@ pub struct MetalMatrixPrewarmMetrics {
 struct BackendInner {
     runtime: Option<Arc<MetalRuntime>>,
     policy: MetalExecutionPolicy,
+    opening_acceleration_policy: OpeningAccelerationPolicy,
     cpu: CpuBackend,
     initialization_time: Duration,
     last_metrics: Mutex<Option<MetalCommitMetrics>>,
@@ -203,13 +274,37 @@ impl<Field> MetalCommitBackend<Field> {
 
     /// Build a backend from the system default device.
     pub fn new(policy: MetalExecutionPolicy) -> Result<Self, MetalCommitError> {
-        Self::new_with_cpu_backend(policy, CpuBackend::DEFAULT)
+        Self::new_with_opening_acceleration_policy(policy, OpeningAccelerationPolicy::default())
+    }
+
+    /// Build a backend with a limit on preprocessing retained after commitment.
+    pub fn new_with_opening_acceleration_policy(
+        policy: MetalExecutionPolicy,
+        opening_acceleration_policy: OpeningAccelerationPolicy,
+    ) -> Result<Self, MetalCommitError> {
+        Self::new_with_cpu_backend_and_opening_acceleration_policy(
+            policy,
+            CpuBackend::DEFAULT,
+            opening_acceleration_policy,
+        )
     }
 
     /// Build a backend with an explicit CPU fallback resource policy.
     pub fn new_with_cpu_backend(
         policy: MetalExecutionPolicy,
         cpu: CpuBackend,
+    ) -> Result<Self, MetalCommitError> {
+        Self::new_with_cpu_backend_and_opening_acceleration_policy(
+            policy,
+            cpu,
+            OpeningAccelerationPolicy::default(),
+        )
+    }
+
+    fn new_with_cpu_backend_and_opening_acceleration_policy(
+        policy: MetalExecutionPolicy,
+        cpu: CpuBackend,
+        opening_acceleration_policy: OpeningAccelerationPolicy,
     ) -> Result<Self, MetalCommitError> {
         let start = Instant::now();
         let runtime = match MetalRuntime::new() {
@@ -221,6 +316,7 @@ impl<Field> MetalCommitBackend<Field> {
             inner: Arc::new(BackendInner {
                 runtime,
                 policy,
+                opening_acceleration_policy,
                 cpu,
                 initialization_time: start.elapsed(),
                 last_metrics: Mutex::new(None),
@@ -250,6 +346,7 @@ impl<Field> MetalCommitBackend<Field> {
             inner: Arc::new(BackendInner {
                 runtime: Some(runtime),
                 policy,
+                opening_acceleration_policy: OpeningAccelerationPolicy::default(),
                 cpu,
                 initialization_time: start.elapsed(),
                 last_metrics: Mutex::new(None),
@@ -267,6 +364,11 @@ impl<Field> MetalCommitBackend<Field> {
     /// Selected execution policy.
     pub fn policy(&self) -> MetalExecutionPolicy {
         self.inner.policy
+    }
+
+    /// Packed-opening preprocessing retained after commitment.
+    pub fn opening_acceleration_policy(&self) -> OpeningAccelerationPolicy {
+        self.inner.opening_acceleration_policy
     }
 
     /// CPU backend used for non-Metal operations and preferred-mode fallback.
@@ -376,6 +478,24 @@ impl<Field> MetalCommitBackend<Field> {
         }
         Ok(())
     }
+
+    pub(crate) fn record_opening_index_preparation(
+        &self,
+        elapsed: Duration,
+        timings: crate::runtime::DispatchTimings,
+        allocation_bytes: usize,
+    ) -> Result<(), MetalCommitError> {
+        self.update_opening_metrics(|metrics| {
+            metrics.command_wall_time += timings.command_wall;
+            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
+            metrics.opening_index_time += elapsed;
+            metrics.opening_index_gpu_time += timings.gpu.unwrap_or_default();
+            metrics.opening_index_bytes =
+                metrics.opening_index_bytes.saturating_add(allocation_bytes);
+            metrics.upload_time += timings.buffer_setup;
+            metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
+        })
+    }
 }
 
 impl MetalCommitBackend<F> {
@@ -421,6 +541,7 @@ impl MetalCommitBackend<F> {
         plan: DecomposeFoldPlan<'_>,
         mut sink: Option<&mut dyn DecomposeFoldChunkSink>,
     ) -> Result<akita_prover::DecomposeFoldWitness<F>, AkitaError> {
+        let total_start = Instant::now();
         if D != 512
             || source.onehot_k() != 256
             || source.column_capacity() != 32
@@ -479,18 +600,39 @@ impl MetalCommitBackend<F> {
 
         let mut positions = Vec::with_capacity(live_challenges * challenge_weight);
         let mut coefficients = Vec::with_capacity(live_challenges * challenge_weight);
-        for challenge in &plan.challenges[..live_challenges] {
+        let dense_len = live_challenges.checked_mul(64).ok_or_else(|| {
+            MetalCommitError::ShapeOverflow("packed decompose dense challenges").into_akita()
+        })?;
+        let mut dense_subring64 = vec![0i8; dense_len];
+        let mut has_subring64_embedding = true;
+        for (challenge_index, challenge) in plan.challenges[..live_challenges].iter().enumerate() {
             challenge.validate::<D>()?;
-            for &position in &challenge.positions {
+            for (&position, &coefficient) in challenge.positions.iter().zip(&challenge.coeffs) {
                 positions.push(u16::try_from(position).map_err(|_| {
                     MetalCommitError::UnsupportedShape(
                         "packed decompose challenge position does not fit u16".into(),
                     )
                     .into_akita()
                 })?);
+                coefficients.push(coefficient);
+                let dense_position = usize::try_from(position)
+                    .ok()
+                    .filter(|position| position.is_multiple_of(8))
+                    .map(|position| position / 8)
+                    .filter(|&position| position < 64);
+                if let Some(dense_position) = dense_position {
+                    let slot = challenge_index * 64 + dense_position;
+                    if dense_subring64[slot] == 0 {
+                        dense_subring64[slot] = coefficient;
+                    } else {
+                        has_subring64_embedding = false;
+                    }
+                } else {
+                    has_subring64_embedding = false;
+                }
             }
-            coefficients.extend(challenge.coeffs.iter().copied());
         }
+        let dense_subring64 = has_subring64_embedding.then_some(dense_subring64);
         let output_coefficients = plan.num_positions_per_block.checked_mul(D).ok_or_else(|| {
             MetalCommitError::ShapeOverflow("packed decompose output coefficients").into_akita()
         })?;
@@ -504,60 +646,135 @@ impl MetalCommitBackend<F> {
                     .preferred_position_chunk_len(plan.num_positions_per_block)
                     .max(1)
             });
-        let mut sink_error = None;
-        let outcome = runtime
-            .dispatch_packed_fp128_d512_decompose_fold_streaming(
-                source.lanes(),
-                &positions,
-                &coefficients,
-                PackedDecomposeFoldParams {
-                    num_rows: source.num_rows() as u64,
-                    num_columns: source.num_columns() as u64,
-                    lane_stride: source.num_columns() as u64,
-                    num_positions: plan.num_positions_per_block as u64,
-                    position_start: 0,
-                    blocks_per_column: blocks_per_column as u64,
-                    challenge_weight: challenge_weight as u64,
-                    output_coefficients: output_coefficients as u64,
-                },
-                position_chunk_len,
-                |position_start, compressed_chunk| {
-                    let Some(consumer) = sink.as_deref_mut() else {
-                        return;
-                    };
-                    let expanded =
-                        expand_packed_decompose_chunk::<D>(compressed_chunk, plan.num_digits);
-                    match expanded.and_then(|expanded| {
-                        let position_count = compressed_chunk.len() / D;
-                        consumer.consume(DecomposeFoldChunk::new(
-                            position_start,
-                            position_count,
-                            D,
-                            plan.num_digits,
-                            &expanded,
-                        )?)
-                    }) {
-                        Ok(()) => {}
-                        Err(error) => sink_error = Some(error),
-                    }
-                },
+        let balanced_digit_request = sink
+            .as_deref()
+            .and_then(DecomposeFoldChunkSink::balanced_digit_request);
+        let indexed_eligible = plan.num_digits == 1
+            && dense_subring64.as_deref().is_some_and(|dense| {
+                dense
+                    .iter()
+                    .all(|&coefficient| (-2..=2).contains(&coefficient))
+            })
+            && balanced_digit_request.is_some();
+        let retained_index = indexed_eligible
+            .then(|| source.take_opening_acceleration::<PackedFp128D512FoldIndex>())
+            .flatten();
+        let deferred_requested = indexed_eligible
+            && source
+                .take_opening_acceleration::<DeferredFoldIndex>()
+                .is_some();
+        let deferred_index = if retained_index.is_none() && deferred_requested {
+            let opening_plan = opening_index_plan(
+                source.num_rows(),
+                source.num_columns(),
+                plan.num_positions_per_block,
+                blocks_per_column,
+            )?;
+            let start = Instant::now();
+            let index = runtime
+                .prepare_packed_fp128_d512_fold_index(source.lanes(), opening_plan.fold)
+                .map_err(MetalCommitError::into_akita)?;
+            self.record_opening_index_preparation(
+                start.elapsed(),
+                index.timings,
+                index.allocation_bytes,
             )
             .map_err(MetalCommitError::into_akita)?;
+            Some(index)
+        } else {
+            None
+        };
+        let opening_index = retained_index.as_deref().or(deferred_index.as_ref());
+        let dispatch_params = PackedDecomposeFoldParams {
+            num_rows: source.num_rows() as u64,
+            num_columns: source.num_columns() as u64,
+            lane_stride: source.num_columns() as u64,
+            num_positions: plan.num_positions_per_block as u64,
+            position_start: 0,
+            blocks_per_column: blocks_per_column as u64,
+            challenge_weight: challenge_weight as u64,
+            output_coefficients: output_coefficients as u64,
+        };
+        let mut sink_error = None;
+        let mut consume_chunk =
+            |position_start: usize,
+             compressed_chunk: &[i32],
+             balanced_digits: Option<(BalancedDigitRequest, &[i8])>| {
+                let Some(consumer) = sink.as_deref_mut() else {
+                    return;
+                };
+                let expanded =
+                    expand_packed_decompose_chunk::<D>(compressed_chunk, plan.num_digits);
+                match expanded.and_then(|expanded| {
+                    let position_count = compressed_chunk.len() / D;
+                    let chunk = DecomposeFoldChunk::new(
+                        position_start,
+                        position_count,
+                        D,
+                        plan.num_digits,
+                        &expanded,
+                    )?;
+                    let chunk = if let Some((request, digits)) = balanced_digits {
+                        chunk.with_balanced_digits(request, digits)?
+                    } else {
+                        chunk
+                    };
+                    consumer.consume(chunk)
+                }) {
+                    Ok(()) => {}
+                    Err(error) => sink_error = Some(error),
+                }
+            };
+        let dispatch_start = Instant::now();
+        let mut indexed_route = false;
+        let outcome = match (
+            dense_subring64.as_deref(),
+            opening_index,
+            balanced_digit_request,
+        ) {
+            (Some(dense), Some(index), Some(request)) if indexed_eligible => {
+                indexed_route = true;
+                runtime
+                    .dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+                        source.lanes(),
+                        dense,
+                        index,
+                        dispatch_params,
+                        request.num_digits,
+                        request.log_basis,
+                        position_chunk_len,
+                        |position_start, compressed_chunk, digits| {
+                            consume_chunk(
+                                position_start,
+                                compressed_chunk,
+                                Some((request, digits)),
+                            );
+                        },
+                    )
+                    .map_err(MetalCommitError::into_akita)?
+            }
+            _ => runtime
+                .dispatch_packed_fp128_d512_decompose_fold_streaming(
+                    source.lanes(),
+                    &positions,
+                    &coefficients,
+                    dense_subring64.as_deref(),
+                    dispatch_params,
+                    position_chunk_len,
+                    |position_start, compressed_chunk| {
+                        consume_chunk(position_start, compressed_chunk, None);
+                    },
+                )
+                .map_err(MetalCommitError::into_akita)?,
+        };
+        drop(retained_index);
+        drop(deferred_index);
+        let prepare_time = dispatch_start.duration_since(total_start);
         if let Some(error) = sink_error {
             return Err(error);
         }
+        let postprocess_start = Instant::now();
         let timings = outcome.timings;
-        self.update_opening_metrics(|metrics| {
-            metrics.command_wall_time += timings.command_wall;
-            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
-            metrics.upload_time += timings.buffer_setup;
-            metrics.readback_time += timings.readback_copy;
-            metrics.allocation_bytes = metrics
-                .allocation_bytes
-                .saturating_add(outcome.allocation_bytes);
-        })
-        .map_err(MetalCommitError::into_akita)?;
-
         let compressed = into_array_vec::<_, D>(outcome.centered_coefficients)?;
         let centered = if plan.num_digits == 1 {
             compressed
@@ -576,7 +793,35 @@ impl MetalCommitBackend<F> {
             expanded
         };
         let modulus = (-F::one()).to_canonical_u128() + 1;
-        Ok(akita_prover::backend::poly_helpers::build_decompose_fold_witness(centered, modulus))
+        let witness =
+            akita_prover::backend::poly_helpers::build_decompose_fold_witness(centered, modulus);
+        let postprocess_time = postprocess_start.elapsed();
+        let total_time = total_start.elapsed();
+        self.update_opening_metrics(|metrics| {
+            metrics.command_wall_time += timings.command_wall;
+            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
+            metrics.packed_decompose_wall_time += timings.command_wall;
+            metrics.packed_decompose_gpu_time += timings.gpu.unwrap_or_default();
+            metrics.packed_decompose_consumer_time += outcome.consumer_time;
+            metrics.packed_decompose_prepare_time += prepare_time;
+            metrics.packed_decompose_postprocess_time += postprocess_time;
+            metrics.packed_decompose_total_time += total_time;
+            metrics.packed_decompose_indexed_calls += usize::from(indexed_route);
+            if indexed_route {
+                metrics.packed_decompose_direct_digit_bytes =
+                    metrics.packed_decompose_direct_digit_bytes.saturating_add(
+                        output_coefficients
+                            .saturating_mul(balanced_digit_request.map_or(0, |r| r.num_digits)),
+                    );
+            }
+            metrics.upload_time += timings.buffer_setup;
+            metrics.readback_time += timings.readback_copy;
+            metrics.allocation_bytes = metrics
+                .allocation_bytes
+                .saturating_add(outcome.allocation_bytes);
+        })
+        .map_err(MetalCommitError::into_akita)?;
+        Ok(witness)
     }
 }
 
@@ -642,6 +887,23 @@ fn direct_range_eq_tables(
     )
 }
 
+fn blake2b_squeeze_checkpoint<T>(transcript: &T) -> Option<([u8; 64], usize)>
+where
+    T: Transcript<F>,
+{
+    let TranscriptExecutionCheckpoint::Blake2b512(checkpoint) =
+        transcript.execution_checkpoint()?;
+    let Blake2b512CheckpointMode::Squeeze {
+        next_block,
+        leftovers,
+    } = checkpoint.mode
+    else {
+        return None;
+    };
+    let squeezed_bytes = next_block.checked_mul(64)?.checked_sub(leftovers.len())?;
+    Some((checkpoint.chaining_value, squeezed_bytes))
+}
+
 fn direct_range_round_poly(
     outcome: &DirectRangeRoundOutcome,
     basis: usize,
@@ -693,6 +955,7 @@ impl DirectRelationHostRound {
     }
 }
 
+#[tracing::instrument(skip_all, name = "direct_relation_host_round")]
 fn direct_relation_host_round(
     state: &DirectRelationRangeProofState<F>,
 ) -> Result<DirectRelationHostRound, AkitaError> {
@@ -848,6 +1111,7 @@ struct DirectRelationTwoRoundPrefixHost {
     norm_omitted_corner: usize,
 }
 
+#[tracing::instrument(skip_all, name = "direct_relation_two_round_prefix_host")]
 fn direct_relation_two_round_prefix_host(
     state: &DirectRelationRangeProofState<F>,
 ) -> Result<Option<DirectRelationTwoRoundPrefixHost>, AkitaError> {
@@ -890,10 +1154,11 @@ fn direct_relation_two_round_prefix_host(
 }
 
 impl MetalCommitBackend<F> {
-    fn record_direct_range_dispatch(
+    fn record_direct_dispatch(
         &self,
         timings: crate::runtime::DispatchTimings,
         allocation_bytes: usize,
+        stage2: bool,
     ) -> Result<(), AkitaError> {
         self.update_opening_metrics(|metrics| {
             metrics.command_wall_time += timings.command_wall;
@@ -901,8 +1166,33 @@ impl MetalCommitBackend<F> {
             metrics.upload_time += timings.buffer_setup;
             metrics.readback_time += timings.readback_copy;
             metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
+            if stage2 {
+                metrics.direct_relation_command_wall_time += timings.command_wall;
+                metrics.direct_relation_gpu_time += timings.gpu.unwrap_or_default();
+                metrics.direct_relation_buffer_setup_time += timings.buffer_setup;
+            } else {
+                metrics.direct_range_command_wall_time += timings.command_wall;
+                metrics.direct_range_gpu_time += timings.gpu.unwrap_or_default();
+                metrics.direct_range_buffer_setup_time += timings.buffer_setup;
+            }
         })
         .map_err(MetalCommitError::into_akita)
+    }
+
+    fn record_direct_range_dispatch(
+        &self,
+        timings: crate::runtime::DispatchTimings,
+        allocation_bytes: usize,
+    ) -> Result<(), AkitaError> {
+        self.record_direct_dispatch(timings, allocation_bytes, false)
+    }
+
+    fn record_direct_relation_dispatch(
+        &self,
+        timings: crate::runtime::DispatchTimings,
+        allocation_bytes: usize,
+    ) -> Result<(), AkitaError> {
+        self.record_direct_dispatch(timings, allocation_bytes, true)
     }
 
     fn record_direct_relation_source_dispatch(
@@ -916,6 +1206,9 @@ impl MetalCommitBackend<F> {
             metrics.readback_time += timings.readback_copy;
             metrics.linear_source_command_wall_time += timings.command_wall;
             metrics.linear_source_gpu_time += timings.gpu.unwrap_or_default();
+            metrics.direct_relation_command_wall_time += timings.command_wall;
+            metrics.direct_relation_gpu_time += timings.gpu.unwrap_or_default();
+            metrics.direct_relation_buffer_setup_time += timings.buffer_setup;
         })
         .map_err(MetalCommitError::into_akita)
     }
@@ -927,6 +1220,7 @@ impl MetalCommitBackend<F> {
     ) -> Result<(), AkitaError> {
         self.update_opening_metrics(|metrics| {
             metrics.upload_time += setup_time;
+            metrics.direct_range_buffer_setup_time += setup_time;
             metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
         })
         .map_err(MetalCommitError::into_akita)
@@ -966,6 +1260,7 @@ impl MetalCommitBackend<F> {
             &self.cpu_backend(),
             &prepared.cpu,
             prover,
+            (),
             transcript,
         )
     }
@@ -1121,44 +1416,36 @@ impl DirectDigitRangeProofBackend<F, F> for MetalCommitBackend<F> {
 }
 
 impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
-    fn prove_direct_relation_range<T>(
+    type Preparation = MetalDirectRelationPreparation;
+
+    fn prepare_direct_relation_range(
         &self,
         prepared: &Self::PreparedSetup,
-        prover: RelationRangeImageProver<F>,
-        transcript: &mut T,
-    ) -> Result<(SumcheckProof<F>, Vec<F>, RelationRangeImageProver<F>), AkitaError>
-    where
-        T: Transcript<F>,
-    {
+        mut input: DirectRelationRangePreparationInput<'_, F>,
+    ) -> Result<Self::Preparation, AkitaError> {
         const COMPACT_PREFIX_ROUNDS: usize = 3;
-        let mut state = DirectRelationRangeProofState::new(prover);
-        let num_rounds = state.num_rounds();
-        let domain_len = state
-            .current_coefficient_count()
-            .checked_mul(state.current_lane_capacity())
-            .ok_or_else(|| {
-                AkitaError::InvalidSetup("direct relation domain length overflow".into())
-            })?;
-        if state.coefficient_bits() < COMPACT_PREFIX_ROUNDS
-            || domain_len < 16
-            || !domain_len.is_power_of_two()
+        if input.coefficient_rounds() < COMPACT_PREFIX_ROUNDS
+            || input.domain_len() < 16
+            || !input.domain_len().is_power_of_two()
         {
             if self.policy() == MetalExecutionPolicy::PreferMetal {
-                return self.direct_relation_cpu_fallback(
-                    prepared,
-                    state.into_prover(),
-                    transcript,
-                );
+                return Ok(MetalDirectRelationPreparation { prepared: None });
             }
             return Err(MetalCommitError::UnsupportedShape(
                 "direct relation Metal proof requires at least three coefficient rounds".into(),
             )
             .into_akita());
         }
-        let two_round_prefix = direct_relation_two_round_prefix_host(&state)?;
-
-        let layout = state.linear_layout();
-        let linear_segments = layout
+        let runtime = match self.runtime() {
+            Some(runtime) => runtime,
+            None if self.policy() == MetalExecutionPolicy::PreferMetal => {
+                return Ok(MetalDirectRelationPreparation { prepared: None });
+            }
+            None => return Err(MetalCommitError::DeviceUnavailable.into_akita()),
+        };
+        let host_prepare_span = tracing::info_span!("direct_relation_host_prepare").entered();
+        let linear_layout = input.linear_layout();
+        let linear_segments = linear_layout
             .segments
             .iter()
             .map(|segment| {
@@ -1201,7 +1488,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 })
             })
             .collect::<Result<Vec<_>, AkitaError>>()?;
-        let lane_offsets = layout
+        let lane_offsets = linear_layout
             .lane_offsets
             .iter()
             .copied()
@@ -1213,7 +1500,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let lane_segments = layout
+        let lane_segments = linear_layout
             .lane_segments
             .iter()
             .copied()
@@ -1225,24 +1512,16 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let runtime = match self.runtime() {
-            Some(runtime) => runtime,
-            None if self.policy() == MetalExecutionPolicy::PreferMetal => {
-                return self.direct_relation_cpu_fallback(prepared, state.into_prover(), transcript)
-            }
-            None => return Err(MetalCommitError::DeviceUnavailable.into_akita()),
-        };
-        let compact_witness = state.compact_witness();
-        let lane_weights = state
+        let lane_weights = input
             .relation_lane_weights()
             .iter()
             .copied()
             .map(crate::field::Fp128Limbs::from_field)
             .collect::<Vec<_>>();
         let linear_round = if self.policy() == MetalExecutionPolicy::RequireMetal {
-            state.take_linear_round()
+            input.take_linear_round()
         } else {
-            state.linear_round()
+            input.linear_round()
         };
         let linear_dense_values = linear_round
             .dense_values
@@ -1314,24 +1593,82 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                 },
             )
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut session, setup_timings) = match runtime.begin_fp128_direct_relation(
-            compact_witness.as_ref(),
-            domain_len,
+        drop(host_prepare_span);
+        let session_setup_span = tracing::info_span!("direct_relation_session_setup").entered();
+        let session = runtime.begin_fp128_direct_relation(
+            input.compact_witness(),
+            input.domain_len(),
             COMPACT_PREFIX_ROUNDS,
-            state.coefficient_bits(),
+            input.coefficient_rounds(),
             &lane_weights,
             &linear_segments,
             &lane_offsets,
             &lane_segments,
             &linear_sources,
             &linear_dense_values,
-        ) {
+        );
+        drop(session_setup_span);
+        let (session, setup_timings) = match session {
             Ok(session) => session,
             Err(_error) if self.policy() == MetalExecutionPolicy::PreferMetal => {
-                return self.direct_relation_cpu_fallback(prepared, state.into_prover(), transcript)
+                return Ok(MetalDirectRelationPreparation { prepared: None });
             }
             Err(error) => return Err(error.into_akita()),
         };
+        Ok(MetalDirectRelationPreparation {
+            prepared: Some(Box::new(PreparedMetalDirectRelation {
+                session,
+                setup_timings,
+                linear_layout,
+                domain_len: input.domain_len(),
+                coefficient_rounds: input.coefficient_rounds(),
+            })),
+        })
+    }
+
+    fn prove_direct_relation_range<T>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        prover: RelationRangeImageProver<F>,
+        preparation: Self::Preparation,
+        transcript: &mut T,
+    ) -> Result<(SumcheckProof<F>, Vec<F>, RelationRangeImageProver<F>), AkitaError>
+    where
+        T: Transcript<F>,
+    {
+        const COMPACT_PREFIX_ROUNDS: usize = 3;
+        let Some(preparation) = preparation.prepared else {
+            return self.direct_relation_cpu_fallback(prepared, prover, transcript);
+        };
+        let PreparedMetalDirectRelation {
+            mut session,
+            setup_timings,
+            linear_layout,
+            domain_len: prepared_domain_len,
+            coefficient_rounds,
+        } = *preparation;
+        let runtime = self
+            .runtime()
+            .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
+        let mut state = {
+            let _span = tracing::info_span!("direct_relation_state_prepare").entered();
+            DirectRelationRangeProofState::with_linear_layout(prover, linear_layout)
+        };
+        let num_rounds = state.num_rounds();
+        let domain_len = state
+            .current_coefficient_count()
+            .checked_mul(state.current_lane_capacity())
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup("direct relation domain length overflow".into())
+            })?;
+        if domain_len != prepared_domain_len || state.coefficient_bits() != coefficient_rounds {
+            return Err(AkitaError::InvalidSetup(
+                "prepared direct relation geometry changed before Stage 2".into(),
+            ));
+        }
+        let host_prepare_span = tracing::info_span!("direct_relation_host_prepare").entered();
+        let two_round_prefix = direct_relation_two_round_prefix_host(&state)?;
+        drop(host_prepare_span);
         let initial_round = direct_relation_host_round(&state)?;
         let (mut next_poly, prefix_reconstruction, initial_timings, initial_allocation_bytes) =
             if let Some(prefix) = &two_round_prefix {
@@ -1393,7 +1730,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             runtime.direct_relation_session_allocation_bytes(&session),
         )?;
         self.record_direct_relation_source_dispatch(setup_timings)?;
-        self.record_direct_range_dispatch(initial_timings, initial_allocation_bytes)?;
+        self.record_direct_relation_dispatch(initial_timings, initial_allocation_bytes)?;
 
         let mut claim = state.input_claim();
         let mut round_polys = Vec::with_capacity(num_rounds);
@@ -1408,7 +1745,10 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
             claim = next_poly.eval_from_hint(&claim, &challenge);
             challenges.push(challenge);
             round_polys.push(next_poly.clone());
-            state.bind_without_linear_terms(challenge);
+            {
+                let _span = tracing::info_span!("direct_relation_host_bind").entered();
+                state.bind_without_linear_terms(challenge);
+            }
             if round == 0 {
                 if let Some(prefix_reconstruction) = &prefix_reconstruction {
                     let prefix_weights = EqPolynomial::evals(&challenges)?
@@ -1425,7 +1765,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                             next_round.as_runtime(),
                         )
                         .map_err(MetalCommitError::into_akita)?;
-                    self.record_direct_range_dispatch(
+                    self.record_direct_relation_dispatch(
                         additional.timings,
                         additional.allocation_bytes,
                     )?;
@@ -1450,7 +1790,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                         next_round.as_runtime(),
                     )
                     .map_err(MetalCommitError::into_akita)?;
-                self.record_direct_range_dispatch(outcome.timings, outcome.allocation_bytes)?;
+                self.record_direct_relation_dispatch(outcome.timings, outcome.allocation_bytes)?;
                 next_poly = direct_relation_round_poly(&outcome)?;
                 continue;
             }
@@ -1475,7 +1815,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalCommitBackend<F> {
                     next_round.as_ref().map(DirectRelationHostRound::as_runtime),
                 )
                 .map_err(MetalCommitError::into_akita)?;
-            self.record_direct_range_dispatch(advance.timings, advance.allocation_bytes)?;
+            self.record_direct_relation_dispatch(advance.timings, advance.allocation_bytes)?;
             if let (Some(coefficients), Some(additional_coefficients)) = (
                 advance.next_coefficients,
                 advance.next_additional_coefficients,
@@ -2057,6 +2397,57 @@ mod tests {
     use akita_types::{DigitRangePlan, SetupMatrixCapacity};
 
     use super::*;
+    use crate::field::Fp128Limbs;
+
+    #[test]
+    fn fp128_blake2b_sumcheck_challenge_matches_transcript() {
+        let mut transcript = AkitaTranscript::<F>::new(b"metal/blake2b-checkpoint");
+        transcript.append_bytes(b"prefix", b"prior-message");
+        let _ = transcript.challenge_scalar(b"prior-challenge");
+        let TranscriptExecutionCheckpoint::Blake2b512(checkpoint) =
+            transcript.execution_checkpoint().unwrap();
+        let prior_squeezed_bytes = match &checkpoint.mode {
+            Blake2b512CheckpointMode::Squeeze {
+                next_block,
+                leftovers,
+            } => next_block * 64 - leftovers.len(),
+            _ => panic!("checkpoint should follow a scalar challenge"),
+        };
+
+        let claim = F::from_u64(0x1234_5678);
+        let poly = EqFactoredUniPoly {
+            coeffs_except_linear_term: vec![
+                F::from_u64(3),
+                F::from_u64(5),
+                F::from_u64(7),
+                F::from_u64(11),
+            ],
+        };
+        transcript.append_serde(labels::ABSORB_SUMCHECK_CLAIM, &claim);
+        transcript.append_serde(labels::ABSORB_SUMCHECK_ROUND, &poly);
+        let expected_challenge = transcript.challenge_scalar(labels::CHALLENGE_SUMCHECK_ROUND);
+        let TranscriptExecutionCheckpoint::Blake2b512(expected_checkpoint) =
+            transcript.execution_checkpoint().unwrap();
+
+        let runtime = MetalRuntime::new().unwrap();
+        let coefficients = poly
+            .coeffs_except_linear_term
+            .iter()
+            .copied()
+            .map(Fp128Limbs::from_field)
+            .collect::<Vec<_>>();
+        let actual = runtime
+            .dispatch_fp128_blake2b_sumcheck_challenge(
+                &checkpoint.chaining_value,
+                prior_squeezed_bytes,
+                Some(Fp128Limbs::from_field(claim)),
+                &coefficients,
+            )
+            .unwrap();
+
+        assert_eq!(actual.challenge.into_field(0).unwrap(), expected_challenge);
+        assert_eq!(actual.chaining_value, expected_checkpoint.chaining_value);
+    }
 
     #[test]
     fn fp128_direct_range_proof_matches_cpu() {
@@ -2158,16 +2549,34 @@ mod tests {
         let cpu = CpuBackend::DEFAULT;
         let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
         let mut cpu_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-parity");
+        let mut cpu_prover = prover();
+        cpu.prepare_direct_relation_range(
+            &cpu_prepared,
+            DirectRelationRangePreparationInput::from_prover(&mut cpu_prover).unwrap(),
+        )
+        .unwrap();
         let (expected_proof, expected_point, expected_prover) = cpu
-            .prove_direct_relation_range(&cpu_prepared, prover(), &mut cpu_transcript)
+            .prove_direct_relation_range(&cpu_prepared, cpu_prover, (), &mut cpu_transcript)
             .unwrap();
 
         let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         metal.begin_opening_metrics().unwrap();
         let mut metal_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-parity");
+        let mut metal_prover = prover();
+        let metal_preparation = metal
+            .prepare_direct_relation_range(
+                &metal_prepared,
+                DirectRelationRangePreparationInput::from_prover(&mut metal_prover).unwrap(),
+            )
+            .unwrap();
         let (actual_proof, actual_point, actual_prover) = metal
-            .prove_direct_relation_range(&metal_prepared, prover(), &mut metal_transcript)
+            .prove_direct_relation_range(
+                &metal_prepared,
+                metal_prover,
+                metal_preparation,
+                &mut metal_transcript,
+            )
             .unwrap();
 
         assert_eq!(actual_proof, expected_proof);
@@ -2225,15 +2634,33 @@ mod tests {
         let cpu = CpuBackend::DEFAULT;
         let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
         let mut cpu_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-nonzero");
+        let mut cpu_prover = prover();
+        cpu.prepare_direct_relation_range(
+            &cpu_prepared,
+            DirectRelationRangePreparationInput::from_prover(&mut cpu_prover).unwrap(),
+        )
+        .unwrap();
         let (expected_proof, expected_point, expected_prover) = cpu
-            .prove_direct_relation_range(&cpu_prepared, prover(), &mut cpu_transcript)
+            .prove_direct_relation_range(&cpu_prepared, cpu_prover, (), &mut cpu_transcript)
             .unwrap();
 
         let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         let mut metal_transcript = AkitaTranscript::<F>::new(b"metal/direct-relation-nonzero");
+        let mut metal_prover = prover();
+        let metal_preparation = metal
+            .prepare_direct_relation_range(
+                &metal_prepared,
+                DirectRelationRangePreparationInput::from_prover(&mut metal_prover).unwrap(),
+            )
+            .unwrap();
         let (actual_proof, actual_point, actual_prover) = metal
-            .prove_direct_relation_range(&metal_prepared, prover(), &mut metal_transcript)
+            .prove_direct_relation_range(
+                &metal_prepared,
+                metal_prover,
+                metal_preparation,
+                &mut metal_transcript,
+            )
             .unwrap();
 
         assert_eq!(actual_proof, expected_proof);

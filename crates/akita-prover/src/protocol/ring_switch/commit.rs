@@ -41,15 +41,14 @@ impl<F: FieldCore> RecursiveCommitPrefix<F> {
 pub(crate) fn merge_recursive_commit_prefixes<F: FieldCore>(
     prefixes: Vec<RecursiveCommitPrefix<F>>,
 ) -> Result<RecursiveCommitPrefix<F>, AkitaError> {
-    let mut prefixes = prefixes.into_iter();
-    let first = prefixes.next().ok_or_else(|| {
+    let first = prefixes.first().ok_or_else(|| {
         AkitaError::InvalidInput("recursive commitment prefix list is empty".into())
     })?;
     let ring_dim = first.inner.ring_dim();
     let known_balanced_log_basis = first.known_balanced_log_basis;
-    let mut coeff_len = first.coeff_len;
-    let mut inner_coefficients = first.inner.into_inner_rows().into_coeffs();
-    for prefix in prefixes {
+    let mut coeff_len = 0usize;
+    let mut inner_coeff_len = 0usize;
+    for prefix in &prefixes {
         if prefix.known_balanced_log_basis != known_balanced_log_basis
             || prefix.inner.ring_dim() != ring_dim
         {
@@ -60,6 +59,14 @@ pub(crate) fn merge_recursive_commit_prefixes<F: FieldCore>(
         coeff_len = coeff_len.checked_add(prefix.coeff_len).ok_or_else(|| {
             AkitaError::InvalidSetup("recursive commitment prefix length overflow".into())
         })?;
+        inner_coeff_len = inner_coeff_len
+            .checked_add(prefix.inner.inner_rows.coeff_len())
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup("recursive commitment prefix inner length overflow".into())
+            })?;
+    }
+    let mut inner_coefficients = Vec::with_capacity(inner_coeff_len);
+    for prefix in prefixes {
         inner_coefficients.extend(prefix.inner.into_inner_rows().into_coeffs());
     }
     Ok(RecursiveCommitPrefix {

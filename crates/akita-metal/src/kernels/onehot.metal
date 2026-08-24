@@ -12,6 +12,7 @@ using namespace metal;
 #define SIMD_RECURSIVE_COMMIT_THREADS 512u
 #define RECURSIVE_COMMIT_BLOCKS_PER_GROUP 16u
 #define RECURSIVE_COMMIT_MAX_D 128u
+#define D512_PACKING_TILES_PER_CHUNK 32u
 #define RECURSIVE_COMMIT_MAX_ROWS 8u
 
 struct AkitaFp128 {
@@ -141,6 +142,33 @@ struct PackedDecomposeFoldParams {
     ulong output_coefficients;
 };
 
+struct PackedFoldIndexParams {
+    ulong num_rows;
+    ulong num_columns;
+    ulong lane_stride;
+    ulong num_positions;
+    ulong position_start;
+    ulong blocks_per_column;
+    ulong tasks_per_position;
+    ulong tiles_per_position;
+    ulong record_slots;
+    ulong count_entries;
+    ulong output_coefficients;
+    ulong fold_digits;
+    ulong fold_log_basis;
+};
+
+struct PackedCoefficientPackingIndexParams {
+    ulong num_rows;
+    ulong num_columns;
+    ulong lane_stride;
+    ulong num_positions;
+    ulong blocks_per_column;
+    ulong position_tiles;
+    ulong record_slots;
+    ulong offset_entries;
+};
+
 struct D512LinearRelationParams {
     ulong num_columns;
     ulong columns_per_tile;
@@ -183,6 +211,14 @@ struct DirectRangeParams {
     ulong basis;
     ulong prefix_size;
     ulong materialize_prefix;
+    ulong resident_challenges;
+};
+
+struct Blake2bSumcheckChallengeParams {
+    ulong include_claim;
+    ulong coefficient_count;
+    ulong prior_squeezed_bytes;
+    ulong reserved;
 };
 
 struct DirectRelationParams {
@@ -202,6 +238,12 @@ struct DirectRelationParams {
     ulong additional_pair_count;
     ulong additional_workgroups;
     ulong fold_lane_weights;
+    ulong resident_challenges;
+};
+
+struct DirectRelationTranscriptParams {
+    ulong prior_squeezed_bytes;
+    ulong has_additional;
 };
 
 struct DirectRelationTwoRoundPrefixParams {
@@ -259,6 +301,12 @@ struct DirectRelationAdditionalPair {
     ulong reserved;
     AkitaFp128 linear[2];
     AkitaFp128 binary[2];
+};
+
+struct DirectRelationAdditionalFoldMapping {
+    ulong parent;
+    uint left;
+    uint right;
 };
 
 inline AkitaFp128 akita_zero() {
@@ -886,6 +934,14 @@ inline AkitaFp128 akita_simd_shuffle_fp128(AkitaFp128 value, uint source_lane) {
     return result;
 }
 
+inline int4 akita_simd_shuffle_int4(int4 value, uint source_lane) {
+    return int4(
+        simd_shuffle(value.x, source_lane),
+        simd_shuffle(value.y, source_lane),
+        simd_shuffle(value.z, source_lane),
+        simd_shuffle(value.w, source_lane));
+}
+
 inline AkitaFp128 akita_simd_sum_fp128(AkitaFp128 value) {
     for (uint offset = 16u; offset != 0u; offset >>= 1u) {
         AkitaFp128 partner;
@@ -1063,6 +1119,572 @@ kernel void akita_fp128_d512_decompose_fold(
         &accumulators[thread_index + 256u], memory_order_relaxed);
 }
 
+kernel void akita_fp128_d512_subring64_decompose_fold(
+    device const uchar *lanes [[buffer(0)]],
+    device const char *dense_challenges [[buffer(1)]],
+    device int *output [[buffer(2)]],
+    constant PackedDecomposeFoldParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup uint partitioned_tasks[8 * 8 * 32];
+    threadgroup uint partition_counts[8 * 8];
+
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    uint local_position = threadgroup_index.x;
+    ulong position = params.position_start + (ulong)local_position;
+    ulong tasks_per_position =
+        params.blocks_per_column * params.num_columns * 2ul;
+    int accumulator_low = 0;
+    int accumulator_high = 0;
+
+    for (ulong task_base = 0ul;
+         task_base < tasks_per_position;
+         task_base += 256ul) {
+        ulong task = task_base + (ulong)thread_index;
+        bool valid = task < tasks_per_position;
+        uint hot = 0u;
+        uint source_high = 0u;
+        uint challenge = 0u;
+        if (valid) {
+            ulong trace_block = task / (params.num_columns * 2ul);
+            ulong block_local = task % (params.num_columns * 2ul);
+            ulong column = block_local >> 1ul;
+            ulong row_in_ring = block_local & 1ul;
+            ulong ring = trace_block * params.num_positions + position;
+            ulong row = ring * 2ul + row_in_ring;
+            hot = (uint)lanes[row * params.lane_stride + column];
+            valid = hot != 0u;
+            source_high = (uint)(row_in_ring * 32ul) + (hot >> 3u);
+            challenge = (uint)(column * params.blocks_per_column + trace_block);
+        }
+
+        for (uint low = 0u; low < 8u; ++low) {
+            bool selected = valid && ((hot & 7u) == low);
+            uint selected_mask = uint(
+                simd_ballot(selected).operator unsigned long());
+            uint partition = simdgroup * 8u + low;
+            if (simd_lane == 0u) {
+                partition_counts[partition] = popcount(selected_mask);
+            }
+            if (selected) {
+                uint preceding_mask = simd_lane == 0u
+                    ? 0u
+                    : ((1u << simd_lane) - 1u);
+                uint rank = popcount(selected_mask & preceding_mask);
+                partitioned_tasks[partition * 32u + rank] =
+                    (challenge << 6u) | source_high;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint destination_low = simdgroup;
+        uint destination_high_0 = simd_lane;
+        uint destination_high_1 = simd_lane + 32u;
+        for (uint producer = 0u; producer < 8u; ++producer) {
+            uint partition = producer * 8u + destination_low;
+            uint count = partition_counts[partition];
+            for (uint index = 0u; index < count; ++index) {
+                uint packed = partitioned_tasks[partition * 32u + index];
+                uint source = packed & 63u;
+                uint challenge_index = packed >> 6u;
+                uint challenge_position_0 =
+                    (destination_high_0 + 64u - source) & 63u;
+                uint challenge_position_1 =
+                    (destination_high_1 + 64u - source) & 63u;
+                int value_0 = (int)dense_challenges[
+                    (ulong)challenge_index * 64ul + (ulong)challenge_position_0];
+                int value_1 = (int)dense_challenges[
+                    (ulong)challenge_index * 64ul + (ulong)challenge_position_1];
+                accumulator_low += destination_high_0 < source ? -value_0 : value_0;
+                accumulator_high += destination_high_1 < source ? -value_1 : value_1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    ulong output_base = (ulong)local_position * 512ul;
+    output[output_base + (ulong)simdgroup
+        + 8ul * (ulong)simd_lane] = accumulator_low;
+    output[output_base + (ulong)simdgroup
+        + 8ul * (ulong)(simd_lane + 32u)] = accumulator_high;
+}
+
+kernel void akita_fp128_d512_build_fold_index(
+    device const uchar *lanes [[buffer(0)]],
+    device uint *records [[buffer(1)]],
+    device ushort *counts [[buffer(2)]],
+    constant PackedFoldIndexParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup ushort partition_counts[8 * 8];
+
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    ulong position = (ulong)threadgroup_index.x;
+    for (ulong tile = 0ul; tile < params.tiles_per_position; ++tile) {
+        ulong task = tile * 256ul + (ulong)thread_index;
+        bool valid = task < params.tasks_per_position;
+        uint hot = 0u;
+        uint source_high = 0u;
+        uint challenge = 0u;
+        if (valid) {
+            ulong trace_block = task / (params.num_columns * 2ul);
+            ulong block_local = task % (params.num_columns * 2ul);
+            ulong column = block_local >> 1ul;
+            ulong row_in_ring = block_local & 1ul;
+            ulong ring = trace_block * params.num_positions + position;
+            ulong row = ring * 2ul + row_in_ring;
+            hot = (uint)lanes[row * params.lane_stride + column];
+            valid = hot != 0u;
+            source_high = (uint)(row_in_ring * 32ul) + (hot >> 3u);
+            challenge = (uint)(column * params.blocks_per_column + trace_block);
+        }
+
+        uint selected_low = hot & 7u;
+        uint selected_rank = 0u;
+        for (uint low = 0u; low < 8u; ++low) {
+            bool selected = valid && selected_low == low;
+            uint selected_mask = uint(
+                simd_ballot(selected).operator unsigned long());
+            uint partition = simdgroup * 8u + low;
+            if (simd_lane == 0u) {
+                partition_counts[partition] = (ushort)popcount(selected_mask);
+            }
+            if (selected) {
+                uint preceding_mask = simd_lane == 0u
+                    ? 0u
+                    : ((1u << simd_lane) - 1u);
+                selected_rank = popcount(selected_mask & preceding_mask);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        ulong tile_index = position * params.tiles_per_position + tile;
+        if (valid) {
+            uint output_index = 0u;
+            for (uint low = 0u; low < selected_low; ++low) {
+                for (uint producer = 0u; producer < 8u; ++producer) {
+                    output_index += (uint)partition_counts[producer * 8u + low];
+                }
+            }
+            for (uint producer = 0u; producer < simdgroup; ++producer) {
+                output_index +=
+                    (uint)partition_counts[producer * 8u + selected_low];
+            }
+            output_index += selected_rank;
+            records[tile_index * 256ul + (ulong)output_index] =
+                (challenge << 6u) | source_high;
+        }
+        if (thread_index < 8u) {
+            uint count = 0u;
+            for (uint producer = 0u; producer < 8u; ++producer) {
+                count += (uint)partition_counts[producer * 8u + thread_index];
+            }
+            counts[tile_index * 8ul + (ulong)thread_index] = (ushort)count;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void akita_fp128_d512_build_coefficient_packing_index(
+    device const uchar *lanes [[buffer(0)]],
+    device ushort *records [[buffer(1)]],
+    device ushort *offsets [[buffer(2)]],
+    constant PackedCoefficientPackingIndexParams &params [[buffer(3)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup atomic_uint bucket_cursors[64 * 32];
+
+    ulong group = (ulong)threadgroup_index.x;
+    ulong trace_block = group / params.position_tiles;
+    ulong tile = group - trace_block * params.position_tiles;
+    uint stream_count = (uint)(params.num_columns * 2ul);
+    uint cursor_count = stream_count * 32u;
+    for (uint cursor = thread_index; cursor < cursor_count; cursor += 256u) {
+        atomic_store_explicit(&bucket_cursors[cursor], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong position = tile * 256ul + (ulong)thread_index;
+    bool valid_position = trace_block < params.blocks_per_column
+        && position < params.num_positions;
+    ulong ring = trace_block * params.num_positions + position;
+    ulong row_0 = ring * 2ul;
+    ulong row_1 = row_0 + 1ul;
+    for (uint column = 0u; column < (uint)params.num_columns; ++column) {
+        uint stream = column * 2u;
+        if (valid_position && row_0 < params.num_rows) {
+            uint hot = (uint)lanes[row_0 * params.lane_stride + (ulong)column];
+            if (hot != 0u) {
+                atomic_fetch_add_explicit(
+                    &bucket_cursors[stream * 32u + (hot >> 3u)],
+                    1u,
+                    memory_order_relaxed);
+            }
+        }
+        if (valid_position && row_1 < params.num_rows) {
+            uint hot = (uint)lanes[row_1 * params.lane_stride + (ulong)column];
+            if (hot != 0u) {
+                atomic_fetch_add_explicit(
+                    &bucket_cursors[(stream + 1u) * 32u + (hot >> 3u)],
+                    1u,
+                    memory_order_relaxed);
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (thread_index < stream_count) {
+        uint stream = thread_index;
+        ulong global_stream =
+            (trace_block * params.num_columns * 2ul) + (ulong)stream;
+        ulong layout = global_stream * params.position_tiles + tile;
+        uint running = 0u;
+        for (uint bucket = 0u; bucket < 32u; ++bucket) {
+            uint cursor = stream * 32u + bucket;
+            uint count = atomic_load_explicit(
+                &bucket_cursors[cursor], memory_order_relaxed);
+            offsets[layout * 33ul + (ulong)bucket] = (ushort)running;
+            atomic_store_explicit(
+                &bucket_cursors[cursor], running, memory_order_relaxed);
+            running += count;
+        }
+        offsets[layout * 33ul + 32ul] = (ushort)running;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint column = 0u; column < (uint)params.num_columns; ++column) {
+        uint stream = column * 2u;
+        if (valid_position && row_0 < params.num_rows) {
+            uint hot = (uint)lanes[row_0 * params.lane_stride + (ulong)column];
+            if (hot != 0u) {
+                uint bucket = hot >> 3u;
+                uint destination = atomic_fetch_add_explicit(
+                    &bucket_cursors[stream * 32u + bucket],
+                    1u,
+                    memory_order_relaxed);
+                ulong global_stream =
+                    trace_block * params.num_columns * 2ul + (ulong)stream;
+                ulong layout = global_stream * params.position_tiles + tile;
+                records[layout * 256ul + (ulong)destination] =
+                    (ushort)(((hot & 7u) << 8u) | thread_index);
+            }
+        }
+        if (valid_position && row_1 < params.num_rows) {
+            uint hot = (uint)lanes[row_1 * params.lane_stride + (ulong)column];
+            if (hot != 0u) {
+                uint bucket = hot >> 3u;
+                uint odd_stream = stream + 1u;
+                uint destination = atomic_fetch_add_explicit(
+                    &bucket_cursors[odd_stream * 32u + bucket],
+                    1u,
+                    memory_order_relaxed);
+                ulong global_stream =
+                    trace_block * params.num_columns * 2ul + (ulong)odd_stream;
+                ulong layout = global_stream * params.position_tiles + tile;
+                records[layout * 256ul + (ulong)destination] =
+                    (ushort)(((hot & 7u) << 8u) | thread_index);
+            }
+        }
+    }
+}
+
+inline AkitaFp128 akita_reduce_unsigned_limb_sums(ulong4 sums) {
+    AkitaFp128 base;
+    ulong word = sums[0];
+    base.limb[0] = (uint)word;
+    ulong carry = word >> 32u;
+    word = sums[1] + carry;
+    base.limb[1] = (uint)word;
+    carry = word >> 32u;
+    word = sums[2] + carry;
+    base.limb[2] = (uint)word;
+    carry = word >> 32u;
+    word = sums[3] + carry;
+    base.limb[3] = (uint)word;
+    ulong high = word >> 32u;
+
+    AkitaCorrection canonical = akita_add_offset(base);
+    base = akita_select(canonical.carry != 0u, canonical.value, base);
+    if (high == 0ul) {
+        return base;
+    }
+    ulong correction_word = high * (ulong)AKITA_OFFSET;
+    AkitaFp128 correction = akita_zero();
+    correction.limb[0] = (uint)correction_word;
+    correction.limb[1] = (uint)(correction_word >> 32u);
+    return akita_add(base, correction);
+}
+
+kernel void akita_fp128_d512_indexed_coefficient_packing_partials(
+    device const ushort *records [[buffer(0)]],
+    device const ushort *offsets [[buffer(1)]],
+    device const AkitaFp128 *combined_weights [[buffer(2)]],
+    device AkitaFp128 *partials [[buffer(3)]],
+    constant PackedCoefficientPackingIndexParams &index_params [[buffer(4)]],
+    constant PackedOneHotCoefficientPackingParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup ulong4 reduction[256];
+    ulong live_streams = params.blocks_per_column * params.num_columns * 2ul;
+    ulong group = (ulong)threadgroup_index.x;
+    ulong tile_chunk = group / live_streams;
+    ulong stream = group - tile_chunk * live_streams;
+    ulong streams_per_block = params.num_columns * 2ul;
+    ulong trace_block = stream / streams_per_block;
+    ulong stream_local = stream - trace_block * streams_per_block;
+    ulong column = stream_local >> 1ul;
+    ulong parity = stream_local & 1ul;
+    uint simd_lane = thread_index & 31u;
+    uint bucket_lane = simd_lane & 7u;
+    uint bucket_owner = simd_lane - bucket_lane;
+    uint bucket = thread_index >> 3u;
+    ulong tile_chunks =
+        (index_params.position_tiles + (ulong)D512_PACKING_TILES_PER_CHUNK - 1ul)
+            / (ulong)D512_PACKING_TILES_PER_CHUNK;
+    ulong4 sums = ulong4(0ul);
+    ulong tile_start = tile_chunk * (ulong)D512_PACKING_TILES_PER_CHUNK;
+    ulong tile_end = min(
+        tile_start + (ulong)D512_PACKING_TILES_PER_CHUNK,
+        index_params.position_tiles);
+    for (ulong tile = tile_start; tile < tile_end; ++tile) {
+        ulong layout = stream * index_params.position_tiles + tile;
+        uint start = 0u;
+        uint end = 0u;
+        if (bucket_lane == 0u) {
+            start = (uint)offsets[layout * 33ul + (ulong)bucket];
+            end = (uint)offsets[layout * 33ul + (ulong)bucket + 1ul];
+        }
+        start = simd_shuffle(start, bucket_owner);
+        end = simd_shuffle(end, bucket_owner);
+        ulong record_base = layout * 256ul;
+        for (uint record_index = start + bucket_lane;
+             record_index < end;
+             record_index += 8u) {
+            uint record = (uint)records[record_base + (ulong)record_index];
+            ulong position = tile * 256ul + (ulong)(record & 255u);
+            ulong low = (ulong)(record >> 8u);
+            AkitaFp128 weight = combined_weights[position * 8ul + low];
+            sums += ulong4(
+                (ulong)weight.limb[0],
+                (ulong)weight.limb[1],
+                (ulong)weight.limb[2],
+                (ulong)weight.limb[3]);
+        }
+    }
+    reduction[thread_index] = sums;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bucket_lane < 4u) {
+        reduction[thread_index] += reduction[thread_index + 4u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bucket_lane < 2u) {
+        reduction[thread_index] += reduction[thread_index + 2u];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (bucket_lane == 0u) {
+        ulong4 total = reduction[thread_index] + reduction[thread_index + 1u];
+        ulong partial_index = (stream * 32ul + (ulong)bucket) * tile_chunks + tile_chunk;
+        partials[partial_index] = akita_reduce_unsigned_limb_sums(total);
+    }
+}
+
+kernel void akita_fp128_d512_indexed_coefficient_packing_reduce(
+    device const AkitaFp128 *partials [[buffer(0)]],
+    device AkitaFp128 *output [[buffer(1)]],
+    constant PackedCoefficientPackingIndexParams &index_params [[buffer(2)]],
+    constant PackedOneHotCoefficientPackingParams &params [[buffer(3)]],
+    uint3 thread_position [[thread_position_in_grid]])
+{
+    ulong output_index = (ulong)thread_position.x;
+    if (output_index >= params.output_coefficients) {
+        return;
+    }
+    ulong tile_chunks =
+        (index_params.position_tiles + (ulong)D512_PACKING_TILES_PER_CHUNK - 1ul)
+            / (ulong)D512_PACKING_TILES_PER_CHUNK;
+    ulong coefficient = output_index % params.subring_dimension;
+    ulong output_block = output_index / params.subring_dimension;
+    ulong trace_block = output_block % params.blocks_per_column;
+    ulong column = output_block / params.blocks_per_column;
+    if (column >= params.num_columns) {
+        output[output_index] = akita_zero();
+        return;
+    }
+    ulong parity = coefficient >> 5ul;
+    ulong bucket = coefficient & 31ul;
+    ulong stream = (trace_block * params.num_columns + column) * 2ul + parity;
+    ulong partial_base = (stream * 32ul + bucket) * tile_chunks;
+    AkitaFp128 sum = akita_zero();
+    for (ulong chunk = 0ul; chunk < tile_chunks; ++chunk) {
+        sum = akita_add(sum, partials[partial_base + chunk]);
+    }
+    output[output_index] = sum;
+}
+
+inline uint akita_lower_byte_mask(uint count) {
+    if (count == 0u) {
+        return 0u;
+    }
+    if (count >= 4u) {
+        return 0xffffffffu;
+    }
+    return (1u << (8u * count)) - 1u;
+}
+
+inline uint akita_apply_negacyclic_signs(uint packed, uint negative_count) {
+    uint mask = akita_lower_byte_mask(negative_count);
+    uint negated = 0x04040404u - packed;
+    return (packed & ~mask) | (negated & mask);
+}
+
+inline void akita_store_indexed_fold_value(
+    device int *output,
+    device char *digits,
+    ulong output_base,
+    ulong digit_position_base,
+    uint coefficient,
+    int value,
+    ulong fold_digits,
+    uint fold_log_basis)
+{
+    output[output_base + (ulong)coefficient] = value;
+    int basis = 1 << fold_log_basis;
+    int half_basis = basis >> 1;
+    int mask = basis - 1;
+    for (ulong digit = 0ul; digit < fold_digits; ++digit) {
+        int raw = value & mask;
+        int balanced = raw >= half_basis ? raw - basis : raw;
+        value = (value - balanced) >> fold_log_basis;
+        digits[digit_position_base + digit * 512ul + (ulong)coefficient] =
+            (char)balanced;
+    }
+}
+
+kernel void akita_fp128_d512_indexed_subring64_decompose_fold(
+    device const uint *records [[buffer(0)]],
+    device const ushort *counts [[buffer(1)]],
+    device const uint *packed_challenges [[buffer(2)]],
+    device int *output [[buffer(3)]],
+    device char *digits [[buffer(4)]],
+    constant PackedFoldIndexParams &params [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    uint simd_lane = thread_index & 31u;
+    uint residue = thread_index >> 5u;
+    uint source_group = simd_lane >> 3u;
+    uint destination_owner = simd_lane & 7u;
+    int4 accumulator_even = int4(0);
+    int4 accumulator_odd = int4(0);
+    ulong local_position = (ulong)threadgroup_index.x;
+    ulong position = params.position_start + local_position;
+
+    for (ulong tile = 0ul; tile < params.tiles_per_position; ++tile) {
+        ulong tile_index = position * params.tiles_per_position + tile;
+        ulong count_base = tile_index * 8ul;
+        uint record_start = 0u;
+        uint count = 0u;
+        if (simd_lane == 0u) {
+            for (uint low = 0u; low < residue; ++low) {
+                record_start += (uint)counts[count_base + (ulong)low];
+            }
+            count = (uint)counts[count_base + (ulong)residue];
+        }
+        record_start = simd_shuffle(record_start, 0u);
+        count = simd_shuffle(count, 0u);
+        ulong record_base = tile_index * 256ul + (ulong)record_start;
+        for (uint batch_start = 0u; batch_start < count; batch_start += 252u) {
+            uint batch_count = min(252u, count - batch_start);
+            uint group_count = batch_count > source_group
+                ? (batch_count + 3u - source_group) / 4u
+                : 0u;
+            uint packed_even = 0u;
+            uint packed_odd = 0u;
+            uint iterations = (batch_count + 3u) / 4u;
+            for (uint iteration = 0u; iteration < iterations; ++iteration) {
+                uint relative_index = 4u * iteration + source_group;
+                bool valid = relative_index < batch_count;
+                uint record = 0u;
+                uint source_lane = 8u * source_group;
+                if (simd_lane == source_lane && valid) {
+                    record = records[
+                        record_base + (ulong)(batch_start + relative_index)];
+                }
+                record = simd_shuffle(record, source_lane);
+                if (valid) {
+                    uint source = record & 63u;
+                    uint challenge = record >> 6u;
+                    uint source_phase = source & 7u;
+                    uint source_rotation = source >> 3u;
+                    uint challenge_quad =
+                        (destination_owner + 8u - source_rotation) & 7u;
+                    uint word = packed_challenges[
+                        (ulong)challenge * 64ul
+                            + (ulong)source_phase * 8ul
+                            + (ulong)challenge_quad];
+                    uint even = word & 0x0f0f0f0fu;
+                    uint odd = (word >> 4u) & 0x0f0f0f0fu;
+                    uint destination_base = 8u * destination_owner;
+                    uint negative_count = source > destination_base
+                        ? min(source - destination_base, 8u)
+                        : 0u;
+                    packed_even += akita_apply_negacyclic_signs(
+                        even, (negative_count + 1u) >> 1u);
+                    packed_odd += akita_apply_negacyclic_signs(
+                        odd, negative_count >> 1u);
+                }
+            }
+            int bias = (int)(2u * group_count);
+            accumulator_even += int4(
+                (int)(packed_even & 255u) - bias,
+                (int)((packed_even >> 8u) & 255u) - bias,
+                (int)((packed_even >> 16u) & 255u) - bias,
+                (int)((packed_even >> 24u) & 255u) - bias);
+            accumulator_odd += int4(
+                (int)(packed_odd & 255u) - bias,
+                (int)((packed_odd >> 8u) & 255u) - bias,
+                (int)((packed_odd >> 16u) & 255u) - bias,
+                (int)((packed_odd >> 24u) & 255u) - bias);
+        }
+    }
+
+    int4 total_even =
+        akita_simd_shuffle_int4(accumulator_even, destination_owner)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 8u)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 16u)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 24u);
+    int4 total_odd =
+        akita_simd_shuffle_int4(accumulator_odd, destination_owner)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 8u)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 16u)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 24u);
+    if (source_group != 0u) {
+        return;
+    }
+
+    ulong output_base = local_position * 512ul;
+    ulong digit_position_base = local_position * params.fold_digits * 512ul;
+    for (uint component = 0u; component < 4u; ++component) {
+        uint destination_high = 8u * destination_owner + 2u * component;
+        uint coefficient = residue + 8u * destination_high;
+        akita_store_indexed_fold_value(
+            output, digits, output_base, digit_position_base, coefficient,
+            total_even[component], params.fold_digits,
+            (uint)params.fold_log_basis);
+        destination_high += 1u;
+        coefficient = residue + 8u * destination_high;
+        akita_store_indexed_fold_value(
+            output, digits, output_base, digit_position_base, coefficient,
+            total_odd[component], params.fold_digits,
+            (uint)params.fold_log_basis);
+    }
+}
 
 kernel void akita_fp128_d512_linear_relation_partials(
     device const AkitaFp128 *matrix [[buffer(0)]],
@@ -1649,6 +2271,307 @@ kernel void akita_fp128_recursive_commit_reconstruct(
     output[coefficient] = reconstructed;
 }
 
+constant ulong AKITA_BLAKE2B_IV[8] = {
+    0x6a09e667f3bcc908ul, 0xbb67ae8584caa73bul,
+    0x3c6ef372fe94f82bul, 0xa54ff53a5f1d36f1ul,
+    0x510e527fade682d1ul, 0x9b05688c2b3e6c1ful,
+    0x1f83d9abfb41bd6bul, 0x5be0cd19137e2179ul,
+};
+
+constant uchar AKITA_BLAKE2B_SIGMA[12][16] = {
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 },
+    { 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 },
+    { 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 },
+    { 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 },
+    { 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 },
+    { 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 },
+    { 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 },
+    { 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 },
+    { 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 },
+    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    { 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 },
+};
+
+inline ulong akita_blake2b_load64(thread const uchar *bytes)
+{
+    ulong value = 0ul;
+    for (uint i = 0u; i < 8u; ++i) {
+        value |= (ulong)bytes[i] << (8u * i);
+    }
+    return value;
+}
+
+inline void akita_blake2b_store64(thread uchar *bytes, ulong value)
+{
+    for (uint i = 0u; i < 8u; ++i) {
+        bytes[i] = (uchar)(value >> (8u * i));
+    }
+}
+
+inline ulong akita_blake2b_rotr(ulong value, uint shift)
+{
+    return (value >> shift) | (value << (64u - shift));
+}
+
+inline void akita_blake2b_g(
+    thread ulong *v,
+    uint a,
+    uint b,
+    uint c,
+    uint d,
+    ulong x,
+    ulong y)
+{
+    v[a] = v[a] + v[b] + x;
+    v[d] = akita_blake2b_rotr(v[d] ^ v[a], 32u);
+    v[c] += v[d];
+    v[b] = akita_blake2b_rotr(v[b] ^ v[c], 24u);
+    v[a] = v[a] + v[b] + y;
+    v[d] = akita_blake2b_rotr(v[d] ^ v[a], 16u);
+    v[c] += v[d];
+    v[b] = akita_blake2b_rotr(v[b] ^ v[c], 63u);
+}
+
+inline void akita_blake2b_compress(
+    thread ulong *h,
+    thread const uchar *block,
+    ulong byte_count,
+    bool final_block)
+{
+    ulong m[16];
+    ulong v[16];
+    for (uint i = 0u; i < 16u; ++i) {
+        m[i] = akita_blake2b_load64(block + 8u * i);
+        v[i] = i < 8u ? h[i] : AKITA_BLAKE2B_IV[i - 8u];
+    }
+    v[12] ^= byte_count;
+    if (final_block) {
+        v[14] = ~v[14];
+    }
+    for (uint round = 0u; round < 12u; ++round) {
+        constant const uchar *s = AKITA_BLAKE2B_SIGMA[round];
+        akita_blake2b_g(v, 0u, 4u, 8u, 12u, m[s[0]], m[s[1]]);
+        akita_blake2b_g(v, 1u, 5u, 9u, 13u, m[s[2]], m[s[3]]);
+        akita_blake2b_g(v, 2u, 6u, 10u, 14u, m[s[4]], m[s[5]]);
+        akita_blake2b_g(v, 3u, 7u, 11u, 15u, m[s[6]], m[s[7]]);
+        akita_blake2b_g(v, 0u, 5u, 10u, 15u, m[s[8]], m[s[9]]);
+        akita_blake2b_g(v, 1u, 6u, 11u, 12u, m[s[10]], m[s[11]]);
+        akita_blake2b_g(v, 2u, 7u, 8u, 13u, m[s[12]], m[s[13]]);
+        akita_blake2b_g(v, 3u, 4u, 9u, 14u, m[s[14]], m[s[15]]);
+    }
+    for (uint i = 0u; i < 8u; ++i) {
+        h[i] ^= v[i] ^ v[i + 8u];
+    }
+}
+
+inline void akita_blake2b512(
+    thread const uchar *input,
+    ulong input_len,
+    thread ulong *output)
+{
+    ulong h[8];
+    for (uint i = 0u; i < 8u; ++i) {
+        h[i] = AKITA_BLAKE2B_IV[i];
+    }
+    h[0] ^= 0x01010040ul;
+
+    uchar block[128];
+    ulong offset = 0ul;
+    ulong byte_count = 0ul;
+    while (input_len - offset > 128ul) {
+        for (uint i = 0u; i < 128u; ++i) {
+            block[i] = input[offset + (ulong)i];
+        }
+        offset += 128ul;
+        byte_count += 128ul;
+        akita_blake2b_compress(h, block, byte_count, false);
+    }
+    ulong remaining = input_len - offset;
+    for (uint i = 0u; i < 128u; ++i) {
+        block[i] = (ulong)i < remaining ? input[offset + (ulong)i] : (uchar)0;
+    }
+    byte_count += remaining;
+    akita_blake2b_compress(h, block, byte_count, true);
+    for (uint i = 0u; i < 8u; ++i) {
+        output[i] = h[i];
+    }
+}
+
+inline void akita_blake2b_copy_words_to_bytes(
+    thread const ulong *words,
+    thread uchar *bytes)
+{
+    for (uint i = 0u; i < 8u; ++i) {
+        akita_blake2b_store64(bytes + 8u * i, words[i]);
+    }
+}
+
+inline AkitaFp128 akita_fp128_from_blake2b_words(ulong low, ulong high)
+{
+    AkitaFp128 value;
+    value.limb = uint4((uint)low, (uint)(low >> 32u), (uint)high, (uint)(high >> 32u));
+    if (value.limb.y == 0xffffffffu
+        && value.limb.z == 0xffffffffu
+        && value.limb.w == 0xffffffffu
+        && value.limb.x >= 0x00005809u) {
+        value.limb = uint4(value.limb.x - 0x00005809u, 0u, 0u, 0u);
+    }
+    return value;
+}
+
+kernel void akita_fp128_blake2b_sumcheck_challenge(
+    device uchar *chaining_value [[buffer(0)]],
+    device const uchar *claim [[buffer(1)]],
+    device const uchar *coefficients [[buffer(2)]],
+    device AkitaFp128 *challenge [[buffer(3)]],
+    constant Blake2bSumcheckChallengeParams &params [[buffer(4)]])
+{
+    uchar input[320];
+    ulong digest[8];
+
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    input[127] = (uchar)2;
+    for (uint i = 0u; i < 64u; ++i) {
+        input[128u + i] = chaining_value[i];
+    }
+    for (uint i = 0u; i < 8u; ++i) {
+        input[192u + i] = (uchar)(params.prior_squeezed_bytes >> (56u - 8u * i));
+    }
+    akita_blake2b512(input, 200ul, digest);
+
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    input[127] = (uchar)0;
+    akita_blake2b_copy_words_to_bytes(digest, input + 128u);
+    ulong cursor = 192ul;
+    if (params.include_claim != 0ul) {
+        input[cursor] = (uchar)16;
+        cursor += 8ul;
+        for (uint i = 0u; i < 16u; ++i) {
+            input[cursor + (ulong)i] = claim[i];
+        }
+        cursor += 16ul;
+    }
+    ulong coefficient_bytes = params.coefficient_count * 16ul;
+    input[cursor] = (uchar)coefficient_bytes;
+    cursor += 8ul;
+    for (ulong i = 0ul; i < coefficient_bytes; ++i) {
+        input[cursor + i] = coefficients[i];
+    }
+    cursor += coefficient_bytes;
+    akita_blake2b512(input, cursor, digest);
+
+    akita_blake2b_copy_words_to_bytes(digest, input);
+    akita_blake2b512(input, 64ul, digest);
+    for (uint i = 0u; i < 8u; ++i) {
+        akita_blake2b_store64(input + 8u * i, digest[i]);
+    }
+    for (uint i = 0u; i < 64u; ++i) {
+        chaining_value[i] = input[i];
+    }
+
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    input[127] = (uchar)1;
+    akita_blake2b_copy_words_to_bytes(digest, input + 128u);
+    akita_blake2b512(input, 200ul, digest);
+    AkitaFp128 low = akita_fp128_from_blake2b_words(digest[0], digest[1]);
+    AkitaFp128 high = akita_fp128_from_blake2b_words(digest[2], digest[3]);
+    challenge[0] = akita_add(
+        low,
+        akita_mul_signed_small(high, (long)AKITA_OFFSET));
+}
+
+inline bool akita_fp128_is_zero(AkitaFp128 value)
+{
+    return all(value.limb == uint4(0u));
+}
+
+inline uchar akita_fp128_serialized_byte(AkitaFp128 value, uint index)
+{
+    uint word = value.limb[index >> 2u];
+    return (uchar)(word >> (8u * (index & 3u)));
+}
+
+kernel void akita_fp128_blake2b_relation_sumcheck_round(
+    device uchar *chaining_value [[buffer(0)]],
+    device const AkitaFp128 *main_coefficients [[buffer(1)]],
+    device const AkitaFp128 *additional_coefficients [[buffer(2)]],
+    device AkitaFp128 *proof_coefficients [[buffer(3)]],
+    device uint *coefficient_count_output [[buffer(4)]],
+    device AkitaFp128 *challenge [[buffer(5)]],
+    constant DirectRelationTranscriptParams &params [[buffer(6)]])
+{
+    AkitaFp128 coefficients[3];
+    for (uint i = 0u; i < 3u; ++i) {
+        coefficients[i] = params.has_additional != 0ul
+            ? akita_add(main_coefficients[i], additional_coefficients[i])
+            : main_coefficients[i];
+        proof_coefficients[i] = coefficients[i];
+    }
+    uint coefficient_count = 3u;
+    while (coefficient_count > 1u
+        && akita_fp128_is_zero(coefficients[coefficient_count - 1u])) {
+        coefficient_count -= 1u;
+    }
+    coefficient_count_output[0] = coefficient_count;
+
+    uchar input[320];
+    ulong digest[8];
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    input[127] = (uchar)2;
+    for (uint i = 0u; i < 64u; ++i) {
+        input[128u + i] = chaining_value[i];
+    }
+    for (uint i = 0u; i < 8u; ++i) {
+        input[192u + i] = (uchar)(params.prior_squeezed_bytes >> (56u - 8u * i));
+    }
+    akita_blake2b512(input, 200ul, digest);
+
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    akita_blake2b_copy_words_to_bytes(digest, input + 128u);
+    ulong cursor = 192ul;
+    ulong coefficient_bytes = (ulong)coefficient_count * 16ul;
+    input[cursor] = (uchar)coefficient_bytes;
+    cursor += 8ul;
+    for (uint coefficient = 0u; coefficient < coefficient_count; ++coefficient) {
+        for (uint byte = 0u; byte < 16u; ++byte) {
+            input[cursor++] = akita_fp128_serialized_byte(coefficients[coefficient], byte);
+        }
+    }
+    akita_blake2b512(input, cursor, digest);
+
+    akita_blake2b_copy_words_to_bytes(digest, input);
+    akita_blake2b512(input, 64ul, digest);
+    for (uint i = 0u; i < 8u; ++i) {
+        akita_blake2b_store64(input + 8u * i, digest[i]);
+    }
+    for (uint i = 0u; i < 64u; ++i) {
+        chaining_value[i] = input[i];
+    }
+
+    for (uint i = 0u; i < 320u; ++i) {
+        input[i] = (uchar)0;
+    }
+    input[127] = (uchar)1;
+    akita_blake2b_copy_words_to_bytes(digest, input + 128u);
+    akita_blake2b512(input, 200ul, digest);
+    AkitaFp128 low = akita_fp128_from_blake2b_words(digest[0], digest[1]);
+    AkitaFp128 high = akita_fp128_from_blake2b_words(digest[2], digest[3]);
+    challenge[0] = akita_add(
+        low,
+        akita_mul_signed_small(high, (long)AKITA_OFFSET));
+}
+
 inline AkitaFp128 akita_direct_range_eq_weight(
     device const AkitaFp128 *e_first,
     device const AkitaFp128 *e_second,
@@ -1701,6 +2624,29 @@ inline void akita_direct_range_q_coefficients(
         akita_mul(delta_squared, second_quadratic));
     q3 = akita_mul(delta_squared, akita_add(first_linear, second_linear));
     q4 = akita_mul(delta_squared, delta_squared);
+}
+
+inline AkitaFp128 akita_direct_range_prefix_weight(
+    device const AkitaFp128 *weights_or_challenges,
+    ulong prefix,
+    constant DirectRangeParams &params)
+{
+    if (params.resident_challenges == 0ul) {
+        return weights_or_challenges[prefix];
+    }
+    AkitaFp128 weight = akita_from_u32(1u);
+    ulong width = params.prefix_size;
+    uint challenge_index = 0u;
+    while (width > 1ul) {
+        AkitaFp128 r = weights_or_challenges[challenge_index];
+        AkitaFp128 factor = ((prefix >> challenge_index) & 1ul) != 0ul
+            ? r
+            : akita_sub(akita_from_u32(1u), r);
+        weight = akita_mul(weight, factor);
+        width >>= 1ul;
+        challenge_index += 1u;
+    }
+    return weight;
 }
 
 kernel void akita_fp128_direct_range_initial_partials(
@@ -1862,7 +2808,10 @@ kernel void akita_fp128_direct_range_compact_fold_partials(
                     long range_image = (long)digit * (long)(digit + 1);
                     value = akita_add(
                         value,
-                        akita_mul_signed_small(prefix_weights[prefix], range_image));
+                        akita_mul_signed_small(
+                            akita_direct_range_prefix_weight(
+                                prefix_weights, prefix, params),
+                            range_image));
                 }
             }
             values[side] = value;
@@ -2217,7 +3166,24 @@ inline AkitaFp128 akita_direct_relation_compact_value(
     for (ulong prefix = 0ul; prefix < params.prefix_size; ++prefix) {
         ulong input_index = input_start + prefix;
         int digit = input_index < params.live_len ? (int)digits[input_index] : 0;
-        value = akita_add(value, akita_mul_signed_small(prefix_weights[prefix], (long)digit));
+        AkitaFp128 weight;
+        if (params.resident_challenges != 0ul) {
+            weight = akita_from_u32(1u);
+            ulong width = params.prefix_size;
+            uint challenge_index = 0u;
+            while (width > 1ul) {
+                AkitaFp128 challenge = prefix_weights[challenge_index];
+                AkitaFp128 factor = ((prefix >> challenge_index) & 1ul) != 0ul
+                    ? challenge
+                    : akita_sub(akita_from_u32(1u), challenge);
+                weight = akita_mul(weight, factor);
+                width >>= 1ul;
+                challenge_index += 1u;
+            }
+        } else {
+            weight = prefix_weights[prefix];
+        }
+        value = akita_add(value, akita_mul_signed_small(weight, (long)digit));
     }
     return value;
 }
@@ -2332,6 +3298,87 @@ kernel void akita_fp128_direct_relation_linear_fold(
         }
     }
     output[index] = akita_add(left, akita_mul(challenge, akita_sub(right, left)));
+}
+
+kernel void akita_fp128_direct_relation_alpha_fold(
+    device const AkitaFp128 *input [[buffer(0)]],
+    device AkitaFp128 *output [[buffer(1)]],
+    constant AkitaFp128 &challenge [[buffer(2)]],
+    constant ulong &output_len [[buffer(3)]],
+    uint thread_index [[thread_position_in_grid]])
+{
+    ulong index = (ulong)thread_index;
+    if (index >= output_len) {
+        return;
+    }
+    AkitaFp128 left = input[2ul * index];
+    output[index] = akita_add(
+        left,
+        akita_mul(challenge, akita_sub(input[2ul * index + 1ul], left)));
+}
+
+kernel void akita_fp128_direct_relation_scalar_advance(
+    constant DirectRelationScalars &current [[buffer(0)]],
+    constant AkitaFp128 &challenge [[buffer(1)]],
+    constant AkitaFp128 &tau_current [[buffer(2)]],
+    constant AkitaFp128 &tau_next [[buffer(3)]],
+    device DirectRelationScalars *next [[buffer(4)]])
+{
+    AkitaFp128 one = akita_from_u32(1u);
+    AkitaFp128 scalar = akita_add(current.l_at_0, current.l_at_1);
+    AkitaFp128 bound = akita_add(
+        akita_mul(tau_current, challenge),
+        akita_mul(akita_sub(one, tau_current), akita_sub(one, challenge)));
+    AkitaFp128 next_scalar = akita_mul(scalar, bound);
+    AkitaFp128 next_at_one = akita_mul(next_scalar, tau_next);
+    next[0].l_at_0 = akita_sub(next_scalar, next_at_one);
+    next[0].l_at_1 = next_at_one;
+    next[0].binary_batching = current.binary_batching;
+}
+
+inline void akita_direct_relation_bind_additional_pair(
+    DirectRelationAdditionalPair pair,
+    AkitaFp128 challenge,
+    thread AkitaFp128 &linear,
+    thread AkitaFp128 &binary)
+{
+    linear = akita_add(
+        pair.linear[0],
+        akita_mul(challenge, akita_sub(pair.linear[1], pair.linear[0])));
+    binary = akita_add(
+        pair.binary[0],
+        akita_mul(challenge, akita_sub(pair.binary[1], pair.binary[0])));
+}
+
+kernel void akita_fp128_direct_relation_additional_fold(
+    device const DirectRelationAdditionalPair *input [[buffer(0)]],
+    device DirectRelationAdditionalPair *output [[buffer(1)]],
+    device const DirectRelationAdditionalFoldMapping *mappings [[buffer(2)]],
+    constant AkitaFp128 &challenge [[buffer(3)]],
+    constant ulong &mapping_count [[buffer(4)]],
+    uint thread_index [[thread_position_in_grid]])
+{
+    ulong index = (ulong)thread_index;
+    if (index >= mapping_count) {
+        return;
+    }
+    DirectRelationAdditionalFoldMapping mapping = mappings[index];
+    DirectRelationAdditionalPair result;
+    result.parent = mapping.parent;
+    result.reserved = 0ul;
+    result.linear[0] = akita_zero();
+    result.linear[1] = akita_zero();
+    result.binary[0] = akita_zero();
+    result.binary[1] = akita_zero();
+    if (mapping.left != 0xffffffffu) {
+        akita_direct_relation_bind_additional_pair(
+            input[mapping.left], challenge, result.linear[0], result.binary[0]);
+    }
+    if (mapping.right != 0xffffffffu) {
+        akita_direct_relation_bind_additional_pair(
+            input[mapping.right], challenge, result.linear[1], result.binary[1]);
+    }
+    output[index] = result;
 }
 
 inline void akita_emit_reduced_shift_sequence(

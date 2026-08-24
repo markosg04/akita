@@ -28,6 +28,8 @@ pub(in crate::protocol::core) fn prepare_single_field_fold<'a, 'p, F, E, T, P, V
     level_params: &CommittedGroupParams,
     basis: BasisMode,
     fold_sink: Option<&'p mut dyn crate::protocol::fold_grind::FoldProbeSink>,
+    pre_fold_task: Option<&'p mut (dyn FnMut() -> Result<(), AkitaError> + Send)>,
+    pre_fold_sink: Option<&'p mut dyn crate::protocol::ring_relation::RingRelationPreFoldSink<F>>,
 ) -> Result<PreparedFold<F, E>, AkitaError>
 where
     F: FieldCore
@@ -67,6 +69,8 @@ where
         basis,
         pad_base_evals,
         fold_sink,
+        pre_fold_task,
+        pre_fold_sink,
         transcript,
     })
     .map_err(|err| AkitaError::InvalidInput(format!("finish prepared fold failed: {err:?}")))
