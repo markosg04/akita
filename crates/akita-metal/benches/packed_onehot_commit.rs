@@ -157,7 +157,7 @@ mod implementation {
         let matrix_streams = metal_work_units.div_ceil(32) * 2;
         let hot_entries = poly.lanes().iter().filter(|&&lane| lane != 0).count();
 
-        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512WidePanels);
+        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
         assert!(metrics.input_zero_copy);
         assert!(metrics.matrix_cache_hit);
         assert!(cpu_blocks.is_power_of_two() && cpu_blocks <= 8);
