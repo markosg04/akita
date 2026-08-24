@@ -219,6 +219,8 @@ pub enum MetalOneHotKernel {
     BlockBatched,
     /// Exact fp128 D512 panels with one block-column task per SIMDgroup.
     PackedFp128D512Panels,
+    /// Exact fp128 D512 panels with interleaved accumulator carry chains.
+    PackedFp128D512InterleavedPanels,
 }
 
 /// Stable Metal device properties relevant to commitment scheduling.
@@ -1814,7 +1816,8 @@ impl MetalRuntime {
             encoder.set_label(match kernel {
                 MetalOneHotKernel::DirectGather => "Akita one-hot gather",
                 MetalOneHotKernel::BlockBatched => "Akita one-hot block batch",
-                MetalOneHotKernel::PackedFp128D512Panels => {
+                MetalOneHotKernel::PackedFp128D512Panels
+                | MetalOneHotKernel::PackedFp128D512InterleavedPanels => {
                     return Err(MetalCommitError::UnsupportedShape(
                         "packed kernel requires packed parameters".into(),
                     ));
@@ -6182,7 +6185,7 @@ impl MetalRuntime {
                     gpu,
                     readback_copy: readback_start.elapsed(),
                 },
-                kernel: MetalOneHotKernel::PackedFp128D512Panels,
+                kernel: MetalOneHotKernel::PackedFp128D512InterleavedPanels,
                 blocks_per_threadgroup: FP128_D512_TASKS_PER_STREAM,
                 columns_per_threadgroup: 1,
                 matrix_block_streams: matrix_block_streams as usize,
@@ -6215,9 +6218,12 @@ impl MetalRuntime {
                     Ok(blocks)
                 }
             }
-            MetalOneHotKernel::PackedFp128D512Panels => Err(MetalCommitError::UnsupportedShape(
-                "packed kernel requires packed parameters".into(),
-            )),
+            MetalOneHotKernel::PackedFp128D512Panels
+            | MetalOneHotKernel::PackedFp128D512InterleavedPanels => {
+                Err(MetalCommitError::UnsupportedShape(
+                    "packed kernel requires packed parameters".into(),
+                ))
+            }
         }
     }
 
@@ -6233,7 +6239,8 @@ impl MetalRuntime {
         let pipeline = match kernel {
             MetalOneHotKernel::DirectGather => &self.direct_pipeline,
             MetalOneHotKernel::BlockBatched => &self.block_batched_pipeline,
-            MetalOneHotKernel::PackedFp128D512Panels => {
+            MetalOneHotKernel::PackedFp128D512Panels
+            | MetalOneHotKernel::PackedFp128D512InterleavedPanels => {
                 return Err(MetalCommitError::UnsupportedShape(
                     "packed kernel requires packed parameters".into(),
                 ));
@@ -6265,7 +6272,8 @@ impl MetalRuntime {
                     MTLSize::new(params.blocks_per_threadgroup * params.ring_d, 1, 1),
                 );
             }
-            MetalOneHotKernel::PackedFp128D512Panels => unreachable!(),
+            MetalOneHotKernel::PackedFp128D512Panels
+            | MetalOneHotKernel::PackedFp128D512InterleavedPanels => unreachable!(),
         }
         Ok(())
     }
