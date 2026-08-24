@@ -4100,122 +4100,85 @@ inline uint4 akita_fp128_d512_gather_word(
         matrix[plane_base + matrix_base + sources[3]]);
 }
 
-inline void akita_fp128_d512_accumulate_positive_pair(
-    thread AkitaTransposedFp128Accumulator &accumulator_0,
-    thread AkitaTransposedFp128Accumulator &accumulator_1,
-    threadgroup const uint *matrix,
-    uint matrix_base,
-    uint4 sources_0,
-    uint4 sources_1)
+inline void akita_fp128_d512_accumulate_value(
+    thread AkitaTransposedFp128Accumulator &accumulator,
+    uint4 value_0,
+    uint4 value_1,
+    uint4 value_2,
+    uint4 value_3,
+    bool4 positive)
 {
-    uint4 carry_0 = uint4(0u);
-    uint4 carry_1 = uint4(0u);
-    accumulator_0.word_0 = akita_add_transposed_word(
-        accumulator_0.word_0,
-        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_0 = akita_add_transposed_word(
-        accumulator_1.word_0,
-        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_1 = akita_add_transposed_word(
-        accumulator_0.word_1,
-        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_1 = akita_add_transposed_word(
-        accumulator_1.word_1,
-        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_2 = akita_add_transposed_word(
-        accumulator_0.word_2,
-        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_2 = akita_add_transposed_word(
-        accumulator_1.word_2,
-        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_3 = akita_add_transposed_word(
-        accumulator_0.word_3,
-        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_3 = akita_add_transposed_word(
-        accumulator_1.word_3,
-        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_1), carry_1);
-    accumulator_0.wraps += int4(carry_0);
-    accumulator_1.wraps += int4(carry_1);
+    uint4 carry = select(uint4(1u), uint4(0u), positive);
+    accumulator.word_0 = akita_add_transposed_word(
+        accumulator.word_0, select(~value_0, value_0, positive), carry);
+    accumulator.word_1 = akita_add_transposed_word(
+        accumulator.word_1, select(~value_1, value_1, positive), carry);
+    accumulator.word_2 = akita_add_transposed_word(
+        accumulator.word_2, select(~value_2, value_2, positive), carry);
+    accumulator.word_3 = akita_add_transposed_word(
+        accumulator.word_3, select(~value_3, value_3, positive), carry);
+    int4 carry_words = int4(carry);
+    accumulator.wraps += select(carry_words - int4(1), carry_words, positive);
 }
 
-inline void akita_fp128_d512_accumulate_negative_pair(
-    thread AkitaTransposedFp128Accumulator &accumulator_0,
-    thread AkitaTransposedFp128Accumulator &accumulator_1,
+inline void akita_fp128_d512_accumulate_positive(
+    thread AkitaTransposedFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
     uint matrix_base,
-    uint4 sources_0,
-    uint4 sources_1)
+    uint4 sources)
 {
-    uint4 carry_0 = uint4(1u);
-    uint4 carry_1 = uint4(1u);
-    accumulator_0.word_0 = akita_add_transposed_word(
-        accumulator_0.word_0,
-        ~akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_0 = akita_add_transposed_word(
-        accumulator_1.word_0,
-        ~akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_1 = akita_add_transposed_word(
-        accumulator_0.word_1,
-        ~akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_1 = akita_add_transposed_word(
-        accumulator_1.word_1,
-        ~akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_2 = akita_add_transposed_word(
-        accumulator_0.word_2,
-        ~akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_2 = akita_add_transposed_word(
-        accumulator_1.word_2,
-        ~akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_1), carry_1);
-    accumulator_0.word_3 = akita_add_transposed_word(
-        accumulator_0.word_3,
-        ~akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_0), carry_0);
-    accumulator_1.word_3 = akita_add_transposed_word(
-        accumulator_1.word_3,
-        ~akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_1), carry_1);
-    accumulator_0.wraps += int4(carry_0) - int4(1);
-    accumulator_1.wraps += int4(carry_1) - int4(1);
+    uint4 carry = uint4(0u);
+    accumulator.word_0 = akita_add_transposed_word(
+        accumulator.word_0,
+        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
+    accumulator.word_1 = akita_add_transposed_word(
+        accumulator.word_1,
+        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
+    accumulator.word_2 = akita_add_transposed_word(
+        accumulator.word_2,
+        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
+    accumulator.word_3 = akita_add_transposed_word(
+        accumulator.word_3,
+        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
+    accumulator.wraps += int4(carry);
 }
 
-inline void akita_fp128_d512_accumulate_mixed_pair(
-    thread AkitaTransposedFp128Accumulator &accumulator_0,
-    thread AkitaTransposedFp128Accumulator &accumulator_1,
+inline void akita_fp128_d512_accumulate_negative(
+    thread AkitaTransposedFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
     uint matrix_base,
-    uint4 sources_0,
-    uint4 sources_1,
-    bool4 positive_0,
-    bool4 positive_1)
+    uint4 sources)
 {
-    uint4 carry_0 = select(uint4(1u), uint4(0u), positive_0);
-    uint4 carry_1 = select(uint4(1u), uint4(0u), positive_1);
-    uint4 value = akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_0);
-    accumulator_0.word_0 = akita_add_transposed_word(
-        accumulator_0.word_0, select(~value, value, positive_0), carry_0);
-    value = akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources_1);
-    accumulator_1.word_0 = akita_add_transposed_word(
-        accumulator_1.word_0, select(~value, value, positive_1), carry_1);
-    value = akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_0);
-    accumulator_0.word_1 = akita_add_transposed_word(
-        accumulator_0.word_1, select(~value, value, positive_0), carry_0);
-    value = akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources_1);
-    accumulator_1.word_1 = akita_add_transposed_word(
-        accumulator_1.word_1, select(~value, value, positive_1), carry_1);
-    value = akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_0);
-    accumulator_0.word_2 = akita_add_transposed_word(
-        accumulator_0.word_2, select(~value, value, positive_0), carry_0);
-    value = akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources_1);
-    accumulator_1.word_2 = akita_add_transposed_word(
-        accumulator_1.word_2, select(~value, value, positive_1), carry_1);
-    value = akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_0);
-    accumulator_0.word_3 = akita_add_transposed_word(
-        accumulator_0.word_3, select(~value, value, positive_0), carry_0);
-    value = akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources_1);
-    accumulator_1.word_3 = akita_add_transposed_word(
-        accumulator_1.word_3, select(~value, value, positive_1), carry_1);
-    int4 carry_words = int4(carry_0);
-    accumulator_0.wraps += select(carry_words - int4(1), carry_words, positive_0);
-    carry_words = int4(carry_1);
-    accumulator_1.wraps += select(carry_words - int4(1), carry_words, positive_1);
+    uint4 carry = uint4(1u);
+    accumulator.word_0 = akita_add_transposed_word(
+        accumulator.word_0,
+        ~akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
+    accumulator.word_1 = akita_add_transposed_word(
+        accumulator.word_1,
+        ~akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
+    accumulator.word_2 = akita_add_transposed_word(
+        accumulator.word_2,
+        ~akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
+    accumulator.word_3 = akita_add_transposed_word(
+        accumulator.word_3,
+        ~akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
+    accumulator.wraps += int4(carry) - int4(1);
+}
+
+inline void akita_fp128_d512_accumulate_mixed(
+    thread AkitaTransposedFp128Accumulator &accumulator,
+    threadgroup const uint *matrix,
+    uint matrix_base,
+    uint4 sources,
+    bool4 positive)
+{
+    akita_fp128_d512_accumulate_value(
+        accumulator,
+        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources),
+        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources),
+        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources),
+        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources),
+        positive);
 }
 
 inline void akita_fp128_d512_accumulate_pair(
@@ -4239,29 +4202,33 @@ inline void akita_fp128_d512_accumulate_pair(
     if (coefficient_band == 0u) {
         if (odd_row) {
             uint4 shift = uint4(256u - local_shift);
-            akita_fp128_d512_accumulate_negative_pair(
-                accumulator_0, accumulator_1, matrix, matrix_base,
-                coefficients_0 + shift, coefficients_1 + shift);
+            akita_fp128_d512_accumulate_negative(
+                accumulator_0, matrix, matrix_base, coefficients_0 + shift);
+            akita_fp128_d512_accumulate_negative(
+                accumulator_1, matrix, matrix_base, coefficients_1 + shift);
         } else {
             uint4 shift = uint4(local_shift);
-            akita_fp128_d512_accumulate_mixed_pair(
-                accumulator_0, accumulator_1, matrix, matrix_base,
-                (coefficients_0 - shift) & uint4(511u),
-                (coefficients_1 - shift) & uint4(511u),
-                coefficients_0 >= shift, coefficients_1 >= shift);
+            akita_fp128_d512_accumulate_mixed(
+                accumulator_0, matrix, matrix_base,
+                (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+            akita_fp128_d512_accumulate_mixed(
+                accumulator_1, matrix, matrix_base,
+                (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
         }
     } else if (odd_row) {
         uint4 shift = uint4(256u + local_shift);
-        akita_fp128_d512_accumulate_mixed_pair(
-            accumulator_0, accumulator_1, matrix, matrix_base,
-            (coefficients_0 - shift) & uint4(511u),
-            (coefficients_1 - shift) & uint4(511u),
-            coefficients_0 >= shift, coefficients_1 >= shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_0, matrix, matrix_base,
+            (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_1, matrix, matrix_base,
+            (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
     } else {
         uint4 shift = uint4(local_shift);
-        akita_fp128_d512_accumulate_positive_pair(
-            accumulator_0, accumulator_1, matrix, matrix_base,
-            coefficients_0 - shift, coefficients_1 - shift);
+        akita_fp128_d512_accumulate_positive(
+            accumulator_0, matrix, matrix_base, coefficients_0 - shift);
+        akita_fp128_d512_accumulate_positive(
+            accumulator_1, matrix, matrix_base, coefficients_1 - shift);
     }
 }
 

@@ -1004,10 +1004,7 @@ mod tests {
                 .unwrap();
             assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
-            assert_eq!(
-                metrics.kernel,
-                MetalOneHotKernel::PackedFp128D512InterleavedPanels
-            );
+            assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
             assert_eq!(metrics.cpu_work_units, columns);
             assert_eq!(metrics.metal_work_units, columns * 31);
         }
@@ -1064,10 +1061,7 @@ mod tests {
 
         assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
-        assert_eq!(
-            metrics.kernel,
-            MetalOneHotKernel::PackedFp128D512InterleavedPanels
-        );
+        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
         assert_eq!(metrics.cpu_work_units, 8);
         assert_eq!(metrics.metal_work_units, 504);
     }
