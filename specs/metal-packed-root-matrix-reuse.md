@@ -120,3 +120,22 @@ The 7.8--9.5 s range is the mechanism prediction, while 10.5 s is the rejection
 boundary. Repeat once only for a surprising result, threshold ambiguity, or parent
 promotion. On failure, revert the task mapping and record the register/issue result;
 do not tune larger reuse factors under the same candidate.
+
+## Result
+
+The red route assertion first observed 32 tasks per stream. After the implementation,
+exact CPU/Metal parity passed at 31, 32, 33, 63, 64, and 65 tasks, along with the
+resident, streaming, sparse-rotation, and 512-block cases.
+
+The single BTreeMap T25 sentinel verified and reported the intended route. Modeled
+matrix reads fell exactly from 207,232,172,032 to 104,152,956,928 bytes. Root GPU
+time nevertheless rose from 1.473321 s to 1.729072 s, command wall rose from
+1.497966 s to 1.751841 s, and complete proving rose from 6.45 s to 6.71 s. Peak RSS
+fell from 16.83 to 15.35 GiB and no swap or fallback occurred.
+
+This is a device-work regression despite removing half the logical matrix traffic.
+Four live accumulators per thread reduce issue throughput or spill enough to cost at
+least 0.49 s relative to the ideal traffic saving at this scale. C1 is rejected
+without a T28 run and reverted in `be8c706a9`. Do not try a larger task-reuse factor;
+a future root candidate must reduce arithmetic with one task per SIMDgroup or use a
+different representation that does not double live accumulator state.
