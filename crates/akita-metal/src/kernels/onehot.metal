@@ -4208,37 +4208,21 @@ inline void akita_fp128_d512_accumulate_pair(
                 accumulator_1, matrix, matrix_base, coefficients_1 + shift);
         } else {
             uint4 shift = uint4(local_shift);
-            if (local_shift < 128u) {
-                akita_fp128_d512_accumulate_mixed(
-                    accumulator_0, matrix, matrix_base,
-                    (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
-                akita_fp128_d512_accumulate_positive(
-                    accumulator_1, matrix, matrix_base, coefficients_1 - shift);
-            } else {
-                akita_fp128_d512_accumulate_negative(
-                    accumulator_0, matrix, matrix_base,
-                    (coefficients_0 - shift) & uint4(511u));
-                akita_fp128_d512_accumulate_mixed(
-                    accumulator_1, matrix, matrix_base,
-                    (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
-            }
-        }
-    } else if (odd_row) {
-        uint4 shift = uint4(256u + local_shift);
-        if (local_shift < 128u) {
             akita_fp128_d512_accumulate_mixed(
                 accumulator_0, matrix, matrix_base,
                 (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
-            akita_fp128_d512_accumulate_positive(
-                accumulator_1, matrix, matrix_base, coefficients_1 - shift);
-        } else {
-            akita_fp128_d512_accumulate_negative(
-                accumulator_0, matrix, matrix_base,
-                (coefficients_0 - shift) & uint4(511u));
             akita_fp128_d512_accumulate_mixed(
                 accumulator_1, matrix, matrix_base,
                 (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
         }
+    } else if (odd_row) {
+        uint4 shift = uint4(256u + local_shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_0, matrix, matrix_base,
+            (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator_1, matrix, matrix_base,
+            (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
     } else {
         uint4 shift = uint4(local_shift);
         akita_fp128_d512_accumulate_positive(
