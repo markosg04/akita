@@ -136,3 +136,22 @@ index byte count is not exact, or complete proving saves less than 0.5 s. A miss
 either register/barrier cost or host allocation as the broken assumption before the
 queue is reranked. Do not tune tile size, chunk count, coefficient packing, or the
 protocol inside this candidate.
+
+## Result
+
+Akita `a454c7575` passed exact CPU/Metal parity for centered coefficients, balanced
+digits, retained and fused routes, multiple full tiles, a partial tail tile, and
+stream order. The integrated Fibonacci T25 guard verified in 5.98 s against its
+6.30 s limit.
+
+Two verified BTreeMap T28 runs took 49.29 s and 49.55 s, compared with the 50.46 s
+parent. Their opening command intervals were 4.574 s and 4.532 s, peak RSS was
+82.03 GiB and 81.93 GiB, and both reported exactly 18,182,307,840 remaining index
+bytes. The unchanged T28 opening harness measured 1.813 s of fused packed-fold GPU
+time, 87% of the calibrated 1.58 s floor and below the 2.00 s bar. Its transcript
+and verifier checks passed.
+
+Promote the candidate. The worst integrated observation saves 0.91 s and raises the
+BTreeMap speedup from 3.301x to 3.361x. The remaining 16.934 GiB coefficient index
+takes about 0.99 s wall but only 0.10 s GPU to build, so its allocation and command
+lifecycle is the next opening candidate; no further fold-queue tuning is justified.
