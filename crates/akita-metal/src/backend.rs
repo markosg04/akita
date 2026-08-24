@@ -37,7 +37,7 @@ use crate::runtime::{
     DigitRowsParams, DirectRangeRoundOutcome, DirectRelationAdditionalPair,
     DirectRelationLinearSegment, DirectRelationLinearSourceInput, DirectRelationRoundData,
     DirectRelationRoundOutcome, DirectRelationScalars, MetalDeviceCapabilities, MetalOneHotKernel,
-    MetalRuntime, PackedDecomposeFoldParams, PackedFp128D512FoldIndex,
+    MetalRuntime, PackedDecomposeFoldParams, PackedFp128D512FoldIndex, PackedFp128D512FoldSource,
     FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL,
 };
 use crate::{MetalCommitError, MetalExecutionPolicy, OpeningAccelerationPolicy};
@@ -192,7 +192,7 @@ pub struct MetalOpeningMetrics {
     pub packed_decompose_postprocess_time: Duration,
     /// Complete packed root backend-call wall time.
     pub packed_decompose_total_time: Duration,
-    /// Packed root calls that consumed a commit-retained residue index.
+    /// Packed root calls that used the retained or locally fused residue schedule.
     pub packed_decompose_indexed_calls: usize,
     /// Device-produced balanced digit bytes consumed by the successor commit.
     pub packed_decompose_direct_digit_bytes: usize,
@@ -663,28 +663,21 @@ impl MetalCommitBackend<F> {
             && source
                 .take_opening_acceleration::<DeferredFoldIndex>()
                 .is_some();
-        let deferred_index = if retained_index.is_none() && deferred_requested {
+        let fused_params = if retained_index.is_none() && deferred_requested {
             let opening_plan = opening_index_plan(
                 source.num_rows(),
                 source.num_columns(),
                 plan.num_positions_per_block,
                 blocks_per_column,
             )?;
-            let start = Instant::now();
-            let index = runtime
-                .prepare_packed_fp128_d512_fold_index(source.lanes(), opening_plan.fold)
-                .map_err(MetalCommitError::into_akita)?;
-            self.record_opening_index_preparation(
-                start.elapsed(),
-                index.timings,
-                index.allocation_bytes,
-            )
-            .map_err(MetalCommitError::into_akita)?;
-            Some(index)
+            Some(opening_plan.fold)
         } else {
             None
         };
-        let opening_index = retained_index.as_deref().or(deferred_index.as_ref());
+        let fold_source = retained_index
+            .as_deref()
+            .map(PackedFp128D512FoldSource::Retained)
+            .or_else(|| fused_params.map(PackedFp128D512FoldSource::Fused));
         let dispatch_params = PackedDecomposeFoldParams {
             num_rows: source.num_rows() as u64,
             num_columns: source.num_columns() as u64,
@@ -729,16 +722,16 @@ impl MetalCommitBackend<F> {
         let mut indexed_route = false;
         let outcome = match (
             dense_subring64.as_deref(),
-            opening_index,
+            fold_source,
             balanced_digit_request,
         ) {
-            (Some(dense), Some(index), Some(request)) if indexed_eligible => {
+            (Some(dense), Some(fold_source), Some(request)) if indexed_eligible => {
                 indexed_route = true;
                 runtime
-                    .dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+                    .dispatch_packed_fp128_d512_subring64_decompose_fold_streaming(
                         source.lanes(),
                         dense,
-                        index,
+                        fold_source,
                         dispatch_params,
                         request.num_digits,
                         request.log_basis,
@@ -768,7 +761,6 @@ impl MetalCommitBackend<F> {
                 .map_err(MetalCommitError::into_akita)?,
         };
         drop(retained_index);
-        drop(deferred_index);
         let prepare_time = dispatch_start.duration_since(total_start);
         if let Some(error) = sink_error {
             return Err(error);

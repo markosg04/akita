@@ -40,6 +40,8 @@ const FP128_D512_INDEXED_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME: &str =
     "akita_fp128_d512_indexed_coefficient_packing_reduce";
 const FP128_D512_INDEXED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
     "akita_fp128_d512_indexed_subring64_decompose_fold";
+const FP128_D512_FUSED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_d512_fused_subring64_decompose_fold";
 const FP128_D512_LINEAR_RELATION_PARTIALS_KERNEL_NAME: &str =
     "akita_fp128_d512_linear_relation_partials";
 const FP128_D512_LINEAR_RELATION_REDUCE_KERNEL_NAME: &str =
@@ -161,6 +163,50 @@ fn pack_biased_subring64_challenges(dense_challenges: &[i8]) -> Result<Vec<u32>,
         }
     }
     Ok(packed)
+}
+
+fn validate_packed_fold_index_geometry(
+    params: PackedFoldIndexParams,
+    lane_count: usize,
+) -> Result<(), MetalCommitError> {
+    let expected_lanes = params
+        .num_rows
+        .checked_mul(params.lane_stride)
+        .ok_or(MetalCommitError::ShapeOverflow("fold-index lanes"))?;
+    let expected_tasks = params
+        .blocks_per_column
+        .checked_mul(params.num_columns)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or(MetalCommitError::ShapeOverflow(
+            "fold-index tasks per position",
+        ))?;
+    let expected_tiles = expected_tasks.div_ceil(FP128_D512_FOLD_INDEX_TILE_TASKS as u64);
+    let expected_records = params
+        .num_positions
+        .checked_mul(expected_tiles)
+        .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_TILE_TASKS as u64))
+        .ok_or(MetalCommitError::ShapeOverflow("fold-index records"))?;
+    let expected_counts = params
+        .num_positions
+        .checked_mul(expected_tiles)
+        .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_COUNT_BUCKETS as u64))
+        .ok_or(MetalCommitError::ShapeOverflow("fold-index counts"))?;
+    if params.num_rows == 0
+        || params.num_columns == 0
+        || params.num_columns > params.lane_stride
+        || params.num_positions == 0
+        || params.position_start != 0
+        || params.tasks_per_position != expected_tasks
+        || params.tiles_per_position != expected_tiles
+        || params.record_slots != expected_records
+        || params.count_entries != expected_counts
+        || u64::try_from(lane_count).ok() != Some(expected_lanes)
+    {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 D512 packed fold-index geometry is unsupported".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Metal implementation selected for a one-hot inner commitment.
@@ -673,6 +719,12 @@ pub(crate) struct PackedFp128D512FoldIndex {
     pub(crate) allocation_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PackedFp128D512FoldSource<'a> {
+    Retained(&'a PackedFp128D512FoldIndex),
+    Fused(PackedFoldIndexParams),
+}
+
 pub(crate) struct PackedFp128D512CoefficientPackingIndex {
     records: Buffer,
     offsets: Buffer,
@@ -908,6 +960,7 @@ pub(crate) struct MetalRuntime {
     fp128_d512_indexed_coefficient_packing_pipeline: ComputePipelineState,
     fp128_d512_indexed_coefficient_packing_reduce_pipeline: ComputePipelineState,
     fp128_d512_indexed_subring64_decompose_fold_pipeline: ComputePipelineState,
+    fp128_d512_fused_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_partials_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_reduce_pipeline: ComputePipelineState,
     fp128_d512_linear_relation_reconstruct_pipeline: ComputePipelineState,
@@ -1220,6 +1273,9 @@ impl MetalRuntime {
             )?,
             fp128_d512_indexed_subring64_decompose_fold_pipeline: pipeline(
                 FP128_D512_INDEXED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
+            )?,
+            fp128_d512_fused_subring64_decompose_fold_pipeline: pipeline(
+                FP128_D512_FUSED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
             )?,
             fp128_d512_linear_relation_partials_pipeline: pipeline(
                 FP128_D512_LINEAR_RELATION_PARTIALS_KERNEL_NAME,
@@ -2555,40 +2611,9 @@ impl MetalRuntime {
         params: PackedFoldIndexParams,
     ) -> Result<PackedFp128D512FoldIndex, MetalCommitError> {
         autoreleasepool(|| {
-            let expected_lanes = params
-                .num_rows
-                .checked_mul(params.lane_stride)
-                .ok_or(MetalCommitError::ShapeOverflow("fold-index lanes"))?;
-            let expected_tasks = params
-                .blocks_per_column
-                .checked_mul(params.num_columns)
-                .and_then(|count| count.checked_mul(2))
-                .ok_or(MetalCommitError::ShapeOverflow(
-                    "fold-index tasks per position",
-                ))?;
-            let expected_tiles = expected_tasks.div_ceil(FP128_D512_FOLD_INDEX_TILE_TASKS as u64);
-            let expected_records = params
-                .num_positions
-                .checked_mul(expected_tiles)
-                .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_TILE_TASKS as u64))
-                .ok_or(MetalCommitError::ShapeOverflow("fold-index records"))?;
-            let expected_counts = params
-                .num_positions
-                .checked_mul(expected_tiles)
-                .and_then(|count| count.checked_mul(FP128_D512_FOLD_INDEX_COUNT_BUCKETS as u64))
-                .ok_or(MetalCommitError::ShapeOverflow("fold-index counts"))?;
-            if params.num_rows == 0
-                || params.num_columns == 0
-                || params.num_columns > params.lane_stride
-                || params.num_positions == 0
-                || params.position_start != 0
-                || params.tasks_per_position != expected_tasks
-                || params.tiles_per_position != expected_tiles
-                || params.record_slots != expected_records
-                || params.count_entries != expected_counts
-                || params.fold_digits != 0
+            validate_packed_fold_index_geometry(params, lanes.len())?;
+            if params.fold_digits != 0
                 || params.fold_log_basis != 0
-                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
                 || self
                     .fp128_d512_build_fold_index_pipeline
                     .max_total_threads_per_threadgroup()
@@ -2754,13 +2779,13 @@ impl MetalRuntime {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "the indexed root dispatch keeps source, retained index, challenge, digit, and streaming boundaries explicit"
+        reason = "the packed root dispatch keeps source, challenge, digit, and streaming boundaries explicit"
     )]
-    pub(crate) fn dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+    pub(crate) fn dispatch_packed_fp128_d512_subring64_decompose_fold_streaming(
         &self,
         lanes: &[u8],
         dense_subring64_challenges: &[i8],
-        index: &PackedFp128D512FoldIndex,
+        source: PackedFp128D512FoldSource<'_>,
         params: PackedDecomposeFoldParams,
         fold_digits: usize,
         fold_log_basis: u32,
@@ -2768,10 +2793,6 @@ impl MetalRuntime {
         mut consume: impl FnMut(usize, &[i32], &[i8]),
     ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
-            let expected_lanes = params
-                .num_rows
-                .checked_mul(params.lane_stride)
-                .ok_or(MetalCommitError::ShapeOverflow("indexed fold lanes"))?;
             let expected_dense = params
                 .num_columns
                 .checked_mul(params.blocks_per_column)
@@ -2783,7 +2804,19 @@ impl MetalRuntime {
                 .num_positions
                 .checked_mul(512)
                 .ok_or(MetalCommitError::ShapeOverflow("indexed fold output"))?;
-            let index_params = index.params;
+            let index_params = match source {
+                PackedFp128D512FoldSource::Retained(index) => index.params,
+                PackedFp128D512FoldSource::Fused(params) => params,
+            };
+            validate_packed_fold_index_geometry(index_params, lanes.len())?;
+            let max_threads = match source {
+                PackedFp128D512FoldSource::Retained(_) => self
+                    .fp128_d512_indexed_subring64_decompose_fold_pipeline
+                    .max_total_threads_per_threadgroup(),
+                PackedFp128D512FoldSource::Fused(_) => self
+                    .fp128_d512_fused_subring64_decompose_fold_pipeline
+                    .max_total_threads_per_threadgroup(),
+            };
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
@@ -2792,17 +2825,13 @@ impl MetalRuntime {
                 || fold_digits == 0
                 || !(1..=8).contains(&fold_log_basis)
                 || position_chunk_len == 0
-                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
                 || u64::try_from(dense_subring64_challenges.len()).ok() != Some(expected_dense)
                 || index_params.num_rows != params.num_rows
                 || index_params.num_columns != params.num_columns
                 || index_params.lane_stride != params.lane_stride
                 || index_params.num_positions != params.num_positions
                 || index_params.blocks_per_column != params.blocks_per_column
-                || self
-                    .fp128_d512_indexed_subring64_decompose_fold_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < 256
+                || max_threads < 256
             {
                 return Err(MetalCommitError::UnsupportedShape(
                     "fp128 D512 indexed fold geometry is unsupported".into(),
@@ -2810,6 +2839,10 @@ impl MetalRuntime {
             }
 
             let buffer_start = Instant::now();
+            let lane_buffer = match source {
+                PackedFp128D512FoldSource::Retained(_) => None,
+                PackedFp128D512FoldSource::Fused(_) => Some(self.packed_lane_buffer(lanes)?),
+            };
             let packed_challenges = pack_biased_subring64_challenges(dense_subring64_challenges)?;
             let packed_challenges_buffer = self.shared_buffer_from_slice(&packed_challenges)?;
             let output_count = usize::try_from(params.output_coefficients)
@@ -2867,18 +2900,37 @@ impl MetalRuntime {
                     .and_then(|count| count.checked_mul(fold_digits))
                     .ok_or(MetalCommitError::ShapeOverflow("indexed fold digit offset"))?;
                 let command = self.queue.new_command_buffer();
-                command.set_label("Akita fp128 D512 indexed packed decompose-fold");
+                command.set_label("Akita fp128 D512 packed subring64 decompose-fold");
                 let encoder = command.new_compute_command_encoder();
-                encoder.set_label("Akita fp128 D512 indexed packed decompose-fold");
-                encoder.set_compute_pipeline_state(
-                    &self.fp128_d512_indexed_subring64_decompose_fold_pipeline,
-                );
-                encoder.set_buffer(0, Some(&index.records), 0);
-                encoder.set_buffer(1, Some(&index.counts), 0);
-                encoder.set_buffer(2, Some(&packed_challenges_buffer), 0);
-                encoder.set_buffer(3, Some(&output), output_offset as u64);
-                encoder.set_buffer(4, Some(&digits), digit_offset as u64);
-                set_inline_bytes(encoder, 5, &command_params);
+                encoder.set_label("Akita fp128 D512 packed subring64 decompose-fold");
+                match source {
+                    PackedFp128D512FoldSource::Retained(index) => {
+                        encoder.set_compute_pipeline_state(
+                            &self.fp128_d512_indexed_subring64_decompose_fold_pipeline,
+                        );
+                        encoder.set_buffer(0, Some(&index.records), 0);
+                        encoder.set_buffer(1, Some(&index.counts), 0);
+                        encoder.set_buffer(2, Some(&packed_challenges_buffer), 0);
+                        encoder.set_buffer(3, Some(&output), output_offset as u64);
+                        encoder.set_buffer(4, Some(&digits), digit_offset as u64);
+                        set_inline_bytes(encoder, 5, &command_params);
+                    }
+                    PackedFp128D512FoldSource::Fused(_) => {
+                        let lane_buffer = lane_buffer.as_ref().ok_or_else(|| {
+                            MetalCommitError::UnsupportedShape(
+                                "fused packed fold is missing its lane buffer".into(),
+                            )
+                        })?;
+                        encoder.set_compute_pipeline_state(
+                            &self.fp128_d512_fused_subring64_decompose_fold_pipeline,
+                        );
+                        encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+                        encoder.set_buffer(1, Some(&packed_challenges_buffer), 0);
+                        encoder.set_buffer(2, Some(&output), output_offset as u64);
+                        encoder.set_buffer(3, Some(&digits), digit_offset as u64);
+                        set_inline_bytes(encoder, 4, &command_params);
+                    }
+                }
                 encoder.dispatch_thread_groups(
                     MTLSize::new(position_count as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
@@ -2933,6 +2985,13 @@ impl MetalRuntime {
             let allocation_bytes = output_bytes
                 .checked_add(digit_bytes)
                 .and_then(|bytes| bytes.checked_add(size_of_val(packed_challenges.as_slice())))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        lane_buffer
+                            .as_ref()
+                            .map_or(0, |buffer| usize::from(!buffer.zero_copy) * lanes.len()),
+                    )
+                })
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "indexed fold allocation bytes",
                 ))?;
@@ -6715,10 +6774,10 @@ mod tests {
     }
 
     #[test]
-    fn packed_d512_subring64_decompose_fold_matches_cpu() {
+    fn packed_d512_subring64_decompose_fold_routes_match_cpu() {
         const POSITIONS: usize = 9;
-        const BLOCKS_PER_COLUMN: usize = 1;
-        const COLUMNS: usize = 128;
+        const BLOCKS_PER_COLUMN: usize = 2;
+        const COLUMNS: usize = 129;
         const CHALLENGE_WEIGHT: usize = 4;
         let runtime = MetalRuntime::new().unwrap();
         let num_rows = 2 * POSITIONS * BLOCKS_PER_COLUMN;
@@ -6761,33 +6820,31 @@ mod tests {
             .centered_coefficients;
         let tasks_per_position = BLOCKS_PER_COLUMN * COLUMNS * 2;
         let tiles_per_position = tasks_per_position.div_ceil(256);
+        let fold_params = PackedFoldIndexParams {
+            num_rows: num_rows as u64,
+            num_columns: COLUMNS as u64,
+            lane_stride: COLUMNS as u64,
+            num_positions: POSITIONS as u64,
+            position_start: 0,
+            blocks_per_column: BLOCKS_PER_COLUMN as u64,
+            tasks_per_position: tasks_per_position as u64,
+            tiles_per_position: tiles_per_position as u64,
+            record_slots: (POSITIONS * tiles_per_position * 256) as u64,
+            count_entries: (POSITIONS * tiles_per_position * 8) as u64,
+            output_coefficients: (POSITIONS * 512) as u64,
+            fold_digits: 0,
+            fold_log_basis: 0,
+        };
         let index = runtime
-            .prepare_packed_fp128_d512_fold_index(
-                &lanes,
-                PackedFoldIndexParams {
-                    num_rows: num_rows as u64,
-                    num_columns: COLUMNS as u64,
-                    lane_stride: COLUMNS as u64,
-                    num_positions: POSITIONS as u64,
-                    position_start: 0,
-                    blocks_per_column: BLOCKS_PER_COLUMN as u64,
-                    tasks_per_position: tasks_per_position as u64,
-                    tiles_per_position: tiles_per_position as u64,
-                    record_slots: (POSITIONS * tiles_per_position * 256) as u64,
-                    count_entries: (POSITIONS * tiles_per_position * 8) as u64,
-                    output_coefficients: (POSITIONS * 512) as u64,
-                    fold_digits: 0,
-                    fold_log_basis: 0,
-                },
-            )
+            .prepare_packed_fp128_d512_fold_index(&lanes, fold_params)
             .unwrap();
         let mut indexed_streamed = Vec::new();
         let mut indexed_digits = Vec::new();
         let indexed = runtime
-            .dispatch_indexed_packed_fp128_d512_decompose_fold_streaming(
+            .dispatch_packed_fp128_d512_subring64_decompose_fold_streaming(
                 &lanes,
                 &dense_challenges,
-                &index,
+                PackedFp128D512FoldSource::Retained(&index),
                 params,
                 4,
                 4,
@@ -6795,6 +6852,26 @@ mod tests {
                 |_, coefficients, digits| {
                     indexed_streamed.extend_from_slice(coefficients);
                     indexed_digits.extend_from_slice(digits);
+                },
+            )
+            .unwrap()
+            .centered_coefficients;
+        let mut fused_streamed = Vec::new();
+        let mut fused_digits = Vec::new();
+        let mut fused_chunk_starts = Vec::new();
+        let fused = runtime
+            .dispatch_packed_fp128_d512_subring64_decompose_fold_streaming(
+                &lanes,
+                &dense_challenges,
+                PackedFp128D512FoldSource::Fused(fold_params),
+                params,
+                4,
+                4,
+                4,
+                |position_start, coefficients, digits| {
+                    fused_chunk_starts.push(position_start);
+                    fused_streamed.extend_from_slice(coefficients);
+                    fused_digits.extend_from_slice(digits);
                 },
             )
             .unwrap()
@@ -6832,15 +6909,20 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(indexed, expected);
         assert_eq!(indexed_streamed, expected);
-        for position in 0..POSITIONS {
-            for coefficient in 0..512 {
-                let reconstructed = (0..4).rev().fold(0i32, |value, digit| {
-                    let value_index = position * 4 * 512 + digit * 512 + coefficient;
-                    let value_digit = indexed_digits[value_index];
-                    assert!((-8..8).contains(&value_digit));
-                    value * 16 + i32::from(value_digit)
-                });
-                assert_eq!(reconstructed, expected[position * 512 + coefficient]);
+        assert_eq!(fused, expected);
+        assert_eq!(fused_streamed, expected);
+        assert_eq!(fused_chunk_starts, [0, 4, 8]);
+        for digits in [&indexed_digits, &fused_digits] {
+            for position in 0..POSITIONS {
+                for coefficient in 0..512 {
+                    let reconstructed = (0..4).rev().fold(0i32, |value, digit| {
+                        let value_index = position * 4 * 512 + digit * 512 + coefficient;
+                        let value_digit = digits[value_index];
+                        assert!((-8..8).contains(&value_digit));
+                        value * 16 + i32::from(value_digit)
+                    });
+                    assert_eq!(reconstructed, expected[position * 512 + coefficient]);
+                }
             }
         }
     }

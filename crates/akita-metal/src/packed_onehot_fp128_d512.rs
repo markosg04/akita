@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_fold_index_is_built_and_consumed_at_opening() {
+    fn deferred_fold_index_is_fused_at_opening() {
         const ROWS: usize = 4_096;
         const COLUMNS: usize = 3;
         const CAPACITY: usize = 32;
@@ -871,11 +871,7 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(sink.chunks > 0);
         let metrics = metal.last_opening_metrics().unwrap().unwrap();
-        let expected_bytes =
-            super::opening_index_plan(ROWS, COLUMNS, POSITIONS_PER_BLOCK, blocks_per_column)
-                .unwrap()
-                .fold_allocation_bytes;
-        assert_eq!(metrics.opening_index_bytes, expected_bytes);
+        assert_eq!(metrics.opening_index_bytes, 0);
         assert_eq!(metrics.packed_decompose_indexed_calls, 1);
         assert!(poly
             .view::<512>()

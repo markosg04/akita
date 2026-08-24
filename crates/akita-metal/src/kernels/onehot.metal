@@ -1566,6 +1566,155 @@ inline void akita_store_indexed_fold_value(
     }
 }
 
+kernel void akita_fp128_d512_fused_subring64_decompose_fold(
+    device const uchar *lanes [[buffer(0)]],
+    device const uint *packed_challenges [[buffer(1)]],
+    device int *output [[buffer(2)]],
+    device char *digits [[buffer(3)]],
+    constant PackedFoldIndexParams &params [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup uint partitioned_tasks[8 * 8 * 32];
+    threadgroup ushort partition_counts[8 * 8];
+
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    uint residue = simdgroup;
+    uint source_group = simd_lane >> 3u;
+    uint destination_owner = simd_lane & 7u;
+    int4 accumulator_even = int4(0);
+    int4 accumulator_odd = int4(0);
+    ulong local_position = (ulong)threadgroup_index.x;
+    ulong position = params.position_start + local_position;
+
+    for (ulong tile = 0ul; tile < params.tiles_per_position; ++tile) {
+        ulong task = tile * 256ul + (ulong)thread_index;
+        bool valid = task < params.tasks_per_position;
+        uint hot = 0u;
+        uint source_high = 0u;
+        uint challenge = 0u;
+        if (valid) {
+            ulong trace_block = task / (params.num_columns * 2ul);
+            ulong block_local = task % (params.num_columns * 2ul);
+            ulong column = block_local >> 1ul;
+            ulong row_in_ring = block_local & 1ul;
+            ulong ring = trace_block * params.num_positions + position;
+            ulong row = ring * 2ul + row_in_ring;
+            hot = (uint)lanes[row * params.lane_stride + column];
+            valid = hot != 0u;
+            source_high = (uint)(row_in_ring * 32ul) + (hot >> 3u);
+            challenge = (uint)(column * params.blocks_per_column + trace_block);
+        }
+
+        for (uint low = 0u; low < 8u; ++low) {
+            bool selected = valid && ((hot & 7u) == low);
+            uint selected_mask = uint(
+                simd_ballot(selected).operator unsigned long());
+            uint partition = simdgroup * 8u + low;
+            if (simd_lane == 0u) {
+                partition_counts[partition] = (ushort)popcount(selected_mask);
+            }
+            if (selected) {
+                uint preceding_mask = simd_lane == 0u
+                    ? 0u
+                    : ((1u << simd_lane) - 1u);
+                uint rank = popcount(selected_mask & preceding_mask);
+                partitioned_tasks[partition * 32u + rank] =
+                    (challenge << 6u) | source_high;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint producer = 0u; producer < 8u; ++producer) {
+            uint partition = producer * 8u + residue;
+            uint count = (uint)partition_counts[partition];
+            uint group_count = count > source_group
+                ? (count + 3u - source_group) / 4u
+                : 0u;
+            uint packed_even = 0u;
+            uint packed_odd = 0u;
+            uint iterations = (count + 3u) / 4u;
+            for (uint iteration = 0u; iteration < iterations; ++iteration) {
+                uint relative_index = 4u * iteration + source_group;
+                bool record_valid = relative_index < count;
+                uint record = 0u;
+                uint source_lane = 8u * source_group;
+                if (simd_lane == source_lane && record_valid) {
+                    record = partitioned_tasks[
+                        partition * 32u + relative_index];
+                }
+                record = simd_shuffle(record, source_lane);
+                if (record_valid) {
+                    uint source = record & 63u;
+                    uint challenge_index = record >> 6u;
+                    uint source_phase = source & 7u;
+                    uint source_rotation = source >> 3u;
+                    uint challenge_quad =
+                        (destination_owner + 8u - source_rotation) & 7u;
+                    uint word = packed_challenges[
+                        (ulong)challenge_index * 64ul
+                            + (ulong)source_phase * 8ul
+                            + (ulong)challenge_quad];
+                    uint even = word & 0x0f0f0f0fu;
+                    uint odd = (word >> 4u) & 0x0f0f0f0fu;
+                    uint destination_base = 8u * destination_owner;
+                    uint negative_count = source > destination_base
+                        ? min(source - destination_base, 8u)
+                        : 0u;
+                    packed_even += akita_apply_negacyclic_signs(
+                        even, (negative_count + 1u) >> 1u);
+                    packed_odd += akita_apply_negacyclic_signs(
+                        odd, negative_count >> 1u);
+                }
+            }
+            int bias = (int)(2u * group_count);
+            accumulator_even += int4(
+                (int)(packed_even & 255u) - bias,
+                (int)((packed_even >> 8u) & 255u) - bias,
+                (int)((packed_even >> 16u) & 255u) - bias,
+                (int)((packed_even >> 24u) & 255u) - bias);
+            accumulator_odd += int4(
+                (int)(packed_odd & 255u) - bias,
+                (int)((packed_odd >> 8u) & 255u) - bias,
+                (int)((packed_odd >> 16u) & 255u) - bias,
+                (int)((packed_odd >> 24u) & 255u) - bias);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    int4 total_even =
+        akita_simd_shuffle_int4(accumulator_even, destination_owner)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 8u)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 16u)
+        + akita_simd_shuffle_int4(accumulator_even, destination_owner + 24u);
+    int4 total_odd =
+        akita_simd_shuffle_int4(accumulator_odd, destination_owner)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 8u)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 16u)
+        + akita_simd_shuffle_int4(accumulator_odd, destination_owner + 24u);
+    if (source_group != 0u) {
+        return;
+    }
+
+    ulong output_base = local_position * 512ul;
+    ulong digit_position_base = local_position * params.fold_digits * 512ul;
+    for (uint component = 0u; component < 4u; ++component) {
+        uint destination_high = 8u * destination_owner + 2u * component;
+        uint coefficient = residue + 8u * destination_high;
+        akita_store_indexed_fold_value(
+            output, digits, output_base, digit_position_base, coefficient,
+            total_even[component], params.fold_digits,
+            (uint)params.fold_log_basis);
+        destination_high += 1u;
+        coefficient = residue + 8u * destination_high;
+        akita_store_indexed_fold_value(
+            output, digits, output_base, digit_position_base, coefficient,
+            total_odd[component], params.fold_digits,
+            (uint)params.fold_log_basis);
+    }
+}
+
 kernel void akita_fp128_d512_indexed_subring64_decompose_fold(
     device const uint *records [[buffer(0)]],
     device const ushort *counts [[buffer(1)]],
