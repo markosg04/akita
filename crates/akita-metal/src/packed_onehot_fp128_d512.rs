@@ -17,8 +17,9 @@ use crate::prepared::MetalPreparedSetup;
 use crate::runtime::{
     DispatchOutcome, MetalRuntime, PackedCoefficientPackingIndexParams, PackedFoldIndexParams,
     PackedOneHotCommitParams, FP128_D512_FOLD_INDEX_COUNT_BUCKETS,
-    FP128_D512_FOLD_INDEX_TILE_TASKS, FP128_D512_PACKING_INDEX_BUCKET_OFFSETS,
-    FP128_D512_PACKING_INDEX_TILE_POSITIONS, FP128_D512_POSITION_PARTIALS,
+    FP128_D512_FOLD_INDEX_TILE_TASKS, FP128_D512_MAX_ROWS_PER_PARTIAL,
+    FP128_D512_PACKING_INDEX_BUCKET_OFFSETS, FP128_D512_PACKING_INDEX_TILE_POSITIONS,
+    FP128_D512_POSITION_PARTIALS,
 };
 use crate::MetalCommitError;
 
@@ -388,9 +389,14 @@ pub(crate) fn validate_shape<const D: usize>(
         .into_akita());
     }
     let positions_per_partial = plan.num_positions_per_block / POSITION_PARTIALS;
-    if !positions_per_partial.is_multiple_of(4) {
+    if !positions_per_partial.is_multiple_of(4)
+        || positions_per_partial
+            .checked_mul(2)
+            .is_none_or(|rows| rows > FP128_D512_MAX_ROWS_PER_PARTIAL)
+    {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 D512 partials must contain whole four-position matrix tiles".into(),
+            "fp128 D512 partials must contain whole four-position matrix tiles within the signed-digit bound"
+                .into(),
         )
         .into_akita());
     }
@@ -953,6 +959,14 @@ mod tests {
     }
 
     #[test]
+    fn wide_digit_bound_fits_largest_position_partial() {
+        let max_rows = (1usize << 18) * 2 / super::POSITION_PARTIALS;
+        let max_digit_sum = max_rows * u16::MAX as usize;
+        assert_eq!(max_rows, super::FP128_D512_MAX_ROWS_PER_PARTIAL);
+        assert!(max_digit_sum < i32::MAX as usize);
+    }
+
+    #[test]
     fn exact_fp128_d512_panels_match_cpu_on_sparse_boundaries() {
         const ROWS: usize = 4_096;
         const CAPACITY: usize = 32;
@@ -1004,7 +1018,7 @@ mod tests {
                 .unwrap();
             assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
-            assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+            assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512WidePanels);
             assert_eq!(metrics.cpu_work_units, columns);
             assert_eq!(metrics.metal_work_units, columns * 31);
         }
@@ -1061,7 +1075,7 @@ mod tests {
 
         assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
-        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512WidePanels);
         assert_eq!(metrics.cpu_work_units, 8);
         assert_eq!(metrics.metal_work_units, 504);
     }

@@ -41,12 +41,15 @@ struct AkitaWideAccumulator {
     int4 high_digits;
 };
 
-struct AkitaTransposedFp128Accumulator {
-    uint4 word_0;
-    uint4 word_1;
-    uint4 word_2;
-    uint4 word_3;
-    int4 wraps;
+struct AkitaTransposedWideFp128Accumulator {
+    int4 low_0;
+    int4 high_0;
+    int4 low_1;
+    int4 high_1;
+    int4 low_2;
+    int4 high_2;
+    int4 low_3;
+    int4 high_3;
 };
 
 struct OneHotCommitParams {
@@ -682,55 +685,65 @@ inline AkitaFp128 akita_reduce_wide(AkitaWideAccumulator accumulator) {
         : akita_sub(base, correction);
 }
 
-inline AkitaTransposedFp128Accumulator akita_transposed_fp128_zero() {
-    AkitaTransposedFp128Accumulator result;
-    result.word_0 = uint4(0u);
-    result.word_1 = uint4(0u);
-    result.word_2 = uint4(0u);
-    result.word_3 = uint4(0u);
-    result.wraps = int4(0);
+inline AkitaTransposedWideFp128Accumulator akita_transposed_wide_fp128_zero() {
+    AkitaTransposedWideFp128Accumulator result;
+    result.low_0 = int4(0);
+    result.high_0 = int4(0);
+    result.low_1 = int4(0);
+    result.high_1 = int4(0);
+    result.low_2 = int4(0);
+    result.high_2 = int4(0);
+    result.low_3 = int4(0);
+    result.high_3 = int4(0);
     return result;
 }
 
-inline AkitaFp128 akita_reduce_transposed_fp128(
-    AkitaTransposedFp128Accumulator accumulator,
+inline AkitaFp128 akita_reduce_transposed_wide_fp128(
+    AkitaTransposedWideFp128Accumulator accumulator,
     uint component)
 {
-    AkitaFp128 base;
-    base.limb = uint4(
-        accumulator.word_0[component],
-        accumulator.word_1[component],
-        accumulator.word_2[component],
-        accumulator.word_3[component]);
-    AkitaCorrection canonical = akita_add_offset(base);
-    base = akita_select(canonical.carry != 0u, canonical.value, base);
-
-    long wraps = (long)accumulator.wraps[component];
-    if (wraps == 0l) {
-        return base;
-    }
-    ulong magnitude = (ulong)(wraps > 0l ? wraps : -wraps);
-    ulong correction_word = magnitude * (ulong)AKITA_OFFSET;
-    AkitaFp128 correction = akita_zero();
-    correction.limb[0] = (uint)correction_word;
-    correction.limb[1] = (uint)(correction_word >> 32u);
-    return wraps > 0l
-        ? akita_add(base, correction)
-        : akita_sub(base, correction);
+    AkitaWideAccumulator scalar;
+    scalar.low_digits = int4(
+        accumulator.low_0[component],
+        accumulator.low_1[component],
+        accumulator.low_2[component],
+        accumulator.low_3[component]);
+    scalar.high_digits = int4(
+        accumulator.high_0[component],
+        accumulator.high_1[component],
+        accumulator.high_2[component],
+        accumulator.high_3[component]);
+    return akita_reduce_wide(scalar);
 }
 
-inline uint4 akita_add_transposed_word(
-    uint4 lhs,
-    uint4 rhs,
-    thread uint4 &carry)
+inline void akita_wide_add_positive(
+    thread int4 &low,
+    thread int4 &high,
+    uint4 value)
 {
-    uint4 base = lhs + rhs;
-    uint4 sum = base + carry;
-    carry = select(
-        uint4(0u),
-        uint4(1u),
-        (base < lhs) | (sum < base));
-    return sum;
+    low += int4(value & uint4(0xffffu));
+    high += int4(value >> 16u);
+}
+
+inline void akita_wide_add_negative(
+    thread int4 &low,
+    thread int4 &high,
+    uint4 value)
+{
+    low -= int4(value & uint4(0xffffu));
+    high -= int4(value >> 16u);
+}
+
+inline void akita_wide_add_mixed(
+    thread int4 &low,
+    thread int4 &high,
+    uint4 value,
+    bool4 positive)
+{
+    int4 low_digits = int4(value & uint4(0xffffu));
+    int4 high_digits = int4(value >> 16u);
+    low += select(-low_digits, low_digits, positive);
+    high += select(-high_digits, high_digits, positive);
 }
 
 kernel void akita_packed_onehot_reduce_partials(
@@ -4101,72 +4114,61 @@ inline uint4 akita_fp128_d512_gather_word(
 }
 
 inline void akita_fp128_d512_accumulate_value(
-    thread AkitaTransposedFp128Accumulator &accumulator,
+    thread AkitaTransposedWideFp128Accumulator &accumulator,
     uint4 value_0,
     uint4 value_1,
     uint4 value_2,
     uint4 value_3,
     bool4 positive)
 {
-    uint4 carry = select(uint4(1u), uint4(0u), positive);
-    accumulator.word_0 = akita_add_transposed_word(
-        accumulator.word_0, select(~value_0, value_0, positive), carry);
-    accumulator.word_1 = akita_add_transposed_word(
-        accumulator.word_1, select(~value_1, value_1, positive), carry);
-    accumulator.word_2 = akita_add_transposed_word(
-        accumulator.word_2, select(~value_2, value_2, positive), carry);
-    accumulator.word_3 = akita_add_transposed_word(
-        accumulator.word_3, select(~value_3, value_3, positive), carry);
-    int4 carry_words = int4(carry);
-    accumulator.wraps += select(carry_words - int4(1), carry_words, positive);
+    akita_wide_add_mixed(accumulator.low_0, accumulator.high_0, value_0, positive);
+    akita_wide_add_mixed(accumulator.low_1, accumulator.high_1, value_1, positive);
+    akita_wide_add_mixed(accumulator.low_2, accumulator.high_2, value_2, positive);
+    akita_wide_add_mixed(accumulator.low_3, accumulator.high_3, value_3, positive);
 }
 
 inline void akita_fp128_d512_accumulate_positive(
-    thread AkitaTransposedFp128Accumulator &accumulator,
+    thread AkitaTransposedWideFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
     uint matrix_base,
     uint4 sources)
 {
-    uint4 carry = uint4(0u);
-    accumulator.word_0 = akita_add_transposed_word(
-        accumulator.word_0,
-        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
-    accumulator.word_1 = akita_add_transposed_word(
-        accumulator.word_1,
-        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
-    accumulator.word_2 = akita_add_transposed_word(
-        accumulator.word_2,
-        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
-    accumulator.word_3 = akita_add_transposed_word(
-        accumulator.word_3,
-        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
-    accumulator.wraps += int4(carry);
+    akita_wide_add_positive(
+        accumulator.low_0, accumulator.high_0,
+        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources));
+    akita_wide_add_positive(
+        accumulator.low_1, accumulator.high_1,
+        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources));
+    akita_wide_add_positive(
+        accumulator.low_2, accumulator.high_2,
+        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources));
+    akita_wide_add_positive(
+        accumulator.low_3, accumulator.high_3,
+        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources));
 }
 
 inline void akita_fp128_d512_accumulate_negative(
-    thread AkitaTransposedFp128Accumulator &accumulator,
+    thread AkitaTransposedWideFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
     uint matrix_base,
     uint4 sources)
 {
-    uint4 carry = uint4(1u);
-    accumulator.word_0 = akita_add_transposed_word(
-        accumulator.word_0,
-        ~akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources), carry);
-    accumulator.word_1 = akita_add_transposed_word(
-        accumulator.word_1,
-        ~akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources), carry);
-    accumulator.word_2 = akita_add_transposed_word(
-        accumulator.word_2,
-        ~akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources), carry);
-    accumulator.word_3 = akita_add_transposed_word(
-        accumulator.word_3,
-        ~akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources), carry);
-    accumulator.wraps += int4(carry) - int4(1);
+    akita_wide_add_negative(
+        accumulator.low_0, accumulator.high_0,
+        akita_fp128_d512_gather_word(matrix, 0u, matrix_base, sources));
+    akita_wide_add_negative(
+        accumulator.low_1, accumulator.high_1,
+        akita_fp128_d512_gather_word(matrix, 1u, matrix_base, sources));
+    akita_wide_add_negative(
+        accumulator.low_2, accumulator.high_2,
+        akita_fp128_d512_gather_word(matrix, 2u, matrix_base, sources));
+    akita_wide_add_negative(
+        accumulator.low_3, accumulator.high_3,
+        akita_fp128_d512_gather_word(matrix, 3u, matrix_base, sources));
 }
 
 inline void akita_fp128_d512_accumulate_mixed(
-    thread AkitaTransposedFp128Accumulator &accumulator,
+    thread AkitaTransposedWideFp128Accumulator &accumulator,
     threadgroup const uint *matrix,
     uint matrix_base,
     uint4 sources,
@@ -4182,8 +4184,8 @@ inline void akita_fp128_d512_accumulate_mixed(
 }
 
 inline void akita_fp128_d512_accumulate_pair(
-    thread AkitaTransposedFp128Accumulator &accumulator_0,
-    thread AkitaTransposedFp128Accumulator &accumulator_1,
+    thread AkitaTransposedWideFp128Accumulator &accumulator_0,
+    thread AkitaTransposedWideFp128Accumulator &accumulator_1,
     threadgroup const uint *matrix,
     uint simd_lane,
     uint coefficient_band,
@@ -4234,7 +4236,7 @@ inline void akita_fp128_d512_accumulate_pair(
 
 inline void akita_store_fp128_d512_group(
     device AkitaFp128 *partials,
-    AkitaTransposedFp128Accumulator accumulator,
+    AkitaTransposedWideFp128Accumulator accumulator,
     uint coefficient_group,
     uint column,
     uint block_in_column,
@@ -4249,13 +4251,13 @@ inline void akita_store_fp128_d512_group(
     uint output_base = (block * n_a + a_row) * 512u + coefficient_group * 128u;
     uint partial_base = position_partial * output_coefficients + output_base;
     partials[partial_base + simd_lane] =
-        akita_reduce_transposed_fp128(accumulator, 0u);
+        akita_reduce_transposed_wide_fp128(accumulator, 0u);
     partials[partial_base + simd_lane + 32u] =
-        akita_reduce_transposed_fp128(accumulator, 1u);
+        akita_reduce_transposed_wide_fp128(accumulator, 1u);
     partials[partial_base + simd_lane + 64u] =
-        akita_reduce_transposed_fp128(accumulator, 2u);
+        akita_reduce_transposed_wide_fp128(accumulator, 2u);
     partials[partial_base + simd_lane + 96u] =
-        akita_reduce_transposed_fp128(accumulator, 3u);
+        akita_reduce_transposed_wide_fp128(accumulator, 3u);
 }
 
 kernel void akita_packed_onehot_commit_fp128_d512_panels(
@@ -4299,8 +4301,10 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     ulong matrix_cursor =
         ((ulong)a_row * params.positions_per_block + (ulong)partial_start) * 512ul;
 
-    AkitaTransposedFp128Accumulator accumulator_0 = akita_transposed_fp128_zero();
-    AkitaTransposedFp128Accumulator accumulator_1 = akita_transposed_fp128_zero();
+    AkitaTransposedWideFp128Accumulator accumulator_0 =
+        akita_transposed_wide_fp128_zero();
+    AkitaTransposedWideFp128Accumulator accumulator_1 =
+        akita_transposed_wide_fp128_zero();
     uint coefficient_group_0 = coefficient_band * 2u;
     uint coefficient_group_1 = coefficient_group_0 + 1u;
 
