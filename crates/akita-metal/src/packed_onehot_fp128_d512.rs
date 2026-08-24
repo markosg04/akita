@@ -953,6 +953,32 @@ mod tests {
     }
 
     #[test]
+    fn sign_quadrant_classification_matches_negacyclic_rotation() {
+        for odd_row in [false, true] {
+            let coefficient_band = usize::from(odd_row);
+            let band_base = coefficient_band * 256;
+            for local_shift in [1, 127, 128, 129, 255] {
+                let shift = usize::from(odd_row) * 256 + local_shift;
+                let boundary_accumulator = usize::from(local_shift >= 128);
+                let uniform_accumulator = 1 - boundary_accumulator;
+                let uniform_positive = uniform_accumulator > boundary_accumulator;
+                let coefficient_start = band_base + uniform_accumulator * 128;
+                for coefficient in coefficient_start..coefficient_start + 128 {
+                    let generic_positive = coefficient >= shift;
+                    assert_eq!(generic_positive, uniform_positive);
+                    let generic_source = (coefficient + 512 - shift) & 511;
+                    let specialized_source = if uniform_positive {
+                        coefficient - shift
+                    } else {
+                        coefficient + 512 - shift
+                    };
+                    assert_eq!(generic_source, specialized_source);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exact_fp128_d512_panels_match_cpu_on_sparse_boundaries() {
         const ROWS: usize = 4_096;
         const CAPACITY: usize = 32;
@@ -1004,7 +1030,10 @@ mod tests {
                 .unwrap();
             assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
             let metrics = metal.last_commit_metrics().unwrap().unwrap();
-            assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+            assert_eq!(
+                metrics.kernel,
+                MetalOneHotKernel::PackedFp128D512SignQuadrants
+            );
             assert_eq!(metrics.cpu_work_units, columns);
             assert_eq!(metrics.metal_work_units, columns * 31);
         }
@@ -1061,7 +1090,10 @@ mod tests {
 
         assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
-        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+        assert_eq!(
+            metrics.kernel,
+            MetalOneHotKernel::PackedFp128D512SignQuadrants
+        );
         assert_eq!(metrics.cpu_work_units, 8);
         assert_eq!(metrics.metal_work_units, 504);
     }
