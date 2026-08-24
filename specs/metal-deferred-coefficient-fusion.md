@@ -119,3 +119,23 @@ the local latency bar fails, or complete proving saves less than 0.5 s. A miss
 must identify occupancy, partition work, or allocation latency as the broken
 assumption before reranking; do not tune the 32-tile window, fold kernel,
 protocol, or evaluator inside this candidate.
+
+## Result
+
+Candidate `2a96663be` passed exact retained/fused parity for two full windows, a
+partial window, zero selectors, padded columns, maximal skew, canonical roots,
+and one-shot marker consumption. The compiled pipeline reported exactly 30,720
+threadgroup bytes. Fibonacci T25 verified in 5.89 s against the 6.16 s guard.
+
+The single BTreeMap T28 treatment verified and removed all 18,182,307,840 index
+bytes, but completed in 49.30 s at 80.09 GiB RSS. This saves 0.12 s from the
+49.42 s accepted mean and 0.25 s from the slower parent, missing the 49.05 s
+gate. Opening command wall fell only to 4.443 s while aggregate opening GPU time
+rose from 2.82--2.84 s to 3.126 s.
+
+Reject and revert the candidate in `f90101e64`. The 0.99 s index subtimer was
+not an additive critical-path term: much of its private capacity was nonresident
+and its lifecycle overlapped other opening work. The fused kernel's one-group
+occupancy added device time that erased most of the exposed saving. Further
+window tuning is closed; later models must use disjoint critical-path intervals
+rather than adding the index subtimer to the consumer.
