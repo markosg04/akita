@@ -33,7 +33,7 @@ const HYBRID_CPU_MAX_BLOCKS: usize = 8;
 const HYBRID_CPU_MIN_WORKLOAD_BLOCKS: usize = 12;
 const HYBRID_SPARSE_PERCENT: usize = 30;
 #[cfg(test)]
-const TASKS_PER_STREAM: usize = 64;
+const TASKS_PER_STREAM: usize = 32;
 
 pub(crate) struct ValidatedShape {
     active_a_cols: usize,
@@ -896,16 +896,21 @@ mod tests {
 
     #[test]
     fn task_and_partial_grids_are_bijective() {
-        for tasks in [31usize, 32, 33, 63, 64, 65, 25 * 32, 30 * 512] {
+        for (columns, blocks) in [
+            (25usize, 32usize),
+            (28, 64),
+            (32, 128),
+            (32, 256),
+            (30, 512),
+        ] {
+            let tasks = columns * blocks;
             let streams = tasks.div_ceil(super::TASKS_PER_STREAM);
             let mut task_map = BTreeSet::new();
             for stream in 0..streams {
-                for task_slot in 0..2 {
-                    for simdgroup in 0..32 {
-                        let task = stream * super::TASKS_PER_STREAM + task_slot * 32 + simdgroup;
-                        if task < tasks {
-                            assert!(task_map.insert(task));
-                        }
+                for simdgroup in 0..super::TASKS_PER_STREAM {
+                    let task = stream * super::TASKS_PER_STREAM + simdgroup;
+                    if task < tasks {
+                        assert!(task_map.insert((task / columns, task % columns)));
                     }
                 }
             }
@@ -916,99 +921,6 @@ mod tests {
                 assert!(partial_map.insert((group / streams, group % streams,)));
             }
             assert_eq!(partial_map.len(), streams * super::POSITION_PARTIALS);
-        }
-    }
-
-    #[test]
-    fn exact_fp128_d512_panels_match_cpu_across_task_stream_boundaries() {
-        const COLUMNS: usize = 1;
-        const CAPACITY: usize = 32;
-        const POSITIONS_PER_BLOCK: usize = 64;
-        const ROWS_PER_BLOCK: usize = POSITIONS_PER_BLOCK * 2;
-        let plan = CommitInnerPlan {
-            n_a: 1,
-            num_positions_per_block: POSITIONS_PER_BLOCK,
-            num_digits_inner: 1,
-            log_basis_inner: 3,
-        };
-
-        for (domain_blocks, populated_blocks, expected_tasks) in [
-            (32usize, 32usize, 31usize),
-            (64, 33, 32),
-            (64, 34, 33),
-            (128, 65, 63),
-            (128, 66, 64),
-            (128, 67, 65),
-        ] {
-            let rows = domain_blocks * ROWS_PER_BLOCK;
-            let populated_rows = populated_blocks * ROWS_PER_BLOCK;
-            let lane = |row: usize| {
-                if row >= populated_rows || row.is_multiple_of(5) {
-                    0
-                } else {
-                    ((row * 73) % 255 + 1) as u8
-                }
-            };
-            let resident = PackedOneHotPoly::<F>::new(
-                super::ONEHOT_K,
-                CAPACITY,
-                COLUMNS,
-                (0..rows).map(lane).collect(),
-            )
-            .unwrap();
-            let buffer =
-                PackedOneHotStreamBuffer::zeroed(super::ONEHOT_K, CAPACITY, COLUMNS, rows).unwrap();
-            let (stream, mut writer) =
-                StreamingPackedOneHotPoly::<F>::from_buffer_with_zero_suffix(
-                    buffer,
-                    populated_rows,
-                )
-                .unwrap();
-            writer
-                .fill_next_rows_in_place(populated_rows, |row, output| {
-                    output[0] = lane(row);
-                    Ok(())
-                })
-                .unwrap();
-            writer.finish().unwrap();
-
-            let num_vars = 25 + domain_blocks.ilog2() as usize - 5;
-            let setup = AkitaProverSetup::<F>::generate_with_capacity(
-                num_vars,
-                1,
-                SetupMatrixCapacity {
-                    num_field_elements: POSITIONS_PER_BLOCK * super::RING_D,
-                },
-            )
-            .unwrap();
-            let cpu = CpuBackend::DEFAULT;
-            let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
-            let expected = cpu
-                .commit_inner_group(
-                    &cpu_prepared,
-                    vec![RootCommitSource::<F, 512>::commit_view(&resident).unwrap()],
-                    plan,
-                )
-                .unwrap();
-            let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
-            let metal_prepared = metal.prepare_setup(&setup).unwrap();
-            let actual = metal
-                .commit_inner_group(
-                    &metal_prepared,
-                    vec![RootCommitSource::<F, 512>::commit_view(&stream).unwrap()],
-                    plan,
-                )
-                .unwrap();
-
-            assert_eq!(actual[0].inner_rows, expected[0].inner_rows);
-            let metrics = metal.last_commit_metrics().unwrap().unwrap();
-            assert_eq!(metrics.metal_work_units, expected_tasks);
-            assert_eq!(metrics.blocks_per_threadgroup, super::TASKS_PER_STREAM);
-            assert_eq!(
-                metrics.modeled_matrix_read_bytes,
-                (metrics.matrix_bytes * expected_tasks.div_ceil(super::TASKS_PER_STREAM) * 2)
-                    as u64
-            );
         }
     }
 

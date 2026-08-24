@@ -4268,7 +4268,7 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
 {
     threadgroup uint shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS * 4];
 
-    constexpr uint tasks_per_stream = 64u;
+    constexpr uint tasks_per_stream = 32u;
     constexpr uint threads_per_threadgroup = 1024u;
     constexpr uint positions_per_tile = 4u;
     constexpr uint rows_per_tile = 8u;
@@ -4291,27 +4291,16 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     uint rows_per_partial = positions_per_partial * 2u;
     uint rows_per_block = (uint)params.positions_per_block * 2u;
     uint output_coefficients = (uint)params.output_coefficients;
-    uint dispatch_task_0 = stream * tasks_per_stream + simdgroup;
-    uint dispatch_task_1 = dispatch_task_0 + 32u;
-    bool task_0_active = dispatch_task_0 < num_tasks;
-    bool task_1_active = dispatch_task_1 < num_tasks;
-    uint global_task_0 = (uint)params.task_offset + dispatch_task_0;
-    uint global_task_1 = (uint)params.task_offset + dispatch_task_1;
-    uint task_block_0 = global_task_0 / live_columns;
-    uint task_block_1 = global_task_1 / live_columns;
-    uint task_column_0 = global_task_0 % live_columns;
-    uint task_column_1 = global_task_1 % live_columns;
+    uint dispatch_task = stream * tasks_per_stream + simdgroup;
+    bool simdgroup_active = dispatch_task < num_tasks;
+    uint global_task = (uint)params.task_offset + dispatch_task;
+    uint task_block = global_task / live_columns;
+    uint task_column = global_task % live_columns;
     ulong matrix_cursor =
         ((ulong)a_row * params.positions_per_block + (ulong)partial_start) * 512ul;
 
-    AkitaTransposedFp128Accumulator task_0_accumulator_0 =
-        akita_transposed_fp128_zero();
-    AkitaTransposedFp128Accumulator task_0_accumulator_1 =
-        akita_transposed_fp128_zero();
-    AkitaTransposedFp128Accumulator task_1_accumulator_0 =
-        akita_transposed_fp128_zero();
-    AkitaTransposedFp128Accumulator task_1_accumulator_1 =
-        akita_transposed_fp128_zero();
+    AkitaTransposedFp128Accumulator accumulator_0 = akita_transposed_fp128_zero();
+    AkitaTransposedFp128Accumulator accumulator_1 = akita_transposed_fp128_zero();
     uint coefficient_group_0 = coefficient_band * 2u;
     uint coefficient_group_1 = coefficient_group_0 + 1u;
 
@@ -4331,76 +4320,39 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint task_0_hot = 0u;
-        if (task_0_active && simd_lane < rows_per_tile) {
-            ulong trace_row = (ulong)task_block_0 * (ulong)rows_per_block
+        uint local_hot = 0u;
+        if (simdgroup_active && simd_lane < rows_per_tile) {
+            ulong trace_row = (ulong)task_block * (ulong)rows_per_block
                 + (ulong)position_partial * (ulong)rows_per_partial
                 + (ulong)tile * (ulong)rows_per_tile
                 + (ulong)simd_lane;
-            task_0_hot = (uint)lanes[
+            local_hot = (uint)lanes[
                 (trace_row - params.lane_row_offset) * params.lane_stride
-                    + (ulong)task_column_0];
+                    + (ulong)task_column];
         }
-        uint task_0_selected = uint(
-            simd_ballot(task_0_hot != 0u).operator unsigned long());
-        while (task_0_selected != 0u) {
-            uint selected_lane = ctz(task_0_selected);
-            uint selected_hot = simd_shuffle(task_0_hot, selected_lane);
+        uint selected = uint(
+            simd_ballot(local_hot != 0u).operator unsigned long());
+        while (selected != 0u) {
+            uint selected_lane = ctz(selected);
+            uint selected_hot = simd_shuffle(local_hot, selected_lane);
             uint local_position = selected_lane >> 1u;
             bool odd_row = (selected_lane & 1u) != 0u;
             akita_fp128_d512_accumulate_pair(
-                task_0_accumulator_0, task_0_accumulator_1, shared_matrix, simd_lane,
+                accumulator_0, accumulator_1, shared_matrix, simd_lane,
                 coefficient_band, local_position, selected_hot, odd_row);
-            task_0_selected &= task_0_selected - 1u;
-        }
-
-        uint task_1_hot = 0u;
-        if (task_1_active && simd_lane < rows_per_tile) {
-            ulong trace_row = (ulong)task_block_1 * (ulong)rows_per_block
-                + (ulong)position_partial * (ulong)rows_per_partial
-                + (ulong)tile * (ulong)rows_per_tile
-                + (ulong)simd_lane;
-            task_1_hot = (uint)lanes[
-                (trace_row - params.lane_row_offset) * params.lane_stride
-                    + (ulong)task_column_1];
-        }
-        uint task_1_selected = uint(
-            simd_ballot(task_1_hot != 0u).operator unsigned long());
-        while (task_1_selected != 0u) {
-            uint selected_lane = ctz(task_1_selected);
-            uint selected_hot = simd_shuffle(task_1_hot, selected_lane);
-            uint local_position = selected_lane >> 1u;
-            bool odd_row = (selected_lane & 1u) != 0u;
-            akita_fp128_d512_accumulate_pair(
-                task_1_accumulator_0, task_1_accumulator_1, shared_matrix, simd_lane,
-                coefficient_band, local_position, selected_hot, odd_row);
-            task_1_selected &= task_1_selected - 1u;
+            selected &= selected - 1u;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         matrix_cursor += (ulong)PACKED_FP128_D512_PANEL_TILE_ELEMENTS;
     }
 
-    if (task_0_active) {
+    if (simdgroup_active) {
         akita_store_fp128_d512_group(
-            partials, task_0_accumulator_0, coefficient_group_0,
-            task_column_0, task_block_0,
+            partials, accumulator_0, coefficient_group_0, task_column, task_block,
             blocks_per_column, (uint)params.n_a, a_row, position_partial,
             output_coefficients, simd_lane);
         akita_store_fp128_d512_group(
-            partials, task_0_accumulator_1, coefficient_group_1,
-            task_column_0, task_block_0,
-            blocks_per_column, (uint)params.n_a, a_row, position_partial,
-            output_coefficients, simd_lane);
-    }
-    if (task_1_active) {
-        akita_store_fp128_d512_group(
-            partials, task_1_accumulator_0, coefficient_group_0,
-            task_column_1, task_block_1,
-            blocks_per_column, (uint)params.n_a, a_row, position_partial,
-            output_coefficients, simd_lane);
-        akita_store_fp128_d512_group(
-            partials, task_1_accumulator_1, coefficient_group_1,
-            task_column_1, task_block_1,
+            partials, accumulator_1, coefficient_group_1, task_column, task_block,
             blocks_per_column, (uint)params.n_a, a_row, position_partial,
             output_coefficients, simd_lane);
     }
