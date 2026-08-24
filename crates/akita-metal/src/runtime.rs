@@ -36,6 +36,8 @@ const FP128_D512_BUILD_COEFFICIENT_PACKING_INDEX_KERNEL_NAME: &str =
     "akita_fp128_d512_build_coefficient_packing_index";
 const FP128_D512_INDEXED_COEFFICIENT_PACKING_KERNEL_NAME: &str =
     "akita_fp128_d512_indexed_coefficient_packing_partials";
+const FP128_D512_FUSED_COEFFICIENT_PACKING_KERNEL_NAME: &str =
+    "akita_fp128_d512_fused_coefficient_packing_partials";
 const FP128_D512_INDEXED_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME: &str =
     "akita_fp128_d512_indexed_coefficient_packing_reduce";
 const FP128_D512_INDEXED_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
@@ -104,6 +106,10 @@ const FP128_COEFFICIENT_PACKING_THREADS: usize = 256;
 pub(crate) const FP128_D512_PACKING_INDEX_TILE_POSITIONS: usize = 256;
 pub(crate) const FP128_D512_PACKING_INDEX_BUCKET_OFFSETS: usize = 33;
 const FP128_D512_PACKING_TILES_PER_CHUNK: usize = 32;
+const FP128_D512_FUSED_COEFFICIENT_PACKING_THREADGROUP_BYTES: usize =
+    FP128_D512_PACKING_TILES_PER_CHUNK
+        * (FP128_D512_PACKING_INDEX_TILE_POSITIONS * (size_of::<u8>() + size_of::<u16>())
+            + 32 * (size_of::<u32>() + size_of::<u16>()));
 const FP128_PACKED_COEFFICIENT_PACKING_PARTIAL_THREADS: usize = 256;
 const FP128_PACKED_COEFFICIENT_PACKING_REDUCE_THREADS: usize = 256;
 pub(crate) const FP128_D512_FOLD_INDEX_TILE_TASKS: usize = 256;
@@ -207,6 +213,54 @@ fn validate_packed_fold_index_geometry(
         ));
     }
     Ok(())
+}
+
+fn validate_packed_coefficient_index_geometry(
+    params: PackedCoefficientPackingIndexParams,
+    lane_count: usize,
+) -> Result<u64, MetalCommitError> {
+    let expected_lanes = params
+        .num_rows
+        .checked_mul(params.lane_stride)
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index lanes"))?;
+    let expected_tiles = params
+        .num_positions
+        .div_ceil(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64);
+    let expected_streams = params
+        .blocks_per_column
+        .checked_mul(params.num_columns)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index streams"))?;
+    let expected_layouts = expected_streams
+        .checked_mul(expected_tiles)
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index layouts"))?;
+    let expected_records = expected_layouts
+        .checked_mul(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64)
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index records"))?;
+    let expected_offsets = expected_layouts
+        .checked_mul(FP128_D512_PACKING_INDEX_BUCKET_OFFSETS as u64)
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index offsets"))?;
+    let expected_groups = params
+        .blocks_per_column
+        .checked_mul(expected_tiles)
+        .ok_or(MetalCommitError::ShapeOverflow("packing-index groups"))?;
+    if params.num_rows == 0
+        || params.num_columns == 0
+        || params.num_columns > 32
+        || params.num_columns > params.lane_stride
+        || params.num_positions == 0
+        || params.blocks_per_column == 0
+        || params.position_tiles != expected_tiles
+        || params.record_slots != expected_records
+        || params.offset_entries != expected_offsets
+        || u64::try_from(lane_count).ok() != Some(expected_lanes)
+        || expected_groups > u64::from(u32::MAX)
+    {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 D512 coefficient-packing index geometry is unsupported".into(),
+        ));
+    }
+    Ok(expected_groups)
 }
 
 /// Metal implementation selected for a one-hot inner commitment.
@@ -733,6 +787,12 @@ pub(crate) struct PackedFp128D512CoefficientPackingIndex {
     pub(crate) allocation_bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PackedFp128D512CoefficientPackingSource<'a> {
+    Retained(&'a PackedFp128D512CoefficientPackingIndex),
+    Fused(PackedCoefficientPackingIndexParams),
+}
+
 pub(crate) struct D512LinearRelationDispatchOutcome {
     pub(crate) coefficients: Vec<Fp128Limbs>,
     pub(crate) timings: DispatchTimings,
@@ -958,6 +1018,7 @@ pub(crate) struct MetalRuntime {
     fp128_d512_build_fold_index_pipeline: ComputePipelineState,
     fp128_d512_build_coefficient_packing_index_pipeline: ComputePipelineState,
     fp128_d512_indexed_coefficient_packing_pipeline: ComputePipelineState,
+    fp128_d512_fused_coefficient_packing_pipeline: ComputePipelineState,
     fp128_d512_indexed_coefficient_packing_reduce_pipeline: ComputePipelineState,
     fp128_d512_indexed_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_fused_subring64_decompose_fold_pipeline: ComputePipelineState,
@@ -1267,6 +1328,9 @@ impl MetalRuntime {
             )?,
             fp128_d512_indexed_coefficient_packing_pipeline: pipeline(
                 FP128_D512_INDEXED_COEFFICIENT_PACKING_KERNEL_NAME,
+            )?,
+            fp128_d512_fused_coefficient_packing_pipeline: pipeline(
+                FP128_D512_FUSED_COEFFICIENT_PACKING_KERNEL_NAME,
             )?,
             fp128_d512_indexed_coefficient_packing_reduce_pipeline: pipeline(
                 FP128_D512_INDEXED_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME,
@@ -2254,14 +2318,19 @@ impl MetalRuntime {
         })
     }
 
-    pub(crate) fn dispatch_fp128_indexed_packed_onehot_coefficient_packing(
+    pub(crate) fn dispatch_fp128_bucketed_packed_onehot_coefficient_packing(
         &self,
-        index: &PackedFp128D512CoefficientPackingIndex,
+        lanes: &[u8],
+        source: PackedFp128D512CoefficientPackingSource<'_>,
         combined_weights: &[Fp128Limbs],
         params: PackedOneHotCoefficientPackingParams,
     ) -> Result<CoefficientPackingDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
-            let index_params = index.params;
+            let index_params = match source {
+                PackedFp128D512CoefficientPackingSource::Retained(index) => index.params,
+                PackedFp128D512CoefficientPackingSource::Fused(params) => params,
+            };
+            validate_packed_coefficient_index_geometry(index_params, lanes.len())?;
             let expected_blocks = params
                 .column_capacity
                 .checked_mul(params.blocks_per_column)
@@ -2301,6 +2370,21 @@ impl MetalRuntime {
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "indexed coefficient-packing partials",
                 ))?;
+            let (partial_max_threads, partial_threadgroup_bytes) = match source {
+                PackedFp128D512CoefficientPackingSource::Retained(_) => (
+                    self.fp128_d512_indexed_coefficient_packing_pipeline
+                        .max_total_threads_per_threadgroup(),
+                    None,
+                ),
+                PackedFp128D512CoefficientPackingSource::Fused(_) => (
+                    self.fp128_d512_fused_coefficient_packing_pipeline
+                        .max_total_threads_per_threadgroup(),
+                    Some(
+                        self.fp128_d512_fused_coefficient_packing_pipeline
+                            .static_threadgroup_memory_length(),
+                    ),
+                ),
+            };
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.column_capacity
@@ -2325,10 +2409,10 @@ impl MetalRuntime {
                     != params
                         .positions_per_block
                         .div_ceil(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64)
-                || self
-                    .fp128_d512_indexed_coefficient_packing_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < FP128_COEFFICIENT_PACKING_THREADS as u64
+                || partial_max_threads < FP128_COEFFICIENT_PACKING_THREADS as u64
+                || partial_threadgroup_bytes.is_some_and(|bytes| {
+                    bytes != FP128_D512_FUSED_COEFFICIENT_PACKING_THREADGROUP_BYTES as u64
+                })
                 || self
                     .fp128_d512_indexed_coefficient_packing_reduce_pipeline
                     .max_total_threads_per_threadgroup()
@@ -2340,6 +2424,12 @@ impl MetalRuntime {
             }
 
             let buffer_start = Instant::now();
+            let lane_buffer = match source {
+                PackedFp128D512CoefficientPackingSource::Retained(_) => None,
+                PackedFp128D512CoefficientPackingSource::Fused(_) => {
+                    Some(self.packed_lane_buffer(lanes)?)
+                }
+            };
             let weights = self.shared_buffer_from_slice(combined_weights)?;
             let output_count = usize::try_from(params.output_coefficients).map_err(|_| {
                 MetalCommitError::ShapeOverflow("indexed coefficient-packing output")
@@ -2358,16 +2448,36 @@ impl MetalRuntime {
             let buffer_setup = buffer_start.elapsed();
 
             let command = self.queue.new_command_buffer();
-            command.set_label("Akita fp128 indexed coefficient packing");
+            command.set_label("Akita fp128 coefficient packing");
             let encoder = command.new_compute_command_encoder();
-            encoder
-                .set_compute_pipeline_state(&self.fp128_d512_indexed_coefficient_packing_pipeline);
-            encoder.set_buffer(0, Some(&index.records), 0);
-            encoder.set_buffer(1, Some(&index.offsets), 0);
-            encoder.set_buffer(2, Some(&weights), 0);
-            encoder.set_buffer(3, Some(&partials), 0);
-            set_inline_bytes(encoder, 4, &index_params);
-            set_inline_bytes(encoder, 5, &params);
+            match source {
+                PackedFp128D512CoefficientPackingSource::Retained(index) => {
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_d512_indexed_coefficient_packing_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&index.records), 0);
+                    encoder.set_buffer(1, Some(&index.offsets), 0);
+                    encoder.set_buffer(2, Some(&weights), 0);
+                    encoder.set_buffer(3, Some(&partials), 0);
+                    set_inline_bytes(encoder, 4, &index_params);
+                    set_inline_bytes(encoder, 5, &params);
+                }
+                PackedFp128D512CoefficientPackingSource::Fused(_) => {
+                    let lane_buffer = lane_buffer.as_ref().ok_or_else(|| {
+                        MetalCommitError::UnsupportedShape(
+                            "fused coefficient packing is missing its lane buffer".into(),
+                        )
+                    })?;
+                    encoder.set_compute_pipeline_state(
+                        &self.fp128_d512_fused_coefficient_packing_pipeline,
+                    );
+                    encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
+                    encoder.set_buffer(1, Some(&weights), 0);
+                    encoder.set_buffer(2, Some(&partials), 0);
+                    set_inline_bytes(encoder, 3, &index_params);
+                    set_inline_bytes(encoder, 4, &params);
+                }
+            }
             encoder.dispatch_thread_groups(
                 MTLSize::new(partial_groups, 1, 1),
                 MTLSize::new(FP128_COEFFICIENT_PACKING_THREADS as u64, 1, 1),
@@ -2406,6 +2516,15 @@ impl MetalRuntime {
                 allocation_bytes: output_bytes
                     .checked_add(size_of_val(combined_weights))
                     .and_then(|bytes| bytes.checked_add(partial_bytes))
+                    .and_then(|bytes| {
+                        bytes.checked_add(lane_buffer.as_ref().map_or(0, |buffer| {
+                            if buffer.zero_copy {
+                                0
+                            } else {
+                                lanes.len()
+                            }
+                        }))
+                    })
                     .ok_or(MetalCommitError::ShapeOverflow(
                         "indexed coefficient-packing allocation bytes",
                     ))?,
@@ -2682,46 +2801,11 @@ impl MetalRuntime {
         params: PackedCoefficientPackingIndexParams,
     ) -> Result<PackedFp128D512CoefficientPackingIndex, MetalCommitError> {
         autoreleasepool(|| {
-            let expected_lanes = params
-                .num_rows
-                .checked_mul(params.lane_stride)
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index lanes"))?;
-            let expected_tiles = params
-                .num_positions
-                .div_ceil(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64);
-            let expected_streams = params
-                .blocks_per_column
-                .checked_mul(params.num_columns)
-                .and_then(|count| count.checked_mul(2))
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index streams"))?;
-            let expected_layouts = expected_streams
-                .checked_mul(expected_tiles)
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index layouts"))?;
-            let expected_records = expected_layouts
-                .checked_mul(FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64)
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index records"))?;
-            let expected_offsets = expected_layouts
-                .checked_mul(FP128_D512_PACKING_INDEX_BUCKET_OFFSETS as u64)
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index offsets"))?;
-            let expected_groups = params
-                .blocks_per_column
-                .checked_mul(expected_tiles)
-                .ok_or(MetalCommitError::ShapeOverflow("packing-index groups"))?;
-            if params.num_rows == 0
-                || params.num_columns == 0
-                || params.num_columns > 32
-                || params.num_columns > params.lane_stride
-                || params.num_positions == 0
-                || params.blocks_per_column == 0
-                || params.position_tiles != expected_tiles
-                || params.record_slots != expected_records
-                || params.offset_entries != expected_offsets
-                || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
-                || expected_groups > u64::from(u32::MAX)
-                || self
-                    .fp128_d512_build_coefficient_packing_index_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64
+            let expected_groups = validate_packed_coefficient_index_geometry(params, lanes.len())?;
+            if self
+                .fp128_d512_build_coefficient_packing_index_pipeline
+                .max_total_threads_per_threadgroup()
+                < FP128_D512_PACKING_INDEX_TILE_POSITIONS as u64
             {
                 return Err(MetalCommitError::UnsupportedShape(
                     "fp128 D512 coefficient-packing index geometry is unsupported".into(),
