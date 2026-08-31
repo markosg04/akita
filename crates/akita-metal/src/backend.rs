@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use akita_algebra::eq_poly::EqPolynomial;
 use akita_algebra::split_eq::GruenSplitEq;
 use akita_algebra::CyclotomicRing;
+use akita_field::parallel::*;
 use akita_field::{AkitaError, ExtField, MulBaseUnreduced};
 use akita_prover::compute::{
     BalancedDigitRequest, CompressionComputeBackend, CompressionRowsProducts, ComputeBackendSetup,
@@ -509,6 +510,39 @@ impl MetalCommitBackend<F> {
             .runtime()
             .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
         let matrix = prepared.matrix(runtime, 512, 1, active_a_cols)?;
+        Ok(MetalMatrixPrewarmMetrics {
+            matrix_bytes: matrix.bytes,
+            cache_hit: matrix.cache_hit,
+            prepare_time: matrix.prepare_time,
+        })
+    }
+
+    /// Make the largest root-or-successor commitment matrix prefix resident.
+    pub fn prewarm_packed_fp128_commitment_matrix(
+        &self,
+        prepared: &MetalPreparedSetup<F>,
+        root_active_a_cols: usize,
+        outer_rows: usize,
+        outer_active_a_cols: usize,
+    ) -> Result<MetalMatrixPrewarmMetrics, AkitaError> {
+        let root_fields = root_active_a_cols.checked_mul(512).ok_or_else(|| {
+            MetalCommitError::ShapeOverflow("packed root matrix fields").into_akita()
+        })?;
+        let outer_fields = outer_rows
+            .checked_mul(outer_active_a_cols)
+            .and_then(|count| count.checked_mul(64))
+            .ok_or_else(|| {
+                MetalCommitError::ShapeOverflow("packed outer matrix fields").into_akita()
+            })?;
+        let (ring_d, n_a, active_a_cols) = if outer_fields > root_fields {
+            (64, outer_rows, outer_active_a_cols)
+        } else {
+            (512, 1, root_active_a_cols)
+        };
+        let runtime = self
+            .runtime()
+            .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
+        let matrix = prepared.matrix(runtime, ring_d, n_a, active_a_cols)?;
         Ok(MetalMatrixPrewarmMetrics {
             matrix_bytes: matrix.bytes,
             cache_hit: matrix.cache_hit,
@@ -1957,7 +1991,7 @@ impl MetalCommitBackend<F> {
             && num_cols != 0
             && log_basis == 3
             && digit_vectors.iter().all(|digits| digits.len() == num_cols)
-            && digit_vectors.iter().all(|digits| {
+            && cfg_iter!(digit_vectors).all(|digits| {
                 digits
                     .iter()
                     .flatten()
@@ -1973,7 +2007,17 @@ impl MetalCommitBackend<F> {
             });
         let (row_batches, used_metal, metal_timings, allocation_bytes) = if use_metal {
             if let Some(runtime) = self.runtime() {
-                let matrix = prepared.matrix(runtime, D, row_len, num_cols)?;
+                let matrix = {
+                    let span = tracing::info_span!(
+                        "MetalDigitRows::matrix_prepare",
+                        num_vectors = digit_vectors.len(),
+                        row_len,
+                        num_cols,
+                        ring_dimension = D,
+                    );
+                    let _entered = span.enter();
+                    prepared.matrix(runtime, D, row_len, num_cols)?
+                };
                 let output_coefficients = digit_vectors
                     .len()
                     .checked_mul(row_len)
@@ -2057,57 +2101,68 @@ impl MetalCommitBackend<F> {
                     .ok_or_else(|| {
                         MetalCommitError::ShapeOverflow("digit-row allocation bytes").into_akita()
                     })?;
-                let coefficients = outcome
-                    .coefficients
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, value)| F::from_device(value, index))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(MetalCommitError::into_akita)?;
-                let coefficients_per_vector = row_len.checked_mul(D).ok_or_else(|| {
-                    MetalCommitError::ShapeOverflow("digit-row vector output").into_akita()
-                })?;
-                let negacyclic_coefficients = coefficients
-                    .get(..output_coefficients)
-                    .ok_or(AkitaError::InvalidProof)?;
-                let row_batches = negacyclic_coefficients
-                    .chunks_exact(coefficients_per_vector)
-                    .map(|vector| {
-                        vector
-                            .chunks_exact(D)
-                            .map(CyclotomicRing::from_slice)
-                            .collect()
-                    })
-                    .collect::<Vec<_>>();
-                let quotient_batches = if retain_quotients {
-                    let quotient_coefficients = coefficients
-                        .get(output_coefficients..)
-                        .filter(|values| values.len() == output_coefficients)
+                let products = {
+                    let span = tracing::info_span!(
+                        "MetalDigitRows::reconstruct",
+                        coefficients = outcome.coefficients.len(),
+                        num_vectors = digit_vectors.len(),
+                        row_len,
+                        ring_dimension = D,
+                        retain_quotients,
+                    );
+                    let _entered = span.enter();
+                    let coefficients = outcome
+                        .coefficients
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| F::from_device(value, index))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(MetalCommitError::into_akita)?;
+                    let coefficients_per_vector = row_len.checked_mul(D).ok_or_else(|| {
+                        MetalCommitError::ShapeOverflow("digit-row vector output").into_akita()
+                    })?;
+                    let negacyclic_coefficients = coefficients
+                        .get(..output_coefficients)
                         .ok_or(AkitaError::InvalidProof)?;
-                    Some(
-                        quotient_coefficients
-                            .chunks_exact(coefficients_per_vector)
-                            .map(|vector| {
-                                vector
-                                    .chunks_exact(D)
-                                    .map(CyclotomicRing::from_slice)
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    None
+                    let row_batches = negacyclic_coefficients
+                        .chunks_exact(coefficients_per_vector)
+                        .map(|vector| {
+                            vector
+                                .chunks_exact(D)
+                                .map(CyclotomicRing::from_slice)
+                                .collect()
+                        })
+                        .collect::<Vec<_>>();
+                    let quotient_batches = if retain_quotients {
+                        let quotient_coefficients = coefficients
+                            .get(output_coefficients..)
+                            .filter(|values| values.len() == output_coefficients)
+                            .ok_or(AkitaError::InvalidProof)?;
+                        Some(
+                            quotient_coefficients
+                                .chunks_exact(coefficients_per_vector)
+                                .map(|vector| {
+                                    vector
+                                        .chunks_exact(D)
+                                        .map(CyclotomicRing::from_slice)
+                                        .collect::<Vec<_>>()
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+                    row_batches
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, negacyclic)| DigitRowsProducts {
+                            negacyclic,
+                            quotients: quotient_batches
+                                .as_ref()
+                                .and_then(|batches| batches.get(index).cloned()),
+                        })
+                        .collect()
                 };
-                let products = row_batches
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, negacyclic)| DigitRowsProducts {
-                        negacyclic,
-                        quotients: quotient_batches
-                            .as_ref()
-                            .and_then(|batches| batches.get(index).cloned()),
-                    })
-                    .collect();
                 (products, true, Some(timings), allocation_bytes)
             } else {
                 (
@@ -2666,6 +2721,53 @@ mod tests {
         let runtime = metal.runtime().unwrap();
 
         assert!(runtime.supports_fp128_d64_digit_rows::<64>(2, 1, 1_409_024, true));
+    }
+
+    #[test]
+    fn fp128_d64_digit_rows_partial_width_is_maximal_i32_safe() {
+        let worst_limb_sum_per_column = 64u64 * 4 * u64::from(u16::MAX);
+        let width = FP128_D64_DIGIT_ROWS_COLUMNS_PER_PARTIAL as u64;
+
+        assert!(width * worst_limb_sum_per_column <= i32::MAX as u64);
+        assert!((width + 1) * worst_limb_sum_per_column > i32::MAX as u64);
+    }
+
+    #[test]
+    fn packed_commitment_matrix_prewarm_selects_the_larger_outer_prefix() {
+        const ROOT_COLUMNS: usize = 64;
+        const OUTER_ROWS: usize = 2;
+        const OUTER_COLUMNS: usize = 1_024;
+        const OUTER_FIELDS: usize = OUTER_ROWS * OUTER_COLUMNS * 64;
+
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            20,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: OUTER_FIELDS,
+            },
+        )
+        .unwrap();
+        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let prepared = metal.prepare_setup(&setup).unwrap();
+
+        let first = metal
+            .prewarm_packed_fp128_commitment_matrix(
+                &prepared,
+                ROOT_COLUMNS,
+                OUTER_ROWS,
+                OUTER_COLUMNS,
+            )
+            .unwrap();
+        assert!(!first.cache_hit);
+        assert_eq!(first.matrix_bytes, OUTER_FIELDS * size_of::<Fp128Limbs>());
+        assert_eq!(prepared.matrix_cache_entries().unwrap(), 1);
+
+        let outer = prepared
+            .matrix(metal.runtime().unwrap(), 64, OUTER_ROWS, OUTER_COLUMNS)
+            .unwrap();
+        assert!(outer.cache_hit);
+        assert_eq!(outer.prepare_time, Duration::ZERO);
+        assert_eq!(prepared.matrix_cache_entries().unwrap(), 1);
     }
 
     #[test]

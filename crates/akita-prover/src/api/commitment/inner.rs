@@ -71,6 +71,17 @@ where
     let n_a = plan.n_a;
     let inners = backend.commit_inner_group(prepared, sources, plan)?;
     validate_commit_inner_group_len(source_count, inners.len())?;
+    let span = tracing::info_span!(
+        "commit_inner_successor_decompose",
+        source_count,
+        num_live_blocks,
+        n_a,
+        num_digits_open,
+        log_basis,
+        source_ring_dimension = D_A,
+        digit_ring_dimension = D_B,
+    );
+    let _entered = span.enter();
     cfg_into_iter!(inners)
         .map(|inner| -> Result<(RingVec<F>, DigitBlocks), AkitaError> {
             validate_commit_inner_shape::<F, D_A>(&inner, num_live_blocks, n_a)?;
@@ -105,13 +116,38 @@ where
     let expected_rows = geometry.logical_output_rows(n_b)?;
     let polynomial_planes = validate_outer_slice_digits::<D_B>(polynomial_digits, geometry)?;
     let mut slice_inputs = Vec::with_capacity(geometry.slice_count().get());
-    for_each_outer_slice_input::<D_B>(polynomial_planes, geometry, |input| {
-        slice_inputs.push(input.to_vec());
-        Ok(())
-    })?;
+    {
+        let span = tracing::info_span!(
+            "commit_outer_slice_materialize",
+            slice_count = geometry.slice_count().get(),
+            physical_input_width = geometry.physical_input_width(),
+            digit_ring_dimension = D_B,
+        );
+        let _entered = span.enter();
+        for_each_outer_slice_input::<D_B>(polynomial_planes, geometry, |input| {
+            slice_inputs.push(input.to_vec());
+            Ok(())
+        })?;
+    }
     let input_views = slice_inputs.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let row_batches =
-        backend.digit_rows_products_batch::<D_B>(prepared, n_b, &input_views, log_basis)?;
+    let input_bytes = input_views
+        .iter()
+        .try_fold(0usize, |total, input| {
+            total.checked_add(std::mem::size_of_val(*input))
+        })
+        .ok_or_else(|| AkitaError::InvalidSetup("B slice input byte count overflow".into()))?;
+    let row_batches = {
+        let span = tracing::info_span!(
+            "commit_outer_slice_rows",
+            input_bytes,
+            input_vectors = input_views.len(),
+            n_b,
+            log_basis,
+            digit_ring_dimension = D_B,
+        );
+        let _entered = span.enter();
+        backend.digit_rows_products_batch::<D_B>(prepared, n_b, &input_views, log_basis)?
+    };
     let mut stacked = Vec::with_capacity(expected_rows);
     let retain_quotients = row_batches
         .iter()

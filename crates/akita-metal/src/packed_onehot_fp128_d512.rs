@@ -32,8 +32,17 @@ const HYBRID_CPU_DENSE_RATE_DIVISOR: usize = 24;
 const HYBRID_CPU_MAX_BLOCKS: usize = 8;
 const HYBRID_CPU_MIN_WORKLOAD_BLOCKS: usize = 12;
 const HYBRID_SPARSE_PERCENT: usize = 30;
+const FIVE_STREAM_MAX_POSITIONS: usize = 1 << 16;
 #[cfg(test)]
 const TASKS_PER_STREAM: usize = 32;
+
+pub(crate) fn packed_streams_per_command(num_positions: usize) -> usize {
+    if num_positions <= FIVE_STREAM_MAX_POSITIONS {
+        5
+    } else {
+        1
+    }
+}
 
 pub(crate) struct ValidatedShape {
     active_a_cols: usize,
@@ -176,6 +185,7 @@ pub(crate) trait PackedCommitInput: Sync {
         runtime: &MetalRuntime,
         matrix: &Buffer,
         params: PackedOneHotCommitParams,
+        streams_per_command: usize,
     ) -> Result<DispatchOutcome, MetalCommitError>;
 }
 
@@ -235,8 +245,9 @@ impl<const D: usize> PackedCommitInput for PackedOneHotView<'_, F, D> {
         runtime: &MetalRuntime,
         matrix: &Buffer,
         params: PackedOneHotCommitParams,
+        streams_per_command: usize,
     ) -> Result<DispatchOutcome, MetalCommitError> {
-        runtime.dispatch_packed_onehot(matrix, (*self).lanes(), params)
+        runtime.dispatch_packed_onehot(matrix, (*self).lanes(), params, streams_per_command)
     }
 }
 
@@ -286,8 +297,9 @@ impl<const D: usize> PackedCommitInput for StreamingPackedOneHotView<F, D> {
         runtime: &MetalRuntime,
         matrix: &Buffer,
         params: PackedOneHotCommitParams,
+        streams_per_command: usize,
     ) -> Result<DispatchOutcome, MetalCommitError> {
-        runtime.dispatch_streaming_packed_onehot(matrix, self, params)
+        runtime.dispatch_streaming_packed_onehot(matrix, self, params, streams_per_command)
     }
 }
 
@@ -437,6 +449,27 @@ pub(crate) fn commit_validated<const D: usize>(
     plan: CommitInnerPlan,
     shape: ValidatedShape,
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
+    let streams_per_command = packed_streams_per_command(shape.active_a_cols);
+    commit_validated_with_schedule::<D>(
+        backend,
+        prepared,
+        runtime,
+        source,
+        plan,
+        shape,
+        streams_per_command,
+    )
+}
+
+fn commit_validated_with_schedule<const D: usize>(
+    backend: &MetalCommitBackend<F>,
+    prepared: &MetalPreparedSetup<F>,
+    runtime: &MetalRuntime,
+    source: &impl PackedCommitInput,
+    plan: CommitInnerPlan,
+    shape: ValidatedShape,
+    streams_per_command: usize,
+) -> Result<CommitInnerWitness<F>, AkitaError> {
     let total_start = Instant::now();
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
     let rows_per_block = plan
@@ -501,7 +534,8 @@ pub(crate) fn commit_validated<const D: usize>(
                 )
             })
         });
-        let metal_result = source.dispatch(runtime, matrix.buffer.as_ref(), params);
+        let metal_result =
+            source.dispatch(runtime, matrix.buffer.as_ref(), params, streams_per_command);
         let cpu_result = cpu_worker.map(|worker| {
             worker.join().map_err(|_| {
                 AkitaError::InvalidSetup("hybrid CPU root commit worker panicked".into())
@@ -747,6 +781,12 @@ mod tests {
             self.chunks += 1;
             Ok(())
         }
+    }
+
+    #[test]
+    fn packed_root_size_dispatch_batches_only_lower_scale() {
+        assert_eq!(super::packed_streams_per_command(1 << 16), 5);
+        assert_eq!(super::packed_streams_per_command((1 << 16) + 1), 1);
     }
 
     #[test]
@@ -1058,7 +1098,6 @@ mod tests {
                 plan,
             )
             .unwrap();
-
         assert_eq!(cpu_output[0].inner_rows, metal_output[0].inner_rows);
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
         assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);

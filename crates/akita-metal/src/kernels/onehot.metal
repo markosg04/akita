@@ -653,6 +653,15 @@ inline void akita_wide_accumulate(
     accumulator.high_digits += sign * int4(value.limb >> 16u);
 }
 
+inline void akita_wide_accumulate_scaled(
+    thread AkitaWideAccumulator &accumulator,
+    AkitaFp128 value,
+    int scale)
+{
+    accumulator.low_digits += scale * int4(value.limb & uint4(0xffffu));
+    accumulator.high_digits += scale * int4(value.limb >> 16u);
+}
+
 inline AkitaFp128 akita_reduce_wide(AkitaWideAccumulator accumulator) {
     AkitaFp128 base;
     long carry = 0l;
@@ -798,17 +807,19 @@ kernel void akita_fp128_d64_digit_rows_partials(
 
         for (uint digit_coefficient = 0u; digit_coefficient < 64u; ++digit_coefficient) {
             int digit = (int)digit_ring[digit_coefficient];
-            uint magnitude = (uint)(digit < 0 ? -digit : digit);
-            bool positive = digit > 0;
+            if (digit == 0) {
+                continue;
+            }
             bool wraps = digit_coefficient > coefficient;
             uint source_coefficient =
                 (coefficient + 64u - digit_coefficient) & 63u;
             AkitaFp128 value = matrix_ring[source_coefficient];
-            for (uint repeat = 0u; repeat < magnitude; ++repeat) {
-                akita_wide_accumulate(accumulator, value, wraps ? !positive : positive);
-                if (params.retain_quotients != 0ul && wraps) {
-                    akita_wide_accumulate(quotient, value, positive);
-                }
+            akita_wide_accumulate_scaled(
+                accumulator,
+                value,
+                wraps ? -digit : digit);
+            if (params.retain_quotients != 0ul && wraps) {
+                akita_wide_accumulate_scaled(quotient, value, digit);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
