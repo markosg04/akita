@@ -6050,10 +6050,13 @@ impl MetalRuntime {
                 .and_then(|count| count.checked_mul(params.n_a))
                 .and_then(|count| count.checked_mul(params.ring_d))
                 .ok_or(MetalCommitError::ShapeOverflow("packed output"))?;
+            let supported_source = matches!(
+                (params.onehot_k, params.column_capacity),
+                (16, 64) | (256, 32)
+            );
             if lane_count != source.lane_count() as u64
                 || params.ring_d != 512
-                || params.onehot_k != 256
-                || params.column_capacity != 32
+                || !supported_source
                 || params.num_columns == 0
                 || params.num_columns > params.column_capacity
                 || params.lane_stride != params.num_columns
@@ -6061,7 +6064,8 @@ impl MetalRuntime {
                 || params.num_digits_inner != 1
                 || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
                 || !params.positions_per_partial.is_multiple_of(4)
-                || !matches!(params.blocks_per_column, 32 | 64 | 128 | 256 | 512)
+                || !params.blocks_per_column.is_power_of_two()
+                || params.blocks_per_column > 512
                 || params.full_blocks_per_column > params.blocks_per_column
                 || params.boundary_columns != 0
                 || params.num_blocks != expected_tasks
@@ -6151,7 +6155,8 @@ impl MetalRuntime {
                 let final_task = task_offset + dispatch_params.dispatch_tasks - 1;
                 let first_block = task_offset / params.num_columns;
                 let final_block = final_task / params.num_columns;
-                let rows_per_block = params.positions_per_block * 2;
+                let rows_per_position = params.ring_d / params.onehot_k;
+                let rows_per_block = params.positions_per_block * rows_per_position;
                 let first_row = first_block * rows_per_block;
                 let final_row = (final_block + 1) * rows_per_block;
                 let first_row = usize::try_from(first_row)
