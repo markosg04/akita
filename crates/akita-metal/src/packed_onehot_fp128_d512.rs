@@ -1,0 +1,302 @@
+use std::mem::size_of;
+use std::time::{Duration, Instant};
+
+use akita_error::AkitaError;
+use akita_prover::compute::CommitInnerPlan;
+use akita_prover::CommitInnerWitness;
+use akita_types::RingVec;
+
+use crate::backend::{MetalBackend, MetalCommitMetrics};
+use crate::field::{Fp128Limbs, MetalField, F};
+use crate::onehot::to_u64;
+use crate::packed_onehot::PackedOneHotCommitView;
+use crate::prepared::MetalPreparedSetup;
+use crate::runtime::{
+    MetalOneHotKernel, MetalRuntime, PackedOneHotCommitParams, FP128_D512_POSITION_PARTIALS,
+};
+use crate::MetalCommitError;
+
+const RING_D: usize = 512;
+const ONEHOT_K: usize = 256;
+const COLUMN_CAPACITY: usize = 32;
+const INNER_RANK: usize = 1;
+const FIVE_STREAM_MAX_POSITIONS: usize = 1 << 16;
+
+pub(crate) struct ValidatedShape {
+    active_a_cols: usize,
+    output_coefficients: usize,
+    positions_per_partial: usize,
+    blocks_per_column: usize,
+    live_columns: usize,
+}
+
+fn packed_streams_per_command(num_positions: usize) -> usize {
+    if num_positions <= FIVE_STREAM_MAX_POSITIONS {
+        5
+    } else {
+        1
+    }
+}
+
+pub(crate) fn validate_shape<const D: usize>(
+    source: PackedOneHotCommitView<'_>,
+    plan: CommitInnerPlan,
+) -> Result<ValidatedShape, AkitaError> {
+    if D != RING_D
+        || source.onehot_k() != ONEHOT_K
+        || source.column_capacity() != COLUMN_CAPACITY
+        || !(1..=COLUMN_CAPACITY).contains(&source.num_columns())
+        || plan.n_a != INNER_RANK
+        || plan.num_digits_inner != 1
+        || plan.num_positions_per_block == 0
+        || !plan
+            .num_positions_per_block
+            .is_multiple_of(FP128_D512_POSITION_PARTIALS)
+    {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 Metal D512 commit requires K256, 1..=32 live columns, capacity 32, rank 1, and integral position partials"
+                .into(),
+        )
+        .into_akita());
+    }
+    let positions_per_partial = plan.num_positions_per_block / FP128_D512_POSITION_PARTIALS;
+    if !positions_per_partial.is_multiple_of(4) {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 D512 partials must contain whole four-position matrix tiles".into(),
+        )
+        .into_akita());
+    }
+    let rows_per_block = plan
+        .num_positions_per_block
+        .checked_mul(2)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 rows per block").into_akita())?;
+    if !source.num_rows().is_multiple_of(rows_per_block) {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 D512 panels require integral trace blocks".into(),
+        )
+        .into_akita());
+    }
+    let blocks_per_column = source.num_rows() / rows_per_block;
+    if !matches!(blocks_per_column, 32 | 64 | 128 | 256 | 512) {
+        return Err(MetalCommitError::UnsupportedShape(
+            "fp128 D512 panels require 32, 64, 128, 256, or 512 blocks per column".into(),
+        )
+        .into_akita());
+    }
+    let output_coefficients = COLUMN_CAPACITY
+        .checked_mul(blocks_per_column)
+        .and_then(|count| count.checked_mul(INNER_RANK))
+        .and_then(|count| count.checked_mul(D))
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 output").into_akita())?;
+    Ok(ValidatedShape {
+        active_a_cols: plan.num_positions_per_block,
+        output_coefficients,
+        positions_per_partial,
+        blocks_per_column,
+        live_columns: source.num_columns(),
+    })
+}
+
+pub(crate) fn commit_validated<const D: usize>(
+    backend: &MetalBackend,
+    prepared: &MetalPreparedSetup,
+    runtime: &MetalRuntime,
+    source: PackedOneHotCommitView<'_>,
+    plan: CommitInnerPlan,
+    shape: ValidatedShape,
+) -> Result<CommitInnerWitness<F>, AkitaError> {
+    let total_start = Instant::now();
+    let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
+    let work_units = shape
+        .live_columns
+        .checked_mul(shape.blocks_per_column)
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 work units").into_akita())?;
+    let params = PackedOneHotCommitParams {
+        num_rows: to_u64(source.num_rows(), "fp128 D512 row count")?,
+        num_columns: to_u64(shape.live_columns, "fp128 D512 column count")?,
+        lane_stride: to_u64(shape.live_columns, "fp128 D512 lane stride")?,
+        column_capacity: COLUMN_CAPACITY as u64,
+        onehot_k: ONEHOT_K as u64,
+        ring_d: D as u64,
+        n_a: INNER_RANK as u64,
+        positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
+        num_digits_inner: 1,
+        blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 block count")?,
+        full_blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 full blocks")?,
+        boundary_columns: 0,
+        num_blocks: to_u64(work_units, "fp128 D512 work units")?,
+        task_offset: 0,
+        dispatch_tasks: to_u64(work_units, "fp128 D512 dispatch work units")?,
+        lane_row_offset: 0,
+        output_coefficients: to_u64(shape.output_coefficients, "fp128 D512 output")?,
+        columns_per_threadgroup: 1,
+        position_partials_per_block: FP128_D512_POSITION_PARTIALS as u64,
+        positions_per_partial: to_u64(
+            shape.positions_per_partial,
+            "fp128 D512 positions per partial",
+        )?,
+        log_ring_d: 9,
+        zero_column_mask: source.zero_column_mask(),
+    };
+    let outcome = runtime
+        .dispatch_packed_onehot(
+            matrix.buffer.as_ref(),
+            source.lanes(),
+            source.active_zero_rows(),
+            params,
+            packed_streams_per_command(shape.active_a_cols),
+        )
+        .map_err(MetalCommitError::into_akita)?;
+
+    let reconstruction_start = Instant::now();
+    let coefficients = outcome
+        .coefficients
+        .into_iter()
+        .enumerate()
+        .map(|(index, coefficient)| F::from_device(coefficient, index))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(MetalCommitError::into_akita)?;
+    let witness = CommitInnerWitness {
+        inner_rows: RingVec::from_coeffs_with_ring_dim(coefficients, D)?,
+    };
+    let output_reconstruction_time = reconstruction_start.elapsed();
+
+    let field_additions = source
+        .hot_entries()
+        .checked_mul(INNER_RANK)
+        .and_then(|count| count.checked_mul(D))
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 additions").into_akita())?;
+    let gathered_matrix_bytes = field_additions
+        .checked_mul(size_of::<Fp128Limbs>())
+        .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 gathered bytes").into_akita())?;
+    backend
+        .record_commit_metrics(MetalCommitMetrics {
+            kernel: MetalOneHotKernel::PackedFp128D512Panels,
+            blocks_per_threadgroup: outcome.blocks_per_threadgroup,
+            num_sources: 1,
+            hot_entries: source.hot_entries(),
+            field_additions: to_u64(field_additions, "fp128 D512 additions")?,
+            gathered_matrix_bytes: to_u64(gathered_matrix_bytes, "fp128 D512 gathered bytes")?,
+            output_bytes: shape
+                .output_coefficients
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or_else(|| {
+                    MetalCommitError::ShapeOverflow("fp128 D512 output bytes").into_akita()
+                })?,
+            scratch_bytes: outcome.scratch_bytes,
+            matrix_bytes: matrix.bytes,
+            matrix_cache_hit: matrix.cache_hit,
+            matrix_prepare_time: matrix.prepare_time,
+            index_pack_time: Duration::ZERO,
+            buffer_setup_time: outcome.timings.buffer_setup,
+            command_wall_time: outcome.timings.command_wall,
+            gpu_time: outcome.timings.gpu,
+            readback_copy_time: outcome.timings.readback_copy,
+            output_reconstruction_time,
+            total_time: total_start.elapsed(),
+        })
+        .map_err(MetalCommitError::into_akita)?;
+    Ok(witness)
+}
+
+#[cfg(test)]
+mod tests {
+    use akita_prover::compute::RootCommitKernel;
+    use akita_prover::{
+        AkitaProverSetup, ComputeBackendSetup, CpuBackend, OneHotPoly, RootCommitSource,
+    };
+    use akita_types::SetupMatrixCapacity;
+
+    use super::*;
+    use crate::{MetalExecutionPolicy, PackedOneHotCommitView};
+
+    #[test]
+    fn parity_d512_k256_panels() {
+        const ROWS: usize = 4096;
+        const LIVE_COLUMNS: usize = 5;
+        const CAPACITY: usize = 32;
+        const POSITIONS_PER_BLOCK: usize = 64;
+        const ZERO_COLUMN_MASK: u64 = 0b0_1010;
+
+        let lanes = (0..ROWS * LIVE_COLUMNS)
+            .map(|index| {
+                if index.is_multiple_of(97) {
+                    ((index.wrapping_mul(73) % 255) + 1) as u8
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut active_zero_rows = vec![0u64; ROWS / u64::BITS as usize];
+        for row in (0..ROWS).step_by(11) {
+            active_zero_rows[row / u64::BITS as usize] |= 1u64 << (row % u64::BITS as usize);
+        }
+        let indices = (0..CAPACITY)
+            .flat_map(|column| {
+                let lanes = &lanes;
+                let active_zero_rows = &active_zero_rows;
+                (0..ROWS).map(move |row| {
+                    if column >= LIVE_COLUMNS {
+                        None
+                    } else {
+                        let lane = lanes[row * LIVE_COLUMNS + column];
+                        let committed_zero = ZERO_COLUMN_MASK & (1u64 << column) != 0
+                            && active_zero_rows[row / u64::BITS as usize]
+                                & (1u64 << (row % u64::BITS as usize))
+                                != 0;
+                        (lane != 0 || committed_zero).then_some(lane)
+                    }
+                })
+            })
+            .collect();
+        let generic = OneHotPoly::<F, u8>::new(ONEHOT_K, indices).unwrap();
+        let plan = CommitInnerPlan {
+            n_a: 1,
+            num_positions_per_block: POSITIONS_PER_BLOCK,
+            num_digits_inner: 1,
+            log_basis_inner: 3,
+        };
+        let num_vars = (ROWS * CAPACITY * ONEHOT_K).trailing_zeros() as usize;
+        let setup = AkitaProverSetup::<F>::generate_with_capacity(
+            num_vars,
+            1,
+            SetupMatrixCapacity {
+                num_field_elements: POSITIONS_PER_BLOCK * RING_D,
+            },
+        )
+        .unwrap();
+
+        let cpu = CpuBackend::DEFAULT;
+        let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
+        let cpu_view =
+            <OneHotPoly<F, u8> as RootCommitSource<F, RING_D>>::commit_view(&generic).unwrap();
+        let cpu_witness = cpu
+            .commit_inner_group(&cpu_prepared, vec![cpu_view], plan)
+            .unwrap()
+            .remove(0);
+
+        let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let metal_prepared = metal.prepare_setup(&setup).unwrap();
+        let source = PackedOneHotCommitView::new_with_active_zero_rows(
+            ONEHOT_K,
+            CAPACITY,
+            LIVE_COLUMNS,
+            &lanes,
+            &active_zero_rows,
+            ZERO_COLUMN_MASK,
+        )
+        .unwrap();
+        let metal_witness = metal
+            .commit_packed_onehot::<RING_D>(&metal_prepared, source, plan)
+            .unwrap();
+        assert_eq!(cpu_witness.inner_rows, metal_witness.inner_rows);
+
+        let second = metal
+            .commit_packed_onehot::<RING_D>(&metal_prepared, source, plan)
+            .unwrap();
+        assert_eq!(cpu_witness.inner_rows, second.inner_rows);
+        let metrics = metal.last_commit_metrics().unwrap().unwrap();
+        assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+        assert!(metrics.matrix_cache_hit);
+    }
+}

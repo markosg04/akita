@@ -1,0 +1,54 @@
+[package]
+name = "akita-metal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+authors = ["Markos Georghiades <mgeorghiades@a16z.com>"]
+license = "Apache-2.0 OR MIT"
+description = "Optional Apple Metal compute backend for Akita commitments."
+repository = "https://github.com/LayerZero-Labs/akita"
+keywords = ["cryptography", "zkp", "metal", "gpu"]
+categories = ["cryptography", "algorithms"]
+include = ["src/**", "benches/**", "Cargo.toml"]
+
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+
+[features]
+default = ["parallel"]
+parallel = [
+  "akita-algebra/parallel",
+  "akita-prover/parallel",
+  "jolt-field/parallel",
+]
+
+[dependencies]
+akita-algebra = { version = "0.1.0", path = "../akita-algebra" }
+akita-error = { version = "0.1.0", path = "../akita-error" }
+akita-prover = { version = "0.1.0", path = "../akita-prover" }
+akita-serialization = { version = "0.1.0", path = "../akita-serialization" }
+akita-sumcheck = { version = "0.1.0", path = "../akita-sumcheck", default-features = false }
+akita-transcript = { version = "0.1.0", path = "../akita-transcript", default-features = false }
+akita-types = { version = "0.1.0", path = "../akita-types", default-features = false }
+jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = [
+  "asm",
+  "solinas",
+] }
+thiserror = "2.0"
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.33.0"
+
+[dev-dependencies]
+akita-challenges = { version = "0.1.0", path = "../akita-challenges" }
+akita-config = { version = "0.1.0", path = "../akita-config" }
+akita-planner = { version = "0.1.0", path = "../akita-planner" }
+akita-prover = { version = "0.1.0", path = "../akita-prover" }
+
+[[bench]]
+name = "packed_onehot_commit"
+harness = false
+
+[lints]
+workspace = true
