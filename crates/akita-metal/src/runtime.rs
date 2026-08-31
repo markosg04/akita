@@ -341,9 +341,10 @@ pub(crate) struct PackedOneHotCoefficientPackingParams {
     pub(crate) subring_dimension: u64,
     pub(crate) output_coefficients: u64,
     pub(crate) partial_coefficients: u64,
+    pub(crate) zero_column_mask: u64,
 }
 
-const _: [(); 120] = [(); size_of::<PackedOneHotCoefficientPackingParams>()];
+const _: [(); 128] = [(); size_of::<PackedOneHotCoefficientPackingParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -2124,6 +2125,7 @@ impl MetalRuntime {
     pub(crate) fn dispatch_fp128_packed_onehot_coefficient_packing(
         &self,
         lanes: &[u8],
+        active_zero_rows: &[u64],
         combined_weights: &[Fp128Limbs],
         params: PackedOneHotCoefficientPackingParams,
     ) -> Result<CoefficientPackingDispatchOutcome, MetalCommitError> {
@@ -2159,6 +2161,12 @@ impl MetalRuntime {
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "packed coefficient-packing partials",
                 ))?;
+            let live_column_mask = if params.num_columns >= u64::BITS as u64 {
+                u64::MAX
+            } else {
+                (1u64 << params.num_columns) - 1
+            };
+            let expected_active_zero_words = params.num_rows.div_ceil(u64::BITS as u64);
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.column_capacity
@@ -2186,6 +2194,11 @@ impl MetalRuntime {
                     .checked_mul(params.row_partials_per_block)
                     .is_none_or(|groups| groups > u64::from(u32::MAX))
                 || u64::try_from(lanes.len()).ok() != Some(expected_lanes)
+                || params.zero_column_mask & !live_column_mask != 0
+                || (params.zero_column_mask == 0 && !active_zero_rows.is_empty())
+                || (params.zero_column_mask != 0
+                    && u64::try_from(active_zero_rows.len()).ok()
+                        != Some(expected_active_zero_words))
                 || u64::try_from(combined_weights.len()).ok() != Some(expected_weights)
                 || self
                     .fp128_packed_onehot_coefficient_packing_partials_pipeline
@@ -2204,6 +2217,14 @@ impl MetalRuntime {
             let buffer_start = Instant::now();
             let lane_bytes = lanes.len();
             let lanes = self.packed_lane_buffer(lanes)?;
+            let no_active_zero_rows = [0u64];
+            let active_zero_rows = if active_zero_rows.is_empty() {
+                no_active_zero_rows.as_slice()
+            } else {
+                active_zero_rows
+            };
+            let active_zero_bytes = size_of_val(active_zero_rows);
+            let active_zero_rows = self.shared_buffer_from_slice(active_zero_rows)?;
             let weights = self.shared_buffer_from_slice(combined_weights)?;
             let output_count = usize::try_from(params.output_coefficients)
                 .map_err(|_| MetalCommitError::ShapeOverflow("coefficient-packing output"))?;
@@ -2228,7 +2249,8 @@ impl MetalRuntime {
             encoder.set_buffer(0, Some(&lanes.buffer), 0);
             encoder.set_buffer(1, Some(&weights), 0);
             encoder.set_buffer(2, Some(&partials), 0);
-            set_inline_bytes(encoder, 3, &params);
+            encoder.set_buffer(3, Some(&active_zero_rows), 0);
+            set_inline_bytes(encoder, 4, &params);
             encoder.dispatch_thread_groups(
                 MTLSize::new(params.num_blocks * params.row_partials_per_block, 1, 1),
                 MTLSize::new(
@@ -2261,6 +2283,7 @@ impl MetalRuntime {
             let allocation_bytes = output_bytes
                 .checked_add(partial_bytes)
                 .and_then(|bytes| bytes.checked_add(size_of_val(combined_weights)))
+                .and_then(|bytes| bytes.checked_add(active_zero_bytes))
                 .and_then(|bytes| bytes.checked_add(if lanes.zero_copy { 0 } else { lane_bytes }))
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "coefficient-packing allocation bytes",

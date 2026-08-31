@@ -37,6 +37,8 @@ impl OpeningAccelerationPolicy {
 #[cfg(target_os = "macos")]
 mod backend;
 #[cfg(target_os = "macos")]
+mod coefficient_packing;
+#[cfg(target_os = "macos")]
 mod field;
 #[cfg(target_os = "macos")]
 mod onehot;
@@ -55,7 +57,7 @@ mod prepared;
 mod runtime;
 
 #[cfg(target_os = "macos")]
-pub use backend::{MetalBackend, MetalCommitMetrics};
+pub use backend::{MetalBackend, MetalCommitMetrics, MetalOpeningMetrics};
 #[cfg(target_os = "macos")]
 pub use packed_onehot::PackedOneHotCommitView;
 #[cfg(target_os = "macos")]

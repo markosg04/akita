@@ -3,12 +3,19 @@ use std::time::{Duration, Instant};
 
 use akita_algebra::CyclotomicRing;
 use akita_error::AkitaError;
-use akita_prover::compute::{CompressionComputeBackend, CompressionRowsProducts};
+use akita_prover::compute::{
+    CompressionComputeBackend, CompressionRowsProducts, DecomposeFoldBatchPlan, DecomposeFoldPlan,
+    OpeningBatchKernel, OpeningFoldKernel, OpeningFoldOutput, OpeningFoldPlan,
+    SubringCoefficientPackingBatchKernel, SubringCoefficientPackingPartials,
+    SubringCoefficientPackingPlan,
+};
 use akita_prover::{
-    ComputeBackendSetup, CpuBackend, CyclicRowsComputeBackend, DigitRowsComputeBackend,
-    NttCacheOwnerId, NttOperationCluster, RoutedNttRequirement,
+    BatchDecomposeFoldOutcome, ComputeBackendSetup, CpuBackend, CyclicRowsComputeBackend,
+    DecomposeFoldWitness, DigitRowsComputeBackend, NttCacheOwnerId, NttOperationCluster,
+    RecursiveFoldBatchView, RoutedNttRequirement, SuffixWitnessBatchView,
 };
 use akita_types::{AkitaExpandedSetup, NttCacheKey};
+use jolt_field::ExtField;
 use metal::Device;
 
 use crate::field::F;
@@ -57,12 +64,32 @@ pub struct MetalCommitMetrics {
     pub total_time: Duration,
 }
 
+/// Timings and routing counters from the most recent opening proof.
+#[derive(Clone, Debug, Default)]
+pub struct MetalOpeningMetrics {
+    /// Wall time from Metal command submission through completion.
+    pub command_wall_time: Duration,
+    /// Sum of GPU timestamp intervals reported by Metal.
+    pub gpu_active_time: Duration,
+    /// Host-side input and output buffer construction time.
+    pub buffer_setup_time: Duration,
+    /// Host-side copy and canonical field reconstruction time.
+    pub readback_time: Duration,
+    /// Transient bytes requested by opening dispatches.
+    pub allocation_bytes: usize,
+    /// Opening operations deliberately delegated to the CPU backend.
+    pub cpu_fallback_calls: usize,
+    /// Scalar source work represented by delegated operations.
+    pub cpu_fallback_work_units: usize,
+}
+
 struct BackendInner {
     runtime: Option<Arc<MetalRuntime>>,
     policy: MetalExecutionPolicy,
     cpu: CpuBackend,
     initialization_time: Duration,
     last_commit_metrics: Mutex<Option<MetalCommitMetrics>>,
+    last_opening_metrics: Mutex<Option<MetalOpeningMetrics>>,
 }
 
 /// Akita compute backend with explicit Metal admission and CPU delegation.
@@ -100,6 +127,7 @@ impl MetalBackend {
                 cpu,
                 initialization_time: start.elapsed(),
                 last_commit_metrics: Mutex::new(None),
+                last_opening_metrics: Mutex::new(None),
             }),
         })
     }
@@ -127,6 +155,7 @@ impl MetalBackend {
                 cpu,
                 initialization_time: start.elapsed(),
                 last_commit_metrics: Mutex::new(None),
+                last_opening_metrics: Mutex::new(None),
             }),
         })
     }
@@ -159,6 +188,50 @@ impl MetalBackend {
             .lock()
             .map_err(|_| MetalCommitError::PoisonedLock)?
             .clone())
+    }
+
+    /// Reset opening metrics immediately before a proof begins.
+    pub fn begin_opening_metrics(&self) -> Result<(), MetalCommitError> {
+        *self
+            .inner
+            .last_opening_metrics
+            .lock()
+            .map_err(|_| MetalCommitError::PoisonedLock)? = Some(MetalOpeningMetrics::default());
+        Ok(())
+    }
+
+    /// Metrics accumulated since the most recent opening reset.
+    pub fn last_opening_metrics(&self) -> Result<Option<MetalOpeningMetrics>, MetalCommitError> {
+        Ok(self
+            .inner
+            .last_opening_metrics
+            .lock()
+            .map_err(|_| MetalCommitError::PoisonedLock)?
+            .clone())
+    }
+
+    pub(crate) fn update_opening_metrics(
+        &self,
+        update: impl FnOnce(&mut MetalOpeningMetrics),
+    ) -> Result<(), MetalCommitError> {
+        let mut metrics = self
+            .inner
+            .last_opening_metrics
+            .lock()
+            .map_err(|_| MetalCommitError::PoisonedLock)?;
+        if let Some(metrics) = metrics.as_mut() {
+            update(metrics);
+        }
+        Ok(())
+    }
+
+    /// Record a deliberate CPU route inside a Metal opening stack.
+    pub fn record_opening_cpu_fallback(&self, work_units: usize) -> Result<(), MetalCommitError> {
+        self.update_opening_metrics(|metrics| {
+            metrics.cpu_fallback_calls = metrics.cpu_fallback_calls.saturating_add(1);
+            metrics.cpu_fallback_work_units =
+                metrics.cpu_fallback_work_units.saturating_add(work_units);
+        })
     }
 
     pub(crate) fn runtime(&self) -> Option<&MetalRuntime> {
@@ -274,3 +347,91 @@ impl CyclicRowsComputeBackend<F> for MetalBackend {
             .cyclic_digit_rows(&prepared.cpu, row_len, digits, log_basis)
     }
 }
+
+impl<S, const D: usize> OpeningFoldKernel<S, F, D> for MetalBackend
+where
+    CpuBackend: OpeningFoldKernel<S, F, D>,
+{
+    fn evaluate_and_fold(
+        &self,
+        prepared: Option<&Self::PreparedSetup>,
+        source: S,
+        plan: OpeningFoldPlan<'_, F>,
+    ) -> Result<OpeningFoldOutput<F, D>, AkitaError> {
+        let output = self.cpu_backend().evaluate_and_fold(
+            prepared.map(|prepared| &prepared.cpu),
+            source,
+            plan,
+        )?;
+        self.record_opening_cpu_fallback(1)
+            .map_err(MetalCommitError::into_akita)?;
+        Ok(output)
+    }
+
+    fn decompose_fold(
+        &self,
+        prepared: Option<&Self::PreparedSetup>,
+        source: S,
+        plan: DecomposeFoldPlan<'_>,
+    ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
+        let output = self.cpu_backend().decompose_fold(
+            prepared.map(|prepared| &prepared.cpu),
+            source,
+            plan,
+        )?;
+        self.record_opening_cpu_fallback(1)
+            .map_err(MetalCommitError::into_akita)?;
+        Ok(output)
+    }
+}
+
+impl<S, const D: usize> OpeningBatchKernel<S, F, D> for MetalBackend
+where
+    CpuBackend: OpeningBatchKernel<S, F, D>,
+{
+    fn decompose_fold_batch(
+        &self,
+        prepared: Option<&Self::PreparedSetup>,
+        source: S,
+        plan: DecomposeFoldBatchPlan<'_>,
+    ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError> {
+        let output = self.cpu_backend().decompose_fold_batch(
+            prepared.map(|prepared| &prepared.cpu),
+            source,
+            plan,
+        )?;
+        self.record_opening_cpu_fallback(1)
+            .map_err(MetalCommitError::into_akita)?;
+        Ok(output)
+    }
+}
+
+macro_rules! delegate_coefficient_packing_to_cpu {
+    ($view:ident) => {
+        impl<E, const D: usize> SubringCoefficientPackingBatchKernel<$view<'_, F, D>, F, E, D>
+            for MetalBackend
+        where
+            E: ExtField<F>,
+            CpuBackend: for<'a> SubringCoefficientPackingBatchKernel<$view<'a, F, D>, F, E, D>,
+        {
+            fn coefficient_packing_partials_batch(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $view<'_, F, D>,
+                plan: SubringCoefficientPackingPlan<'_, E>,
+            ) -> Result<Vec<SubringCoefficientPackingPartials<F>>, AkitaError> {
+                let output = self.cpu_backend().coefficient_packing_partials_batch(
+                    prepared.map(|prepared| &prepared.cpu),
+                    source,
+                    plan,
+                )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+        }
+    };
+}
+
+delegate_coefficient_packing_to_cpu!(RecursiveFoldBatchView);
+delegate_coefficient_packing_to_cpu!(SuffixWitnessBatchView);

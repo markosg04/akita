@@ -178,6 +178,76 @@ where
         Ok(proof)
     }
 
+    /// Produce a fused batched opening proof with independently selected
+    /// commit, opening, tensor, and ring-switch backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any opening point is invalid or proof generation fails.
+    #[tracing::instrument(skip_all, name = "AkitaCommitmentScheme::batched_prove_with_stack")]
+    pub fn batched_prove_with_stack<'a, T, P, C, O, TS, R>(
+        setup: &AkitaProverSetup<Cfg::Field>,
+        opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
+        stacks: &'a impl LevelProveStacks<
+            'a,
+            Cfg::Field,
+            Commit = C,
+            Opening = O,
+            Tensor = TS,
+            RingSwitch = R,
+        >,
+        transcript: &mut T,
+        basis: BasisMode,
+    ) -> Result<AkitaBatchedProof<Cfg::Field, Cfg::ExtField>, AkitaError>
+    where
+        T: Transcript<Cfg::Field> + ProverTranscriptGrind<Cfg::Field>,
+        Cfg::Field: Ring + Unreduced + Field + 'static,
+        <Cfg::Field as Unreduced>::Wide: From<Cfg::Field> + AdditiveGroup,
+        P: PreparedGroupProveOps<Cfg::Field, Cfg::ExtField, O>,
+        C: ComputeBackendSetup<Cfg::Field>
+            + RuntimeCommitBackendFor<Cfg::Field, akita_prover::RecursiveWitnessFlat>
+            + 'a,
+        O: ComputeBackendSetup<Cfg::Field>
+            + RuntimeOpeningProveBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>>
+            + RuntimeCoefficientPackingBackendFor<
+                Cfg::Field,
+                RecursiveFoldSource<Cfg::Field>,
+                Cfg::ExtField,
+            > + SuffixOpeningProveBackend<Cfg::Field>
+            + DigitRowsComputeBackend<Cfg::Field>
+            + 'a,
+        TS: ComputeBackendSetup<Cfg::Field>
+            + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
+            + SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>
+            + 'a,
+        R: ComputeBackendSetup<Cfg::Field>
+            + RuntimeRingSwitchProveBackend<Cfg::Field>
+            + DigitRowsComputeBackend<Cfg::Field>
+            + 'a,
+        <C as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <O as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <TS as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+        <R as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
+    {
+        let t_prove_total = Instant::now();
+        akita_config::validate_config_policy::<Cfg>()?;
+        let proof = akita_prover::batched_prove::<Cfg, T, P, C, O, TS, R>(
+            &setup.expanded,
+            &setup.prefix_slots,
+            stacks,
+            opening,
+            transcript,
+            basis,
+        )?;
+
+        tracing::info!(
+            levels = proof.num_fold_levels(),
+            elapsed_s = t_prove_total.elapsed().as_secs_f64(),
+            "akita heterogeneous batched prove complete"
+        );
+        Ok(proof)
+    }
+
     /// Verify a fused batched opening proof over ordered commitment groups.
     ///
     /// # Errors

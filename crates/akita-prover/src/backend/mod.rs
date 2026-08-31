@@ -22,7 +22,8 @@ pub use multilinear_polynomial::{
 };
 pub use onehot::{OneHotBatchView, OneHotIndex, OneHotPoly, OneHotView};
 pub use recursive::{
-    RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView, SuffixWitnessView,
+    RecursiveFoldBatchView, RecursiveFoldSource, RecursiveWitnessFlat, SuffixWitnessBatchView,
+    SuffixWitnessView,
 };
 pub use ring_switch::RingSwitchRelationView;
 pub use sparse_ring::SparseRingBlockEntry;
