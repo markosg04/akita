@@ -46,6 +46,12 @@ impl MetalPreparedSetup {
         }
     }
 
+    /// CPU setup state used by an adapter when a source shape is deliberately
+    /// outside its Metal admission boundary.
+    pub fn cpu_prepared(&self) -> &CpuPreparedSetup<F> {
+        &self.cpu
+    }
+
     pub(crate) fn matrix(
         &self,
         runtime: &MetalRuntime,
