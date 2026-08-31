@@ -4251,6 +4251,32 @@ inline void akita_fp128_d512_accumulate_pair(
     }
 }
 
+inline void akita_fp128_d512_accumulate_shift(
+    thread AkitaTransposedFp128Accumulator &accumulator_0,
+    thread AkitaTransposedFp128Accumulator &accumulator_1,
+    threadgroup const uint *matrix,
+    uint simd_lane,
+    uint coefficient_band,
+    uint local_position,
+    uint local_shift)
+{
+    uint coefficient_base = coefficient_band * 256u;
+    uint4 coefficients_0 = uint4(
+        simd_lane + coefficient_base,
+        simd_lane + coefficient_base + 32u,
+        simd_lane + coefficient_base + 64u,
+        simd_lane + coefficient_base + 96u);
+    uint4 coefficients_1 = coefficients_0 + uint4(128u);
+    uint4 shift = uint4(local_shift);
+    uint matrix_base = local_position * 512u;
+    akita_fp128_d512_accumulate_mixed(
+        accumulator_0, matrix, matrix_base,
+        (coefficients_0 - shift) & uint4(511u), coefficients_0 >= shift);
+    akita_fp128_d512_accumulate_mixed(
+        accumulator_1, matrix, matrix_base,
+        (coefficients_1 - shift) & uint4(511u), coefficients_1 >= shift);
+}
+
 inline void akita_store_fp128_d512_group(
     device AkitaFp128 *partials,
     AkitaTransposedFp128Accumulator accumulator,
@@ -4291,8 +4317,10 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     constexpr uint tasks_per_stream = 32u;
     constexpr uint threads_per_threadgroup = 1024u;
     constexpr uint positions_per_tile = 4u;
-    constexpr uint rows_per_tile = 8u;
     uint live_columns = (uint)params.num_columns;
+    uint onehot_k = (uint)params.onehot_k;
+    uint rows_per_position = 512u / onehot_k;
+    uint rows_per_tile = positions_per_tile * rows_per_position;
     uint num_tasks = (uint)params.dispatch_tasks;
     uint blocks_per_column = (uint)params.blocks_per_column;
     uint streams = (num_tasks + tasks_per_stream - 1u) / tasks_per_stream;
@@ -4308,8 +4336,8 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
     uint a_row = partial_group / position_partials;
     uint positions_per_partial = (uint)params.positions_per_partial;
     uint partial_start = position_partial * positions_per_partial;
-    uint rows_per_partial = positions_per_partial * 2u;
-    uint rows_per_block = (uint)params.positions_per_block * 2u;
+    uint rows_per_partial = positions_per_partial * rows_per_position;
+    uint rows_per_block = (uint)params.positions_per_block * rows_per_position;
     uint output_coefficients = (uint)params.output_coefficients;
     uint dispatch_task = stream * tasks_per_stream + simdgroup;
     bool simdgroup_active = dispatch_task < num_tasks;
@@ -4340,34 +4368,71 @@ kernel void akita_packed_onehot_commit_fp128_d512_panels(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        uint local_hot = 0u;
-        bool local_selected = false;
-        if (simdgroup_active && simd_lane < rows_per_tile) {
-            ulong trace_row = (ulong)task_block * (ulong)rows_per_block
-                + (ulong)position_partial * (ulong)rows_per_partial
-                + (ulong)tile * (ulong)rows_per_tile
-                + (ulong)simd_lane;
-            local_hot = (uint)lanes[
-                (trace_row - params.lane_row_offset) * params.lane_stride
-                    + (ulong)task_column];
-            local_selected = local_hot != 0u;
-            if (!local_selected
-                && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
-                ulong active_word = active_zero_rows[trace_row >> 6ul];
-                local_selected = ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
+        if (onehot_k == 256u) {
+            uint local_hot = 0u;
+            bool local_selected = false;
+            if (simdgroup_active && simd_lane < rows_per_tile) {
+                ulong trace_row = (ulong)task_block * (ulong)rows_per_block
+                    + (ulong)position_partial * (ulong)rows_per_partial
+                    + (ulong)tile * (ulong)rows_per_tile
+                    + (ulong)simd_lane;
+                local_hot = (uint)lanes[
+                    (trace_row - params.lane_row_offset) * params.lane_stride
+                        + (ulong)task_column];
+                local_selected = local_hot != 0u;
+                if (!local_selected
+                    && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
+                    ulong active_word = active_zero_rows[trace_row >> 6ul];
+                    local_selected = ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
+                }
             }
-        }
-        uint selected = uint(
-            simd_ballot(local_selected).operator unsigned long());
-        while (selected != 0u) {
-            uint selected_lane = ctz(selected);
-            uint selected_hot = simd_shuffle(local_hot, selected_lane);
-            uint local_position = selected_lane >> 1u;
-            bool odd_row = (selected_lane & 1u) != 0u;
-            akita_fp128_d512_accumulate_pair(
-                accumulator_0, accumulator_1, shared_matrix, simd_lane,
-                coefficient_band, local_position, selected_hot, odd_row);
-            selected &= selected - 1u;
+            uint selected = uint(
+                simd_ballot(local_selected).operator unsigned long());
+            while (selected != 0u) {
+                uint selected_lane = ctz(selected);
+                uint selected_hot = simd_shuffle(local_hot, selected_lane);
+                uint local_position = selected_lane >> 1u;
+                bool odd_row = (selected_lane & 1u) != 0u;
+                akita_fp128_d512_accumulate_pair(
+                    accumulator_0, accumulator_1, shared_matrix, simd_lane,
+                    coefficient_band, local_position, selected_hot, odd_row);
+                selected &= selected - 1u;
+            }
+        } else {
+            for (uint local_position = 0u;
+                 local_position < positions_per_tile;
+                 ++local_position) {
+                ulong trace_row = (ulong)task_block * (ulong)rows_per_block
+                    + (ulong)position_partial * (ulong)rows_per_partial
+                    + (ulong)tile * (ulong)rows_per_tile
+                    + (ulong)local_position * (ulong)rows_per_position
+                    + (ulong)simd_lane;
+                uint local_hot = 0u;
+                bool local_selected = false;
+                if (simdgroup_active) {
+                    local_hot = (uint)lanes[
+                        (trace_row - params.lane_row_offset) * params.lane_stride
+                            + (ulong)task_column];
+                    local_selected = local_hot != 0u;
+                    if (!local_selected
+                        && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
+                        ulong active_word = active_zero_rows[trace_row >> 6ul];
+                        local_selected =
+                            ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
+                    }
+                }
+                uint selected = uint(
+                    simd_ballot(local_selected).operator unsigned long());
+                while (selected != 0u) {
+                    uint selected_lane = ctz(selected);
+                    uint selected_hot = simd_shuffle(local_hot, selected_lane);
+                    uint local_shift = selected_lane * onehot_k + selected_hot;
+                    akita_fp128_d512_accumulate_shift(
+                        accumulator_0, accumulator_1, shared_matrix, simd_lane,
+                        coefficient_band, local_position, local_shift);
+                    selected &= selected - 1u;
+                }
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         matrix_cursor += (ulong)PACKED_FP128_D512_PANEL_TILE_ELEMENTS;

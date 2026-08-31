@@ -17,8 +17,8 @@ use crate::runtime::{
 use crate::MetalCommitError;
 
 const RING_D: usize = 512;
-const ONEHOT_K: usize = 256;
-const COLUMN_CAPACITY: usize = 32;
+const K16_COLUMN_CAPACITY: usize = 64;
+const K256_COLUMN_CAPACITY: usize = 32;
 const INNER_RANK: usize = 1;
 const FIVE_STREAM_MAX_POSITIONS: usize = 1 << 16;
 
@@ -42,10 +42,13 @@ pub(crate) fn validate_shape<const D: usize>(
     source: PackedOneHotCommitView<'_>,
     plan: CommitInnerPlan,
 ) -> Result<ValidatedShape, AkitaError> {
+    let supported_source = matches!(
+        (source.onehot_k(), source.column_capacity()),
+        (16, K16_COLUMN_CAPACITY) | (256, K256_COLUMN_CAPACITY)
+    );
     if D != RING_D
-        || source.onehot_k() != ONEHOT_K
-        || source.column_capacity() != COLUMN_CAPACITY
-        || !(1..=COLUMN_CAPACITY).contains(&source.num_columns())
+        || !supported_source
+        || !(1..=source.column_capacity()).contains(&source.num_columns())
         || plan.n_a != INNER_RANK
         || plan.num_digits_inner != 1
         || plan.num_positions_per_block == 0
@@ -54,7 +57,7 @@ pub(crate) fn validate_shape<const D: usize>(
             .is_multiple_of(FP128_D512_POSITION_PARTIALS)
     {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 Metal D512 commit requires K256, 1..=32 live columns, capacity 32, rank 1, and integral position partials"
+            "fp128 Metal D512 commit requires K16/capacity-64 or K256/capacity-32, rank 1, and integral position partials"
                 .into(),
         )
         .into_akita());
@@ -66,9 +69,10 @@ pub(crate) fn validate_shape<const D: usize>(
         )
         .into_akita());
     }
+    let rows_per_position = D / source.onehot_k();
     let rows_per_block = plan
         .num_positions_per_block
-        .checked_mul(2)
+        .checked_mul(rows_per_position)
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 rows per block").into_akita())?;
     if !source.num_rows().is_multiple_of(rows_per_block) {
         return Err(MetalCommitError::UnsupportedShape(
@@ -77,13 +81,14 @@ pub(crate) fn validate_shape<const D: usize>(
         .into_akita());
     }
     let blocks_per_column = source.num_rows() / rows_per_block;
-    if !matches!(blocks_per_column, 32 | 64 | 128 | 256 | 512) {
+    if !blocks_per_column.is_power_of_two() || blocks_per_column > 512 {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 D512 panels require 32, 64, 128, 256, or 512 blocks per column".into(),
+            "fp128 D512 panels require at most 512 power-of-two blocks per column".into(),
         )
         .into_akita());
     }
-    let output_coefficients = COLUMN_CAPACITY
+    let output_coefficients = source
+        .column_capacity()
         .checked_mul(blocks_per_column)
         .and_then(|count| count.checked_mul(INNER_RANK))
         .and_then(|count| count.checked_mul(D))
@@ -115,8 +120,8 @@ pub(crate) fn commit_validated<const D: usize>(
         num_rows: to_u64(source.num_rows(), "fp128 D512 row count")?,
         num_columns: to_u64(shape.live_columns, "fp128 D512 column count")?,
         lane_stride: to_u64(shape.live_columns, "fp128 D512 lane stride")?,
-        column_capacity: COLUMN_CAPACITY as u64,
-        onehot_k: ONEHOT_K as u64,
+        column_capacity: to_u64(source.column_capacity(), "fp128 D512 column capacity")?,
+        onehot_k: to_u64(source.onehot_k(), "fp128 D512 one-hot K")?,
         ring_d: D as u64,
         n_a: INNER_RANK as u64,
         positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
@@ -210,32 +215,29 @@ mod tests {
     use super::*;
     use crate::{MetalExecutionPolicy, PackedOneHotCommitView};
 
-    #[test]
-    fn parity_d512_k256_panels() {
-        const ROWS: usize = 4096;
+    fn assert_panel_parity(onehot_k: usize, rows: usize, capacity: usize) {
         const LIVE_COLUMNS: usize = 5;
-        const CAPACITY: usize = 32;
         const POSITIONS_PER_BLOCK: usize = 64;
         const ZERO_COLUMN_MASK: u64 = 0b0_1010;
 
-        let lanes = (0..ROWS * LIVE_COLUMNS)
+        let lanes = (0..rows * LIVE_COLUMNS)
             .map(|index| {
                 if index.is_multiple_of(97) {
-                    ((index.wrapping_mul(73) % 255) + 1) as u8
+                    ((index.wrapping_mul(73) % (onehot_k - 1)) + 1) as u8
                 } else {
                     0
                 }
             })
             .collect::<Vec<_>>();
-        let mut active_zero_rows = vec![0u64; ROWS / u64::BITS as usize];
-        for row in (0..ROWS).step_by(11) {
+        let mut active_zero_rows = vec![0u64; rows / u64::BITS as usize];
+        for row in (0..rows).step_by(11) {
             active_zero_rows[row / u64::BITS as usize] |= 1u64 << (row % u64::BITS as usize);
         }
-        let indices = (0..CAPACITY)
+        let indices = (0..capacity)
             .flat_map(|column| {
                 let lanes = &lanes;
                 let active_zero_rows = &active_zero_rows;
-                (0..ROWS).map(move |row| {
+                (0..rows).map(move |row| {
                     if column >= LIVE_COLUMNS {
                         None
                     } else {
@@ -249,14 +251,14 @@ mod tests {
                 })
             })
             .collect();
-        let generic = OneHotPoly::<F, u8>::new(ONEHOT_K, indices).unwrap();
+        let generic = OneHotPoly::<F, u8>::new(onehot_k, indices).unwrap();
         let plan = CommitInnerPlan {
             n_a: 1,
             num_positions_per_block: POSITIONS_PER_BLOCK,
             num_digits_inner: 1,
             log_basis_inner: 3,
         };
-        let num_vars = (ROWS * CAPACITY * ONEHOT_K).trailing_zeros() as usize;
+        let num_vars = (rows * capacity * onehot_k).trailing_zeros() as usize;
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
             num_vars,
             1,
@@ -278,8 +280,8 @@ mod tests {
         let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         let source = PackedOneHotCommitView::new_with_active_zero_rows(
-            ONEHOT_K,
-            CAPACITY,
+            onehot_k,
+            capacity,
             LIVE_COLUMNS,
             &lanes,
             &active_zero_rows,
@@ -298,5 +300,15 @@ mod tests {
         let metrics = metal.last_commit_metrics().unwrap().unwrap();
         assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
         assert!(metrics.matrix_cache_hit);
+    }
+
+    #[test]
+    fn parity_d512_k256_panels() {
+        assert_panel_parity(256, 4096, 32);
+    }
+
+    #[test]
+    fn parity_d512_k16_panels() {
+        assert_panel_parity(16, 2048, 64);
     }
 }
