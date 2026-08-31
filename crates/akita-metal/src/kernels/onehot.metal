@@ -130,6 +130,7 @@ struct PackedOneHotCoefficientPackingParams {
     ulong subring_dimension;
     ulong output_coefficients;
     ulong partial_coefficients;
+    ulong zero_column_mask;
 };
 
 struct PackedDecomposeFoldParams {
@@ -971,7 +972,8 @@ kernel void akita_fp128_packed_onehot_coefficient_packing_partials(
     device const uchar *lanes [[buffer(0)]],
     device const AkitaFp128 *combined_weights [[buffer(1)]],
     device AkitaFp128 *partials [[buffer(2)]],
-    constant PackedOneHotCoefficientPackingParams &params [[buffer(3)]],
+    device const ulong *active_zero_rows [[buffer(3)]],
+    constant PackedOneHotCoefficientPackingParams &params [[buffer(4)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threadgroup_index [[threadgroup_position_in_grid]])
 {
@@ -999,7 +1001,12 @@ kernel void akita_fp128_packed_onehot_coefficient_packing_partials(
              row < row_end;
              row += 256ul) {
             uint hot = (uint)lanes[row * params.num_columns + column];
-            if (hot == 0u || (ulong)hot >= params.onehot_k) {
+            bool committed = hot != 0u;
+            if (!committed && ((params.zero_column_mask >> column) & 1ul) != 0ul) {
+                ulong active_word = active_zero_rows[row >> 6ul];
+                committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
+            }
+            if (!committed || (ulong)hot >= params.onehot_k) {
                 continue;
             }
             ulong field_in_block =
