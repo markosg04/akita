@@ -152,6 +152,8 @@ where
                 Cfg::ExtField,
             > + SuffixOpeningProveBackend<Cfg::Field>
             + DigitRowsComputeBackend<Cfg::Field>
+            + akita_prover::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + akita_prover::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
             + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
             + SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>
             + RuntimeRingSwitchProveBackend<Cfg::Field>
@@ -215,6 +217,8 @@ where
                 Cfg::ExtField,
             > + SuffixOpeningProveBackend<Cfg::Field>
             + DigitRowsComputeBackend<Cfg::Field>
+            + akita_prover::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + akita_prover::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
             + 'a,
         TS: ComputeBackendSetup<Cfg::Field>
             + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>

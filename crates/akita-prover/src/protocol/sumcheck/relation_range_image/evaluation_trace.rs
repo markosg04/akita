@@ -1,6 +1,6 @@
 //! Prover-owned evaluation-trace support prepared for Stage 2.
 
-use super::fold_two_round_quad;
+use super::{fold_two_round_quad, DirectLinearLayout, DirectLinearRound, DirectLinearSegment};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::ops::Range;
@@ -236,6 +236,87 @@ pub(crate) struct PreparedProverLinearTerms<E: Field> {
 }
 
 impl<E: Field> PreparedProverLinearTerms<E> {
+    pub(super) fn direct_layout(&self) -> DirectLinearLayout<E> {
+        let mut segments = Vec::new();
+        match &self.lane_weights {
+            PreparedLaneWeights::Packing(packing) => {
+                segments.extend(packing.segments.iter().map(|segment| DirectLinearSegment {
+                    factor: segment.factor,
+                    source_index: segment.source_index,
+                    target_lane_start: segment.target_lane_start,
+                    target_lane_stride: 1,
+                    source_lane_start: segment.source_lane_start,
+                    source_lane_stride: 1,
+                    lane_count: segment.lane_count,
+                }));
+            }
+            PreparedLaneWeights::Sparse(lanes) => {
+                for (lane, terms) in lanes.iter().enumerate() {
+                    segments.extend(terms.iter().map(|term| DirectLinearSegment {
+                        factor: term.factor,
+                        source_index: term.source_index,
+                        target_lane_start: lane,
+                        target_lane_stride: 1,
+                        source_lane_start: term.lane,
+                        source_lane_stride: 1,
+                        lane_count: 1,
+                    }));
+                }
+            }
+            PreparedLaneWeights::Dense(_) => {}
+        }
+
+        let mut lane_offsets = vec![0usize; self.live_lane_count + 1];
+        for segment in &segments {
+            for lane_offset in 0..segment.lane_count {
+                let lane = segment.target_lane_start + lane_offset * segment.target_lane_stride;
+                lane_offsets[lane + 1] += 1;
+            }
+        }
+        for lane in 0..self.live_lane_count {
+            lane_offsets[lane + 1] += lane_offsets[lane];
+        }
+        let mut lane_segments = vec![0usize; *lane_offsets.last().unwrap_or(&0)];
+        let mut cursors = lane_offsets[..self.live_lane_count].to_vec();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            for lane_offset in 0..segment.lane_count {
+                let lane = segment.target_lane_start + lane_offset * segment.target_lane_stride;
+                lane_segments[cursors[lane]] = segment_index;
+                cursors[lane] += 1;
+            }
+        }
+        DirectLinearLayout {
+            segments,
+            lane_offsets,
+            lane_segments,
+            source_count: self.sources.len(),
+        }
+    }
+
+    pub(super) fn direct_round(&self) -> DirectLinearRound<E> {
+        if let PreparedLaneWeights::Dense(values) = &self.lane_weights {
+            return DirectLinearRound {
+                sources: Vec::new(),
+                dense_values: Some(values.clone()),
+            };
+        }
+        DirectLinearRound {
+            sources: self
+                .sources
+                .iter()
+                .map(|source| source.values.clone())
+                .collect(),
+            dense_values: None,
+        }
+    }
+
+    pub(super) fn replace_with_final_value(&mut self, value: E) {
+        self.lane_weights = PreparedLaneWeights::Dense(vec![value]);
+        self.sources.clear();
+        self.live_lane_count = 1;
+        self.coeff_count = 1;
+    }
+
     #[cfg(test)]
     pub(crate) fn source_count(&self) -> usize {
         self.sources.len()

@@ -416,3 +416,229 @@ impl<E: Field + Ring + Unreduced> RelationRangeImageProver<E> {
             .expect("two-round prefix should be initialized")
     }
 }
+
+impl<E: Field + Ring + Fold + Unreduced> DirectRelationRangeProofState<E> {
+    pub fn new(prover: RelationRangeImageProver<E>) -> Self {
+        Self { prover }
+    }
+
+    pub fn into_prover(self) -> RelationRangeImageProver<E> {
+        self.prover
+    }
+
+    pub fn input_claim(&self) -> E {
+        self.prover.input_claim
+    }
+
+    pub fn num_rounds(&self) -> usize {
+        self.prover.num_vars
+    }
+
+    pub fn coefficient_bits(&self) -> usize {
+        self.prover.coefficient_bits()
+    }
+
+    pub fn current_coefficient_count(&self) -> usize {
+        self.prover.common_alpha_factor.len()
+    }
+
+    pub fn current_lane_capacity(&self) -> usize {
+        self.prover.relation_lane_weights.len()
+    }
+
+    pub fn current_live_lane_count(&self) -> usize {
+        self.prover.live_lane_count
+    }
+
+    pub fn common_alpha_factor(&self) -> &[E] {
+        &self.prover.common_alpha_factor
+    }
+
+    pub fn remaining_eq_tables(&self) -> (&[E], &[E]) {
+        self.prover.split_eq.remaining_eq_tables()
+    }
+
+    pub fn current_linear_factor_evals(&self) -> (E, E) {
+        self.prover.split_eq.linear_factor_evals()
+    }
+
+    pub fn additional_round(&self) -> DirectAdditionalRound<E> {
+        self.prover.additional_relation_terms.as_ref().map_or(
+            DirectAdditionalRound {
+                pairs: Vec::new(),
+                binary_batching: E::zero(),
+            },
+            AdditionalRelationTerms::direct_round,
+        )
+    }
+
+    pub fn two_round_prefix_data(
+        &self,
+    ) -> Result<Option<DirectRelationTwoRoundPrefixData<'_, E>>, AkitaError> {
+        let Some(stage1_point) = self.prover.compact_prefix_stage1_point.as_deref() else {
+            return Ok(None);
+        };
+        let split = 1 + (stage1_point.len() - 1) / 2;
+        if split < 2 {
+            return Ok(None);
+        }
+        let equality_first = EqPolynomial::evals(&stage1_point[2..split])?;
+        let equality_second = EqPolynomial::evals(&stage1_point[split..])?;
+        let omitted = default_stage2_norm_omitted_corner(stage2_norm_corner_weights_from_taus(
+            stage1_point[0],
+            stage1_point[1],
+        ));
+        Ok(Some(DirectRelationTwoRoundPrefixData {
+            equality_first,
+            equality_second,
+            alpha: &self.prover.common_alpha_factor,
+            lane_weights: &self.prover.relation_lane_weights,
+            basis: self.prover.b,
+            live_lane_count: self.prover.live_lane_count,
+            coefficient_count: self.prover.common_alpha_factor.len(),
+            norm_omitted_corner: omitted.boolean_index(),
+        }))
+    }
+
+    pub fn reconstruct_two_round_prefix(
+        &self,
+        norm_evals_except_corner: [E; 8],
+        relation_evals_except_corner: [E; 8],
+    ) -> Result<DirectRelationTwoRoundPrefixState<E>, AkitaError> {
+        let stage1_point = self
+            .prover
+            .compact_prefix_stage1_point
+            .as_deref()
+            .ok_or(AkitaError::InvalidProof)?;
+        let norm_omitted_corner = default_stage2_norm_omitted_corner(
+            stage2_norm_corner_weights_from_taus(stage1_point[0], stage1_point[1]),
+        );
+        let proof = Stage2BivariateSkipProof {
+            norm: Stage2CompressedGrid {
+                omitted_corner: norm_omitted_corner,
+                evals_except_corner: norm_evals_except_corner,
+            },
+            relation: Stage2CompressedGrid {
+                omitted_corner: BooleanCorner::DEFAULT_STAGE2_RELATION,
+                evals_except_corner: relation_evals_except_corner,
+            },
+        };
+        let inner = Stage2BivariateSkipState::new(
+            &proof,
+            stage1_point,
+            self.prover.range_image_evaluation,
+            self.prover.relation_linear_claim,
+            self.prover.batching_coeff,
+        )
+        .ok_or(AkitaError::InvalidProof)?;
+        Ok(DirectRelationTwoRoundPrefixState { inner })
+    }
+
+    pub fn bind_without_linear_terms(&mut self, challenge: E) {
+        if let Some(additional) = &mut self.prover.additional_relation_terms {
+            additional.bind(challenge);
+        }
+        self.prover.split_eq.bind(challenge);
+        if self.prover.rounds_completed < self.prover.coefficient_bits() {
+            fold_evals_in_place(&mut self.prover.common_alpha_factor, challenge);
+        } else {
+            fold_evals_in_place(&mut self.prover.relation_lane_weights, challenge);
+            self.prover.live_lane_count = self.prover.live_lane_count.div_ceil(2);
+        }
+        self.prover.rounds_completed += 1;
+    }
+
+    pub fn finish_with_linear_evaluation(
+        mut self,
+        final_witness_evaluation: E,
+        final_linear_evaluation: E,
+    ) -> Result<(RelationRangeImageProver<E>, E), AkitaError> {
+        if self.prover.rounds_completed != self.prover.num_vars {
+            return Err(AkitaError::InvalidProof);
+        }
+        self.prover.witness_state = WitnessState::FoldedSuffix(vec![final_witness_evaluation]);
+        self.prover
+            .linear_terms
+            .replace_with_final_value(final_linear_evaluation);
+        let expected = self.prover.expected_final_claim()?;
+        Ok((self.prover, expected))
+    }
+}
+
+fn prove_relation_range_cpu<F, E, T>(
+    mut prover: RelationRangeImageProver<E>,
+    transcript: &mut T,
+) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
+where
+    F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
+    E: ExtField<F> + Ring + Fold + Unreduced + AkitaSerialize,
+    T: Transcript<F>,
+{
+    let (proof, challenges, final_claim) = prover.prove::<F, T, _>(transcript, |tr| {
+        sample_ext_challenge::<F, E, T>(tr, akita_transcript::labels::CHALLENGE_SUMCHECK_ROUND)
+    })?;
+    if final_claim != prover.expected_final_claim()? {
+        return Err(AkitaError::InvalidInput(
+            "stage-2 prover final claim disagrees with its folded oracle".into(),
+        ));
+    }
+    Ok((proof, challenges, prover))
+}
+
+macro_rules! impl_cpu_direct_relation_range {
+    ($backend:ty) => {
+        impl<F, E> DirectRelationRangeProofBackend<F, E> for $backend
+        where
+            F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
+            E: ExtField<F> + Ring + Fold + Unreduced + AkitaSerialize,
+        {
+            type Preparation = ();
+
+            fn prepare_direct_relation_range(
+                &self,
+                _prepared: &Self::PreparedSetup,
+                _input: DirectRelationRangePreparationInput<'_, E>,
+            ) -> Result<Self::Preparation, AkitaError> {
+                Ok(())
+            }
+
+            fn prove_direct_relation_range<T>(
+                &self,
+                _prepared: &Self::PreparedSetup,
+                prover: RelationRangeImageProver<E>,
+                (): Self::Preparation,
+                transcript: &mut T,
+            ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
+            where
+                T: Transcript<F>,
+            {
+                prove_relation_range_cpu::<F, E, T>(prover, transcript)
+            }
+        }
+    };
+}
+
+impl_cpu_direct_relation_range!(CpuBackend);
+impl_cpu_direct_relation_range!(OpeningCluster);
+
+impl<E: Field + Ring + Fold + Unreduced + AkitaSerialize> RelationRangeImageProver<E> {
+    pub fn prove_with_backend<F, T, B>(
+        self,
+        backend: &OperationCtx<'_, F, B>,
+        preparation: B::Preparation,
+        transcript: &mut T,
+    ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
+    where
+        F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
+        E: ExtField<F>,
+        T: Transcript<F>,
+        B: DirectRelationRangeProofBackend<F, E>,
+    {
+        backend.backend().prove_direct_relation_range(
+            backend.prepared(),
+            self,
+            preparation,
+            transcript,
+        )
+    }
+}

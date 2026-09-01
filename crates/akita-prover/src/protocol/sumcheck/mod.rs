@@ -11,9 +11,17 @@ pub mod relation_range_image;
 pub mod two_round_prefix;
 
 pub use akita_stage3::AkitaStage3Prover;
-pub use digit_range::{DigitRangeProver, LowBasisRangeCheckProver};
+pub use digit_range::{
+    DigitRangeProver, DirectDigitRangeProofBackend, DirectDigitRangeProofInput,
+    LowBasisRangeCheckProver,
+};
 pub(crate) use relation_range_image::AdditionalRelationTerms;
-pub use relation_range_image::RelationRangeImageProver;
+pub use relation_range_image::{
+    DirectAdditionalPair, DirectAdditionalRound, DirectLinearLayout, DirectLinearRound,
+    DirectLinearSegment, DirectRelationRangePreparationInput, DirectRelationRangeProofBackend,
+    DirectRelationRangeProofOutput, DirectRelationRangeProofState,
+    DirectRelationTwoRoundPrefixData, DirectRelationTwoRoundPrefixState, RelationRangeImageProver,
+};
 
 // --- Shared helpers ------------------------------------------------------
 
