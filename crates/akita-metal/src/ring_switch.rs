@@ -1,5 +1,5 @@
 use akita_algebra::CyclotomicRing;
-use akita_field::AkitaError;
+use akita_error::AkitaError;
 use akita_prover::backend::RingSwitchRelationView;
 use akita_prover::compute::{
     RingSwitchRelationKernel, RingSwitchRelationPlan, RingSwitchRelationRows,
@@ -7,17 +7,19 @@ use akita_prover::compute::{
 
 use crate::field::{MetalField, F};
 use crate::runtime::D512LinearRelationParams;
-use crate::{MetalCommitBackend, MetalCommitError, MetalPreparedSetup};
+use crate::{MetalBackend, MetalCommitError, MetalPreparedSetup};
+use std::time::Instant;
 
 impl<const D: usize> RingSwitchRelationKernel<RingSwitchRelationView<'_, D>, F, D>
-    for MetalCommitBackend<F>
+    for MetalBackend
 {
     fn relation_rows(
         &self,
-        prepared: &MetalPreparedSetup<F>,
+        prepared: &MetalPreparedSetup,
         source: RingSwitchRelationView<'_, D>,
         plan: RingSwitchRelationPlan,
     ) -> Result<RingSwitchRelationRows<F, D>, AkitaError> {
+        let total_start = Instant::now();
         let rhs_abs_bound = source
             .z_segment
             .iter()
@@ -45,15 +47,26 @@ impl<const D: usize> RingSwitchRelationKernel<RingSwitchRelationView<'_, D>, F, 
                 .saturating_mul(D);
             self.record_opening_cpu_fallback(work_units)
                 .map_err(MetalCommitError::into_akita)?;
-            return self
+            let output = self
                 .cpu_backend()
-                .relation_rows(&prepared.cpu, source, plan);
+                .relation_rows(&prepared.cpu, source, plan)?;
+            tracing::debug!(
+                route = "cpu",
+                ring_dimension = D,
+                n_d = plan.n_d,
+                n_b = plan.n_b,
+                n_a = plan.n_a,
+                z_rows = source.z_segment.len(),
+                elapsed_s = total_start.elapsed().as_secs_f64(),
+                "completed Metal ring-switch relation route"
+            );
+            return Ok(output);
         }
 
         let runtime = self
             .runtime()
             .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
-        let matrix = prepared.shared_matrix(runtime, 512, 1, source.z_segment.len())?;
+        let matrix = prepared.matrix(runtime, 512, 1, source.z_segment.len())?;
         let num_tiles = source.z_segment.len().div_ceil(64);
         let outcome = runtime
             .dispatch_fp128_d512_linear_relation(
@@ -88,14 +101,25 @@ impl<const D: usize> RingSwitchRelationKernel<RingSwitchRelationView<'_, D>, F, 
         self.update_opening_metrics(|metrics| {
             metrics.command_wall_time += timings.command_wall;
             metrics.gpu_active_time += timings.gpu.unwrap_or_default();
-            metrics.upload_time += timings.buffer_setup + matrix.prepare_time;
+            metrics.buffer_setup_time += timings.buffer_setup + matrix.prepare_time;
             metrics.readback_time += timings.readback_copy;
             metrics.allocation_bytes = metrics
                 .allocation_bytes
                 .saturating_add(outcome.allocation_bytes)
-                .saturating_add(matrix.bytes.saturating_mul(usize::from(!matrix.zero_copy)));
+                .saturating_add(matrix.bytes.saturating_mul(usize::from(!matrix.cache_hit)));
         })
         .map_err(MetalCommitError::into_akita)?;
+        tracing::debug!(
+            route = "metal",
+            ring_dimension = D,
+            n_d = plan.n_d,
+            n_b = plan.n_b,
+            n_a = plan.n_a,
+            z_rows = source.z_segment.len(),
+            gpu_s = timings.gpu.map(|duration| duration.as_secs_f64()),
+            elapsed_s = total_start.elapsed().as_secs_f64(),
+            "completed Metal ring-switch relation route"
+        );
         Ok(RingSwitchRelationRows {
             d_negacyclic: Vec::new(),
             d_cyclic: Vec::new(),
@@ -151,7 +175,7 @@ mod tests {
         let cpu_prepared = cpu.prepare_setup(&setup).unwrap();
         let expected = cpu.relation_rows(&cpu_prepared, source, plan).unwrap();
 
-        let metal = MetalCommitBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
+        let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         metal.begin_opening_metrics().unwrap();
         let actual = metal.relation_rows(&metal_prepared, source, plan).unwrap();
