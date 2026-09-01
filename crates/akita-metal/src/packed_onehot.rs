@@ -24,6 +24,7 @@ pub struct PackedOneHotCommitView<'a> {
     column_capacity: usize,
     onehot_k: usize,
     hot_entries: usize,
+    zero_suffix_start: usize,
 }
 
 impl<'a> PackedOneHotCommitView<'a> {
@@ -55,6 +56,7 @@ impl<'a> PackedOneHotCommitView<'a> {
             active_zero_rows,
             zero_column_mask,
             None,
+            None,
         )
     }
 
@@ -76,9 +78,36 @@ impl<'a> PackedOneHotCommitView<'a> {
             active_zero_rows,
             zero_column_mask,
             Some(hot_entries),
+            None,
         )
     }
 
+    /// Reuse producer-side counts and a certified all-zero row suffix.
+    pub fn new_k256_with_precomputed_metrics(
+        column_capacity: usize,
+        num_columns: usize,
+        lanes: &'a [u8],
+        active_zero_rows: &'a [u64],
+        zero_column_mask: u64,
+        hot_entries: usize,
+        zero_suffix_start: usize,
+    ) -> Result<Self, AkitaError> {
+        Self::new_inner(
+            256,
+            column_capacity,
+            num_columns,
+            lanes,
+            active_zero_rows,
+            zero_column_mask,
+            Some(hot_entries),
+            Some(zero_suffix_start),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the borrowed selector view validates each independent source dimension"
+    )]
     fn new_inner(
         onehot_k: usize,
         column_capacity: usize,
@@ -87,6 +116,7 @@ impl<'a> PackedOneHotCommitView<'a> {
         active_zero_rows: &'a [u64],
         zero_column_mask: u64,
         precomputed_hot_entries: Option<usize>,
+        zero_suffix_start: Option<usize>,
     ) -> Result<Self, AkitaError> {
         if onehot_k == 0 || onehot_k > usize::from(u8::MAX) + 1 || !onehot_k.is_power_of_two() {
             return Err(AkitaError::InvalidInput(format!(
@@ -124,6 +154,12 @@ impl<'a> PackedOneHotCommitView<'a> {
         if !total_field_elements.is_power_of_two() {
             return Err(AkitaError::InvalidInput(format!(
                 "packed one-hot logical field length {total_field_elements} is not a power of two"
+            )));
+        }
+        let zero_suffix_start = zero_suffix_start.unwrap_or(num_rows);
+        if zero_suffix_start > num_rows {
+            return Err(AkitaError::InvalidInput(format!(
+                "packed one-hot zero suffix starts at row {zero_suffix_start}, beyond {num_rows} rows"
             )));
         }
         let live_column_mask = if num_columns == u64::BITS as usize {
@@ -185,6 +221,7 @@ impl<'a> PackedOneHotCommitView<'a> {
             column_capacity,
             onehot_k,
             hot_entries,
+            zero_suffix_start,
         })
     }
 
@@ -226,6 +263,10 @@ impl<'a> PackedOneHotCommitView<'a> {
 
     pub(crate) fn hot_entries(self) -> usize {
         self.hot_entries
+    }
+
+    pub(crate) fn zero_suffix_start(self) -> usize {
+        self.zero_suffix_start
     }
 }
 
@@ -540,5 +581,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(precomputed.hot_entries(), scanned.hot_entries());
+        let with_suffix = PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+            4,
+            2,
+            &lanes,
+            &[0b0101],
+            0b01,
+            scanned.hot_entries(),
+            3,
+        )
+        .unwrap();
+        assert_eq!(with_suffix.zero_suffix_start(), 3);
+        assert!(PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+            4,
+            2,
+            &lanes,
+            &[0b0101],
+            0b01,
+            scanned.hot_entries(),
+            5,
+        )
+        .is_err());
     }
 }

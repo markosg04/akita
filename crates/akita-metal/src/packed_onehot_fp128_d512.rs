@@ -27,6 +27,7 @@ pub(crate) struct ValidatedShape {
     output_coefficients: usize,
     positions_per_partial: usize,
     blocks_per_column: usize,
+    full_blocks_per_column: usize,
     live_columns: usize,
 }
 
@@ -87,6 +88,11 @@ pub(crate) fn validate_shape<const D: usize>(
         )
         .into_akita());
     }
+    let full_blocks_per_column = source
+        .zero_suffix_start()
+        .div_ceil(rows_per_block)
+        .max(1)
+        .min(blocks_per_column);
     let output_coefficients = source
         .column_capacity()
         .checked_mul(blocks_per_column)
@@ -98,6 +104,7 @@ pub(crate) fn validate_shape<const D: usize>(
         output_coefficients,
         positions_per_partial,
         blocks_per_column,
+        full_blocks_per_column,
         live_columns: source.num_columns(),
     })
 }
@@ -114,7 +121,7 @@ pub(crate) fn commit_validated<const D: usize>(
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
     let work_units = shape
         .live_columns
-        .checked_mul(shape.blocks_per_column)
+        .checked_mul(shape.full_blocks_per_column)
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 work units").into_akita())?;
     let params = PackedOneHotCommitParams {
         num_rows: to_u64(source.num_rows(), "fp128 D512 row count")?,
@@ -127,7 +134,7 @@ pub(crate) fn commit_validated<const D: usize>(
         positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
         num_digits_inner: 1,
         blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 block count")?,
-        full_blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 full blocks")?,
+        full_blocks_per_column: to_u64(shape.full_blocks_per_column, "fp128 D512 full blocks")?,
         boundary_columns: 0,
         num_blocks: to_u64(work_units, "fp128 D512 work units")?,
         task_offset: 0,
@@ -184,6 +191,10 @@ pub(crate) fn commit_validated<const D: usize>(
         readback_copy_s = outcome.timings.readback_copy.as_secs_f64(),
         reconstruction_s = output_reconstruction_time.as_secs_f64(),
         lane_bytes = source.lanes().len(),
+        hot_entries = source.hot_entries(),
+        zero_suffix_start = source.zero_suffix_start(),
+        blocks_per_column = shape.blocks_per_column,
+        full_blocks_per_column = shape.full_blocks_per_column,
         output_coefficients = shape.output_coefficients,
         "completed packed Metal trace commitment"
     );
@@ -228,14 +239,20 @@ mod tests {
     use super::*;
     use crate::{MetalExecutionPolicy, PackedOneHotCommitView};
 
-    fn assert_panel_parity(onehot_k: usize, rows: usize, capacity: usize) {
+    fn assert_panel_parity(
+        onehot_k: usize,
+        rows: usize,
+        capacity: usize,
+        zero_suffix_start: Option<usize>,
+    ) {
         const LIVE_COLUMNS: usize = 5;
         const POSITIONS_PER_BLOCK: usize = 64;
         const ZERO_COLUMN_MASK: u64 = 0b0_1010;
 
         let lanes = (0..rows * LIVE_COLUMNS)
             .map(|index| {
-                if index.is_multiple_of(97) {
+                let row = index / LIVE_COLUMNS;
+                if row < zero_suffix_start.unwrap_or(rows) && index.is_multiple_of(97) {
                     ((index.wrapping_mul(73) % (onehot_k - 1)) + 1) as u8
                 } else {
                     0
@@ -243,10 +260,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut active_zero_rows = vec![0u64; rows / u64::BITS as usize];
-        for row in (0..rows).step_by(11) {
+        for row in (0..zero_suffix_start.unwrap_or(rows)).step_by(11) {
             active_zero_rows[row / u64::BITS as usize] |= 1u64 << (row % u64::BITS as usize);
         }
-        let indices = (0..capacity)
+        let indices: Vec<Option<u8>> = (0..capacity)
             .flat_map(|column| {
                 let lanes = &lanes;
                 let active_zero_rows = &active_zero_rows;
@@ -264,6 +281,7 @@ mod tests {
                 })
             })
             .collect();
+        let hot_entries = indices.iter().filter(|entry| entry.is_some()).count();
         let generic = OneHotPoly::<F, u8>::new(onehot_k, indices).unwrap();
         let plan = CommitInnerPlan {
             n_a: 1,
@@ -292,15 +310,28 @@ mod tests {
 
         let metal = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
-        let source = PackedOneHotCommitView::new_with_active_zero_rows(
-            onehot_k,
-            capacity,
-            LIVE_COLUMNS,
-            &lanes,
-            &active_zero_rows,
-            ZERO_COLUMN_MASK,
-        )
-        .unwrap();
+        let source = if let (256, Some(zero_suffix_start)) = (onehot_k, zero_suffix_start) {
+            PackedOneHotCommitView::new_k256_with_precomputed_metrics(
+                capacity,
+                LIVE_COLUMNS,
+                &lanes,
+                &active_zero_rows,
+                ZERO_COLUMN_MASK,
+                hot_entries,
+                zero_suffix_start,
+            )
+            .unwrap()
+        } else {
+            PackedOneHotCommitView::new_with_active_zero_rows(
+                onehot_k,
+                capacity,
+                LIVE_COLUMNS,
+                &lanes,
+                &active_zero_rows,
+                ZERO_COLUMN_MASK,
+            )
+            .unwrap()
+        };
         let metal_witness = metal
             .commit_packed_onehot::<RING_D>(&metal_prepared, source, plan)
             .unwrap();
@@ -317,11 +348,16 @@ mod tests {
 
     #[test]
     fn parity_d512_k256_panels() {
-        assert_panel_parity(256, 4096, 32);
+        assert_panel_parity(256, 4096, 32, None);
+    }
+
+    #[test]
+    fn parity_d512_k256_panels_skip_zero_suffix() {
+        assert_panel_parity(256, 4096, 32, Some(2048));
     }
 
     #[test]
     fn parity_d512_k16_panels() {
-        assert_panel_parity(16, 2048, 64);
+        assert_panel_parity(16, 2048, 64, None);
     }
 }
