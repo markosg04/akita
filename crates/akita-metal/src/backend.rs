@@ -600,6 +600,14 @@ impl DirectDigitRangeProofBackend<F, F> for MetalBackend {
                 actual: input.digit_witness_len(),
             });
         }
+        let _direct_span = tracing::info_span!(
+            "direct_digit_range_metal",
+            domain_len,
+            live_len = input.digit_witness_len(),
+            num_vars,
+            basis = input.plan().basis(),
+        )
+        .entered();
         let runtime = match self.runtime() {
             Some(runtime) => runtime,
             None if self.policy() == MetalExecutionPolicy::PreferMetal => {
@@ -612,16 +620,19 @@ impl DirectDigitRangeProofBackend<F, F> for MetalBackend {
             input.decode_digit_witness()
         };
         const COMPACT_PREFIX_ROUNDS: usize = 3;
-        let (mut session, setup_time) = match runtime.begin_fp128_direct_range(
-            &decoded_witness,
-            domain_len,
-            COMPACT_PREFIX_ROUNDS,
-        ) {
-            Ok(session) => session,
-            Err(_error) if self.policy() == MetalExecutionPolicy::PreferMetal => {
-                return self.direct_range_cpu_fallback(prepared, input, transcript)
+        let (mut session, setup_time) = {
+            let _span = tracing::info_span!("direct_range_session_setup").entered();
+            match runtime.begin_fp128_direct_range(
+                &decoded_witness,
+                domain_len,
+                COMPACT_PREFIX_ROUNDS,
+            ) {
+                Ok(session) => session,
+                Err(_error) if self.policy() == MetalExecutionPolicy::PreferMetal => {
+                    return self.direct_range_cpu_fallback(prepared, input, transcript)
+                }
+                Err(error) => return Err(error.into_akita()),
             }
-            Err(error) => return Err(error.into_akita()),
         };
         self.update_opening_metrics(|metrics| {
             metrics.buffer_setup_time += setup_time;
@@ -633,14 +644,16 @@ impl DirectDigitRangeProofBackend<F, F> for MetalBackend {
 
         let mut split_eq = GruenSplitEq::new(input.equality_point())?;
         let (first_eq, second_eq) = direct_range_eq_tables(&split_eq);
-        let initial = runtime
-            .dispatch_fp128_direct_range_initial(
+        let initial = {
+            let _span = tracing::info_span!("direct_range_initial").entered();
+            runtime.dispatch_fp128_direct_range_initial(
                 &session,
                 &first_eq,
                 &second_eq,
                 input.plan().basis(),
             )
-            .map_err(MetalCommitError::into_akita)?;
+        }
+        .map_err(MetalCommitError::into_akita)?;
         self.record_direct_range_dispatch(initial.timings, initial.allocation_bytes)?;
 
         let mut next_poly = direct_range_round_poly(&initial, input.plan().basis())?;
@@ -672,15 +685,17 @@ impl DirectDigitRangeProofBackend<F, F> for MetalBackend {
             let next_eq = next_eq_storage
                 .as_ref()
                 .map(|(first, second)| (first.as_slice(), second.as_slice()));
-            let advance = runtime
-                .dispatch_fp128_direct_range_advance(
+            let advance = {
+                let _span = tracing::info_span!("direct_range_advance", round).entered();
+                runtime.dispatch_fp128_direct_range_advance(
                     &mut session,
                     crate::field::Fp128Limbs::from_field(challenge),
                     next_eq,
                     &prefix_weights,
                     input.plan().basis(),
                 )
-                .map_err(MetalCommitError::into_akita)?;
+            }
+            .map_err(MetalCommitError::into_akita)?;
             self.record_direct_range_dispatch(advance.timings, advance.allocation_bytes)?;
             if let Some(coefficients) = advance.next_coefficients {
                 next_poly = direct_range_round_poly(
