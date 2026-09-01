@@ -2766,11 +2766,15 @@ inline AkitaFp128 akita_direct_range_eq_weight(
     return akita_mul(e_first[low], e_second[high]);
 }
 
+// Coefficients q1..q4 of the per-pair range polynomial q(X) = A(X) B(X) with
+// A(X) = (l + dX)(l + dX - 2) and, for basis eight, B(X) = (l + dX)^2 - 18(l + dX) + 72.
+// The constant coefficient q0 is omitted: the normalized eq-factored round message
+// stores `[q_1, ..., q_d]` and the verifier recovers q0 from the running claim.
 inline void akita_direct_range_q_coefficients(
     AkitaFp128 left,
     AkitaFp128 right,
     uint basis,
-    thread AkitaFp128 &q0,
+    thread AkitaFp128 &q1,
     thread AkitaFp128 &q2,
     thread AkitaFp128 &q3,
     thread AkitaFp128 &q4)
@@ -2778,7 +2782,9 @@ inline void akita_direct_range_q_coefficients(
     AkitaFp128 delta = akita_sub(right, left);
     AkitaFp128 delta_squared = akita_mul(delta, delta);
     if (basis == 4u) {
-        q0 = akita_mul(left, akita_sub(left, akita_from_u32(2u)));
+        q1 = akita_mul(
+            delta,
+            akita_sub(akita_mul_signed_small(left, 2l), akita_from_u32(2u)));
         q2 = delta_squared;
         q3 = akita_zero();
         q4 = akita_zero();
@@ -2799,7 +2805,9 @@ inline void akita_direct_range_q_coefficients(
         delta,
         akita_sub(akita_mul_signed_small(left, 2l), akita_from_u32(18u)));
 
-    q0 = akita_mul(first_quadratic, second_quadratic);
+    q1 = akita_add(
+        akita_mul(first_quadratic, second_linear),
+        akita_mul(first_linear, second_quadratic));
     q2 = akita_add(
         akita_add(
             akita_mul(first_quadratic, delta_squared),
@@ -3003,15 +3011,15 @@ kernel void akita_fp128_direct_range_compact_fold_partials(
                 folded[output_index] = value;
             }
         }
-        AkitaFp128 q0;
+        AkitaFp128 q1;
         AkitaFp128 q2;
         AkitaFp128 q3;
         AkitaFp128 q4;
         akita_direct_range_q_coefficients(
-            values[0], values[1], (uint)params.basis, q0, q2, q3, q4);
+            values[0], values[1], (uint)params.basis, q1, q2, q3, q4);
         AkitaFp128 weight = akita_direct_range_eq_weight(
             e_first, e_second, pair, params);
-        sum_0 = akita_add(sum_0, akita_mul(weight, q0));
+        sum_0 = akita_add(sum_0, akita_mul(weight, q1));
         sum_2 = akita_add(sum_2, akita_mul(weight, q2));
         sum_3 = akita_add(sum_3, akita_mul(weight, q3));
         sum_4 = akita_add(sum_4, akita_mul(weight, q4));
@@ -3084,15 +3092,15 @@ kernel void akita_fp128_direct_range_field_fold_partials(
             }
             values[side] = value;
         }
-        AkitaFp128 q0;
+        AkitaFp128 q1;
         AkitaFp128 q2;
         AkitaFp128 q3;
         AkitaFp128 q4;
         akita_direct_range_q_coefficients(
-            values[0], values[1], (uint)params.basis, q0, q2, q3, q4);
+            values[0], values[1], (uint)params.basis, q1, q2, q3, q4);
         AkitaFp128 weight = akita_direct_range_eq_weight(
             e_first, e_second, pair, params);
-        sum_0 = akita_add(sum_0, akita_mul(weight, q0));
+        sum_0 = akita_add(sum_0, akita_mul(weight, q1));
         sum_2 = akita_add(sum_2, akita_mul(weight, q2));
         sum_3 = akita_add(sum_3, akita_mul(weight, q3));
         sum_4 = akita_add(sum_4, akita_mul(weight, q4));

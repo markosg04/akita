@@ -1,9 +1,10 @@
 use super::*;
 
-pub(in crate::protocol::core) fn prove_stage1<F, E, T>(
+pub(in crate::protocol::core) fn prove_stage1<F, E, T, O>(
     transcript: &mut T,
     level: u32,
-    rs: &mut RingSwitchOutput<E>,
+    opening: &crate::compute::OperationCtx<'_, F, O>,
+    rs: &RingSwitchOutput<E>,
     lp: &CommittedGroupParams,
     plan: &RelationRangeImagePlan,
 ) -> Result<Stage1ProveOutput<E>, AkitaError>
@@ -11,6 +12,7 @@ where
     F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
     E: ExtField<F> + Unreduced + Fold + Ring + AkitaSerialize,
     T: akita_types::ProverTranscriptGrinding<F>,
+    O: crate::DirectDigitRangeProofBackend<F, E>,
 {
     let _sumcheck_span = tracing::info_span!("stage1_sumcheck").entered();
     let domain = plan.digit_witness_domain();
@@ -39,8 +41,12 @@ where
         equality_point,
     )?;
     let physical_plan = PhysicalResponsePlan::new(lp, plan)?;
-    let (stage1_proof, stage1_point) =
-        stage1_prover.prove::<F, T>(transcript, physical_plan.as_ref(), level)?;
+    let (stage1_proof, stage1_point) = stage1_prover.prove_with_backend::<F, T, O>(
+        opening,
+        transcript,
+        physical_plan.as_ref(),
+        level,
+    )?;
     let range_image_evaluation = stage1_proof.range_image_evaluation;
     let physical_l2 = match physical_plan {
         Some(physical_plan) => {
@@ -87,9 +93,10 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prove_stage2<F, E, T>(
+pub(super) fn prove_stage2<F, E, T, O>(
     level: usize,
     transcript: &mut T,
+    opening: &crate::compute::OperationCtx<'_, F, O>,
     batching_coeff: E,
     rs: RingSwitchOutput<E>,
     stage1_point: &[E],
@@ -100,11 +107,13 @@ pub(super) fn prove_stage2<F, E, T>(
     linear_terms: PreparedProverLinearTerms<E>,
     trace_opening_claim: E,
     plan: RelationRangeImagePlan,
+    preparation: O::Preparation,
 ) -> Result<RelationRangeImageProveResult<E>, AkitaError>
 where
     F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
     E: ExtField<F> + Unreduced + Fold + Ring + AkitaSerialize,
     T: akita_types::ProverTranscriptGrinding<F>,
+    O: crate::DirectRelationRangeProofBackend<F, E>,
 {
     let _sumcheck_span = tracing::info_span!("stage2_sumcheck").entered();
     let domain = plan.digit_witness_domain();
@@ -172,7 +181,7 @@ where
         - additional_relation_terms
             .as_ref()
             .map_or_else(E::zero, AdditionalRelationTerms::input_claim);
-    let mut stage2_prover = RelationRangeImageProver::new(
+    let stage2_prover = RelationRangeImageProver::new(
         batching_coeff,
         rs.w_evals_compact,
         stage1_point,
@@ -195,27 +204,7 @@ where
     })?;
     let level = u32::try_from(level)
         .map_err(|_| AkitaError::InvalidSetup("fold level exceeds u32".into()))?;
-    let mut round = 0u32;
-    let (stage2_sumcheck_proof, sumcheck_challenges, final_claim) = stage2_prover
-        .prove::<F, T, _>(transcript, |tr| {
-            let challenge = akita_types::sample_grinded_sumcheck_challenge::<F, E, T>(
-                tr,
-                akita_types::SumcheckProtocol::Stage2,
-                level,
-                0,
-                round,
-            )?;
-            round = round
-                .checked_add(1)
-                .ok_or_else(|| AkitaError::InvalidSetup("Stage 2 round overflow".into()))?;
-            Ok(challenge)
-        })?;
-    if final_claim != stage2_prover.expected_final_claim()? {
-        return Err(AkitaError::InvalidInput(
-            "stage-2 prover final claim disagrees with its folded oracle".into(),
-        ));
-    }
-    Ok((stage2_sumcheck_proof, sumcheck_challenges, stage2_prover))
+    stage2_prover.prove_with_backend::<F, T, O>(opening, preparation, transcript, level)
 }
 
 #[allow(clippy::too_many_arguments)]

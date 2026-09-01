@@ -97,6 +97,8 @@ where
             RecursiveFoldSource<Cfg::Field>,
             Cfg::ExtField,
         > + DigitRowsComputeBackend<Cfg::Field>
+        + crate::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + crate::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + ComputeBackendSetup<Cfg::Field>
         + 'stack,
     TS: SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>

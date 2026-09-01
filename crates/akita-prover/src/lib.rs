@@ -44,7 +44,12 @@ pub use compute::{
     TieredProveStacks, UniformProverStack,
 };
 pub use protocol::sumcheck::{
-    DigitRangeProver, LowBasisRangeCheckProver, RelationRangeImageProver,
+    DigitRangeProver, DirectAdditionalPair, DirectAdditionalRound, DirectDigitRangeProofBackend,
+    DirectDigitRangeProofInput, DirectLinearLayout, DirectLinearRound, DirectLinearSegment,
+    DirectRelationRangePreparationInput, DirectRelationRangeProofBackend,
+    DirectRelationRangeProofOutput, DirectRelationRangeProofState,
+    DirectRelationTwoRoundPrefixData, DirectRelationTwoRoundPrefixState, LowBasisRangeCheckProver,
+    RelationRangeImageProver,
 };
 pub use protocol::{
     batched_prove, build_relation_weight_events, commit_terminal_w, commit_w, prove, prove_suffix,

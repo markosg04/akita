@@ -69,6 +69,8 @@ where
             Cfg::ExtField,
         > + SuffixOpeningProveBackend<Cfg::Field>
         + DigitRowsComputeBackend<Cfg::Field>
+        + crate::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + crate::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + 'a,
     TS: ComputeBackendSetup<Cfg::Field>
         + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
@@ -178,6 +180,8 @@ where
             Cfg::ExtField,
         > + SuffixOpeningProveBackend<Cfg::Field>
         + DigitRowsComputeBackend<Cfg::Field>
+        + crate::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+        + crate::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
         + 'a,
     TS: ComputeBackendSetup<Cfg::Field>
         + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>

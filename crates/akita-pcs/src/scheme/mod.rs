@@ -151,6 +151,8 @@ where
                 Cfg::ExtField,
             > + SuffixOpeningProveBackend<Cfg::Field>
             + DigitRowsComputeBackend<Cfg::Field>
+            + akita_prover::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + akita_prover::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
             + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>
             + SuffixTensorProveBackend<Cfg::Field, Cfg::ExtField>
             + RuntimeRingSwitchProveBackend<Cfg::Field>
@@ -199,7 +201,7 @@ where
         basis: BasisMode,
     ) -> Result<AkitaBatchedProof<Cfg::Field, Cfg::ExtField>, AkitaError>
     where
-        T: Transcript<Cfg::Field> + ProverTranscriptGrind<Cfg::Field>,
+        T: Transcript<Cfg::Field> + TranscriptChallengePreview,
         Cfg::Field: Ring + Unreduced + Field + 'static,
         <Cfg::Field as Unreduced>::Wide: From<Cfg::Field> + AdditiveGroup,
         P: PreparedGroupProveOps<Cfg::Field, Cfg::ExtField, O>,
@@ -214,6 +216,8 @@ where
                 Cfg::ExtField,
             > + SuffixOpeningProveBackend<Cfg::Field>
             + DigitRowsComputeBackend<Cfg::Field>
+            + akita_prover::DirectDigitRangeProofBackend<Cfg::Field, Cfg::ExtField>
+            + akita_prover::DirectRelationRangeProofBackend<Cfg::Field, Cfg::ExtField>
             + 'a,
         TS: ComputeBackendSetup<Cfg::Field>
             + RuntimeTensorBackendFor<Cfg::Field, RecursiveFoldSource<Cfg::Field>, Cfg::ExtField>

@@ -81,20 +81,25 @@
 use super::fold_prefix_pair_with_zero_padding as fold_folded_lane_pair;
 use super::two_round_prefix::{
     build_stage2_bivariate_skip_proof_from_m_compact, can_use_stage2_two_round_prefix,
-    Stage2BivariateSkipState,
+    default_stage2_norm_omitted_corner, stage2_norm_corner_weights_from_taus, BooleanCorner,
+    Stage2BivariateSkipProof, Stage2BivariateSkipState, Stage2CompressedGrid,
 };
 use super::two_round_prefix::{
     stage2_b4_lookup_index_from_digits, stage2_b4_w_digit, stage2_b8_lookup_index_from_digits,
     stage2_b8_w_digit,
 };
+use crate::compute::{ComputeBackendSetup, CpuBackend, OpeningCluster, OperationCtx};
+use akita_algebra::eq_poly::EqPolynomial;
 use akita_algebra::poly::trim_trailing_zeros;
 use akita_algebra::split_eq::GruenSplitEq;
 use akita_error::AkitaError;
+use akita_serialization::AkitaSerialize;
 use akita_sumcheck::{
-    fold_evals_in_place, reduce_signed_accum, CompactPairFoldLut, SumcheckInstanceProver, UniPoly,
+    fold_evals_in_place, reduce_signed_accum, CompactPairFoldLut, SumcheckInstanceProver,
+    SumcheckInstanceProverExt, UniPoly,
 };
 use jolt_field::solinas::parallel::*;
-use jolt_field::{Field, Ring, Zero};
+use jolt_field::{CanonicalEncoding, ExtField, Field, Ring, Zero};
 use jolt_field::{Fold, Unreduced};
 use std::mem;
 use std::time::Instant;
@@ -255,6 +260,208 @@ pub struct RelationRangeImageProver<E: Field> {
     scan_time_total: f64,
     fold_time_total: f64,
     rounds_completed: usize,
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DirectLinearSegment<E: Field> {
+    pub factor: E,
+    pub source_index: usize,
+    pub target_lane_start: usize,
+    pub target_lane_stride: usize,
+    pub source_lane_start: usize,
+    pub source_lane_stride: usize,
+    pub lane_count: usize,
+}
+
+#[doc(hidden)]
+pub struct DirectLinearLayout<E: Field> {
+    pub segments: Vec<DirectLinearSegment<E>>,
+    pub lane_offsets: Vec<usize>,
+    pub lane_segments: Vec<usize>,
+    pub source_count: usize,
+}
+
+#[doc(hidden)]
+pub struct DirectLinearRound<E: Field> {
+    pub sources: Vec<Vec<E>>,
+    pub dense_values: Option<Vec<E>>,
+}
+
+#[doc(hidden)]
+pub struct DirectAdditionalPair<E: Field> {
+    pub parent: usize,
+    pub linear: [E; 2],
+    pub binary: [E; 2],
+}
+
+#[doc(hidden)]
+pub struct DirectAdditionalRound<E: Field> {
+    pub pairs: Vec<DirectAdditionalPair<E>>,
+    pub binary_batching: E,
+}
+
+#[doc(hidden)]
+pub struct DirectRelationTwoRoundPrefixData<'a, E: Field> {
+    pub equality_first: Vec<E>,
+    pub equality_second: Vec<E>,
+    pub alpha: &'a [E],
+    pub lane_weights: &'a [E],
+    pub basis: usize,
+    pub live_lane_count: usize,
+    pub coefficient_count: usize,
+    pub norm_omitted_corner: usize,
+}
+
+#[doc(hidden)]
+pub struct DirectRelationTwoRoundPrefixState<E: Field> {
+    inner: Stage2BivariateSkipState<E>,
+}
+
+impl<E: Field> DirectRelationTwoRoundPrefixState<E> {
+    fn coefficients_except_linear(norm: UniPoly<E>, relation: UniPoly<E>) -> [E; 3] {
+        [0usize, 2, 3].map(|coefficient| {
+            norm.coeffs
+                .get(coefficient)
+                .copied()
+                .unwrap_or_else(E::zero)
+                + relation
+                    .coeffs
+                    .get(coefficient)
+                    .copied()
+                    .unwrap_or_else(E::zero)
+        })
+    }
+
+    pub fn round_zero_coefficients_except_linear(&self) -> [E; 3] {
+        let (norm, relation) = self.inner.reconstruct_round0_polys();
+        Self::coefficients_except_linear(norm, relation)
+    }
+
+    pub fn round_one_coefficients_except_linear(&self, round_zero_challenge: E) -> [E; 3] {
+        let (norm, relation) = self.inner.reconstruct_round1_polys(round_zero_challenge);
+        Self::coefficients_except_linear(norm, relation)
+    }
+}
+
+#[doc(hidden)]
+pub struct DirectRelationRangeProofState<E: Field> {
+    prover: RelationRangeImageProver<E>,
+}
+
+#[doc(hidden)]
+pub struct DirectRelationRangePreparationInput<'a, E: Field> {
+    compact_witness: &'a PackedSignedDigits,
+    domain_len: usize,
+    coefficient_rounds: usize,
+    relation_lane_weights: &'a [E],
+    linear_terms: &'a mut PreparedProverLinearTerms<E>,
+}
+
+impl<'a, E: Field> DirectRelationRangePreparationInput<'a, E> {
+    pub(crate) fn new(
+        compact_witness: &'a PackedSignedDigits,
+        domain_len: usize,
+        coefficient_rounds: usize,
+        relation_lane_weights: &'a [E],
+        linear_terms: &'a mut PreparedProverLinearTerms<E>,
+    ) -> Self {
+        Self {
+            compact_witness,
+            domain_len,
+            coefficient_rounds,
+            relation_lane_weights,
+            linear_terms,
+        }
+    }
+
+    pub fn from_prover(prover: &'a mut RelationRangeImageProver<E>) -> Result<Self, AkitaError> {
+        let coefficient_count = prover.common_alpha_factor.len();
+        if !coefficient_count.is_power_of_two() {
+            return Err(AkitaError::InvalidSetup(
+                "direct relation coefficient count must be a power of two".into(),
+            ));
+        }
+        let domain_len = coefficient_count
+            .checked_mul(prover.relation_lane_weights.len())
+            .ok_or_else(|| {
+                AkitaError::InvalidSetup("direct relation domain length overflow".into())
+            })?;
+        let compact_witness = match &prover.witness_state {
+            WitnessState::CompactPrefix(witness) => witness,
+            WitnessState::FoldedSuffix(_) => {
+                return Err(AkitaError::InvalidSetup(
+                    "direct relation preparation requires the compact witness".into(),
+                ))
+            }
+        };
+        Ok(Self {
+            compact_witness,
+            domain_len,
+            coefficient_rounds: coefficient_count.trailing_zeros() as usize,
+            relation_lane_weights: &prover.relation_lane_weights,
+            linear_terms: &mut prover.linear_terms,
+        })
+    }
+
+    pub fn decode_compact_witness(&self) -> Vec<i8> {
+        self.compact_witness.decode()
+    }
+
+    pub const fn domain_len(&self) -> usize {
+        self.domain_len
+    }
+
+    pub const fn coefficient_rounds(&self) -> usize {
+        self.coefficient_rounds
+    }
+
+    pub const fn relation_lane_weights(&self) -> &[E] {
+        self.relation_lane_weights
+    }
+
+    pub fn linear_layout(&self) -> DirectLinearLayout<E> {
+        self.linear_terms.direct_layout()
+    }
+
+    pub fn linear_round(&self) -> DirectLinearRound<E> {
+        self.linear_terms.direct_round()
+    }
+}
+
+pub type DirectRelationRangeProofOutput<E> = (
+    akita_sumcheck::SumcheckProof<E>,
+    Vec<E>,
+    RelationRangeImageProver<E>,
+);
+
+pub trait DirectRelationRangeProofBackend<F, E>: ComputeBackendSetup<F>
+where
+    F: Field + CanonicalEncoding + akita_serialization::AkitaSerialize,
+    E: ExtField<F> + Ring + Fold + Unreduced + AkitaSerialize,
+{
+    type Preparation: Send;
+
+    fn should_overlap_direct_relation_preparation(&self) -> bool {
+        false
+    }
+
+    fn prepare_direct_relation_range(
+        &self,
+        prepared: &Self::PreparedSetup,
+        input: DirectRelationRangePreparationInput<'_, E>,
+    ) -> Result<Self::Preparation, AkitaError>;
+
+    fn prove_direct_relation_range<T>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        prover: RelationRangeImageProver<E>,
+        preparation: Self::Preparation,
+        transcript: &mut T,
+        level: u32,
+    ) -> Result<DirectRelationRangeProofOutput<E>, AkitaError>
+    where
+        T: akita_types::ProverTranscriptGrinding<F>;
 }
 
 mod additional_terms;

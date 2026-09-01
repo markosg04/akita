@@ -145,7 +145,11 @@ where
     T: akita_types::ProverTranscriptGrinding<F>,
     P: RootProverGroupOpening<F, E, O> + Clone,
     C: RuntimeCommitBackendFor<F, RecursiveWitnessFlat> + ComputeBackendSetup<F> + 'stack,
-    O: DigitRowsComputeBackend<F> + ComputeBackendSetup<F> + 'stack,
+    O: DigitRowsComputeBackend<F>
+        + crate::DirectDigitRangeProofBackend<F, E>
+        + crate::DirectRelationRangeProofBackend<F, E>
+        + ComputeBackendSetup<F>
+        + 'stack,
     TS: ComputeBackendSetup<F> + 'stack,
     R: RuntimeRingSwitchProveBackend<F>
         + DigitRowsComputeBackend<F>
