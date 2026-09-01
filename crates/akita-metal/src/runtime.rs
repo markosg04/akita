@@ -357,9 +357,10 @@ pub(crate) struct PackedDecomposeFoldParams {
     pub(crate) blocks_per_column: u64,
     pub(crate) challenge_weight: u64,
     pub(crate) output_coefficients: u64,
+    pub(crate) zero_column_mask: u64,
 }
 
-const _: [(); 64] = [(); size_of::<PackedDecomposeFoldParams>()];
+const _: [(); 72] = [(); size_of::<PackedDecomposeFoldParams>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -2463,6 +2464,7 @@ impl MetalRuntime {
     pub(crate) fn dispatch_packed_fp128_d512_decompose_fold_streaming(
         &self,
         lanes: &[u8],
+        active_zero_rows: &[u64],
         challenge_positions: &[u16],
         challenge_coefficients: &[i8],
         dense_subring64_challenges: Option<&[i8]>,
@@ -2493,9 +2495,20 @@ impl MetalRuntime {
                 .ok_or(MetalCommitError::ShapeOverflow(
                     "dense subring challenge coefficients",
                 ))?;
+            let expected_active_zero_words = params.num_rows.div_ceil(u64::BITS.into());
+            let live_column_mask = if params.num_columns >= u64::BITS.into() {
+                u64::MAX
+            } else {
+                (1u64 << params.num_columns) - 1
+            };
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
+                || params.zero_column_mask & !live_column_mask != 0
+                || (params.zero_column_mask == 0 && !active_zero_rows.is_empty())
+                || (params.zero_column_mask != 0
+                    && u64::try_from(active_zero_rows.len()).ok()
+                        != Some(expected_active_zero_words))
                 || params.challenge_weight == 0
                 || params.position_start != 0
                 || position_chunk_len == 0
@@ -2519,6 +2532,13 @@ impl MetalRuntime {
 
             let buffer_start = Instant::now();
             let lane_buffer = self.packed_lane_buffer(lanes)?;
+            let no_active_zero_rows = [0u64];
+            let active_zero_rows = if active_zero_rows.is_empty() {
+                no_active_zero_rows.as_slice()
+            } else {
+                active_zero_rows
+            };
+            let active_zero_buffer = self.shared_buffer_from_slice(active_zero_rows)?;
             let positions = self.shared_buffer_from_slice(challenge_positions)?;
             let coefficients = self.shared_buffer_from_slice(challenge_coefficients)?;
             let dense_challenges = dense_subring64_challenges
@@ -2579,6 +2599,7 @@ impl MetalRuntime {
                     encoder.set_buffer(1, Some(dense_challenges), 0);
                     encoder.set_buffer(2, Some(&output), output_offset as u64);
                     set_inline_bytes(encoder, 3, &command_params);
+                    encoder.set_buffer(4, Some(&active_zero_buffer), 0);
                 } else {
                     encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
                     encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
@@ -2586,6 +2607,7 @@ impl MetalRuntime {
                     encoder.set_buffer(2, Some(&coefficients), 0);
                     encoder.set_buffer(3, Some(&output), output_offset as u64);
                     set_inline_bytes(encoder, 4, &command_params);
+                    encoder.set_buffer(5, Some(&active_zero_buffer), 0);
                 }
                 encoder.dispatch_thread_groups(
                     MTLSize::new(position_count as u64, 1, 1),
@@ -2632,6 +2654,7 @@ impl MetalRuntime {
             let allocation_bytes = output_bytes
                 .checked_add(size_of_val(challenge_positions))
                 .and_then(|bytes| bytes.checked_add(size_of_val(challenge_coefficients)))
+                .and_then(|bytes| bytes.checked_add(size_of_val(active_zero_rows)))
                 .and_then(|bytes| {
                     bytes.checked_add(dense_subring64_challenges.map_or(0, size_of_val))
                 })
@@ -6804,12 +6827,15 @@ mod tests {
             blocks_per_column: BLOCKS_PER_COLUMN as u64,
             challenge_weight: CHALLENGE_WEIGHT as u64,
             output_coefficients: (POSITIONS * 512) as u64,
+            zero_column_mask: 1,
         };
+        let active_zero_rows = [1u64];
         let mut streamed = Vec::new();
         let mut chunk_starts = Vec::new();
         let actual = runtime
             .dispatch_packed_fp128_d512_decompose_fold_streaming(
                 &lanes,
+                &active_zero_rows,
                 &challenge_positions,
                 &challenge_coefficients,
                 None,
@@ -6830,7 +6856,12 @@ mod tests {
                         let ring = trace_block * POSITIONS + position;
                         let row = 2 * ring + row_in_ring;
                         let hot = usize::from(lanes[row * COLUMNS + column]);
-                        if hot == 0 {
+                        let committed_zero = hot == 0
+                            && column == 0
+                            && active_zero_rows[row / u64::BITS as usize]
+                                & (1u64 << (row % u64::BITS as usize))
+                                != 0;
+                        if hot == 0 && !committed_zero {
                             continue;
                         }
                         let source_coefficient = row_in_ring * 256 + hot;
@@ -6888,10 +6919,12 @@ mod tests {
             blocks_per_column: BLOCKS_PER_COLUMN as u64,
             challenge_weight: CHALLENGE_WEIGHT as u64,
             output_coefficients: (POSITIONS * 512) as u64,
+            zero_column_mask: 0,
         };
         let actual = runtime
             .dispatch_packed_fp128_d512_decompose_fold_streaming(
                 &lanes,
+                &[],
                 &challenge_positions,
                 &challenge_coefficients,
                 Some(&dense_challenges),

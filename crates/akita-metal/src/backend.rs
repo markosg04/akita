@@ -3,6 +3,10 @@ use std::time::{Duration, Instant};
 
 use akita_algebra::CyclotomicRing;
 use akita_error::AkitaError;
+use akita_prover::backend::{
+    DenseBatchView, DenseView, MultilinearPolynomialBatchView, MultilinearPolynomialView,
+    OneHotBatchView, OneHotView, RecursiveFoldView,
+};
 use akita_prover::compute::{
     CompressionComputeBackend, CompressionRowsProducts, DecomposeFoldBatchPlan, DecomposeFoldPlan,
     OpeningBatchKernel, OpeningFoldKernel, OpeningFoldOutput, OpeningFoldPlan,
@@ -12,7 +16,8 @@ use akita_prover::compute::{
 use akita_prover::{
     BatchDecomposeFoldOutcome, ComputeBackendSetup, CpuBackend, CyclicRowsComputeBackend,
     DecomposeFoldWitness, DigitRowsComputeBackend, NttCacheOwnerId, NttOperationCluster,
-    RecursiveFoldBatchView, RoutedNttRequirement, SuffixWitnessBatchView,
+    OneHotIndex, RecursiveFoldBatchView, RoutedNttRequirement, SuffixWitnessBatchView,
+    SuffixWitnessView,
 };
 use akita_types::{AkitaExpandedSetup, NttCacheKey};
 use jolt_field::ExtField;
@@ -348,63 +353,140 @@ impl CyclicRowsComputeBackend<F> for MetalBackend {
     }
 }
 
-impl<S, const D: usize> OpeningFoldKernel<S, F, D> for MetalBackend
-where
-    CpuBackend: OpeningFoldKernel<S, F, D>,
-{
-    fn evaluate_and_fold(
-        &self,
-        prepared: Option<&Self::PreparedSetup>,
-        source: S,
-        plan: OpeningFoldPlan<'_, F>,
-    ) -> Result<OpeningFoldOutput<F, D>, AkitaError> {
-        let output = self.cpu_backend().evaluate_and_fold(
-            prepared.map(|prepared| &prepared.cpu),
-            source,
-            plan,
-        )?;
-        self.record_opening_cpu_fallback(1)
-            .map_err(MetalCommitError::into_akita)?;
-        Ok(output)
-    }
+macro_rules! delegate_opening_pair_to_cpu {
+    ($fold:ty, $batch:ty) => {
+        impl<const D: usize> OpeningFoldKernel<$fold, F, D> for MetalBackend {
+            fn evaluate_and_fold(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $fold,
+                plan: OpeningFoldPlan<'_, F>,
+            ) -> Result<OpeningFoldOutput<F, D>, AkitaError> {
+                let output = <CpuBackend as OpeningFoldKernel<$fold, F, D>>::evaluate_and_fold(
+                    &self.cpu_backend(),
+                    prepared.map(|prepared| &prepared.cpu),
+                    source,
+                    plan,
+                )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
 
-    fn decompose_fold(
-        &self,
-        prepared: Option<&Self::PreparedSetup>,
-        source: S,
-        plan: DecomposeFoldPlan<'_>,
-    ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
-        let output = self.cpu_backend().decompose_fold(
-            prepared.map(|prepared| &prepared.cpu),
-            source,
-            plan,
-        )?;
-        self.record_opening_cpu_fallback(1)
-            .map_err(MetalCommitError::into_akita)?;
-        Ok(output)
-    }
+            fn decompose_fold(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $fold,
+                plan: DecomposeFoldPlan<'_>,
+            ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
+                let output = <CpuBackend as OpeningFoldKernel<$fold, F, D>>::decompose_fold(
+                    &self.cpu_backend(),
+                    prepared.map(|prepared| &prepared.cpu),
+                    source,
+                    plan,
+                )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+        }
+
+        impl<const D: usize> OpeningBatchKernel<$batch, F, D> for MetalBackend {
+            fn decompose_fold_batch(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $batch,
+                plan: DecomposeFoldBatchPlan<'_>,
+            ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError> {
+                let output =
+                    <CpuBackend as OpeningBatchKernel<$batch, F, D>>::decompose_fold_batch(
+                        &self.cpu_backend(),
+                        prepared.map(|prepared| &prepared.cpu),
+                        source,
+                        plan,
+                    )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+        }
+    };
 }
 
-impl<S, const D: usize> OpeningBatchKernel<S, F, D> for MetalBackend
-where
-    CpuBackend: OpeningBatchKernel<S, F, D>,
-{
-    fn decompose_fold_batch(
-        &self,
-        prepared: Option<&Self::PreparedSetup>,
-        source: S,
-        plan: DecomposeFoldBatchPlan<'_>,
-    ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError> {
-        let output = self.cpu_backend().decompose_fold_batch(
-            prepared.map(|prepared| &prepared.cpu),
-            source,
-            plan,
-        )?;
-        self.record_opening_cpu_fallback(1)
-            .map_err(MetalCommitError::into_akita)?;
-        Ok(output)
-    }
+macro_rules! delegate_indexed_opening_pair_to_cpu {
+    ($fold:ty, $batch:ty) => {
+        impl<I: OneHotIndex, const D: usize> OpeningFoldKernel<$fold, F, D> for MetalBackend {
+            fn evaluate_and_fold(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $fold,
+                plan: OpeningFoldPlan<'_, F>,
+            ) -> Result<OpeningFoldOutput<F, D>, AkitaError> {
+                let output = <CpuBackend as OpeningFoldKernel<$fold, F, D>>::evaluate_and_fold(
+                    &self.cpu_backend(),
+                    prepared.map(|prepared| &prepared.cpu),
+                    source,
+                    plan,
+                )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+
+            fn decompose_fold(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $fold,
+                plan: DecomposeFoldPlan<'_>,
+            ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
+                let output = <CpuBackend as OpeningFoldKernel<$fold, F, D>>::decompose_fold(
+                    &self.cpu_backend(),
+                    prepared.map(|prepared| &prepared.cpu),
+                    source,
+                    plan,
+                )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+        }
+
+        impl<I: OneHotIndex, const D: usize> OpeningBatchKernel<$batch, F, D> for MetalBackend {
+            fn decompose_fold_batch(
+                &self,
+                prepared: Option<&Self::PreparedSetup>,
+                source: $batch,
+                plan: DecomposeFoldBatchPlan<'_>,
+            ) -> Result<BatchDecomposeFoldOutcome<F, D>, AkitaError> {
+                let output =
+                    <CpuBackend as OpeningBatchKernel<$batch, F, D>>::decompose_fold_batch(
+                        &self.cpu_backend(),
+                        prepared.map(|prepared| &prepared.cpu),
+                        source,
+                        plan,
+                    )?;
+                self.record_opening_cpu_fallback(1)
+                    .map_err(MetalCommitError::into_akita)?;
+                Ok(output)
+            }
+        }
+    };
 }
+
+delegate_opening_pair_to_cpu!(DenseView<'_, F, D>, DenseBatchView<'_, F, D>);
+delegate_opening_pair_to_cpu!(
+    RecursiveFoldView<'_, F, D>,
+    RecursiveFoldBatchView<'_, F, D>
+);
+delegate_opening_pair_to_cpu!(
+    SuffixWitnessView<'_, F, D>,
+    SuffixWitnessBatchView<'_, F, D>
+);
+delegate_indexed_opening_pair_to_cpu!(OneHotView<'_, F, D, I>, OneHotBatchView<'_, F, D, I>);
+delegate_indexed_opening_pair_to_cpu!(
+    MultilinearPolynomialView<'_, F, D, I>,
+    MultilinearPolynomialBatchView<'_, F, D, I>
+);
 
 macro_rules! delegate_coefficient_packing_to_cpu {
     ($view:ident) => {

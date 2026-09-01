@@ -1,10 +1,12 @@
 use akita_error::AkitaError;
-use akita_prover::compute::{CommitInnerPlan, RootCommitKernel};
-use akita_prover::{CommitInnerWitness, OneHotPoly, RootCommitSource};
+use akita_prover::compute::{CommitInnerPlan, DecomposeFoldPlan, RootCommitKernel};
+use akita_prover::{CommitInnerWitness, DecomposeFoldWitness, OneHotPoly, RootCommitSource};
+use jolt_field::One;
 
 use crate::backend::MetalBackend;
 use crate::field::F;
 use crate::prepared::MetalPreparedSetup;
+use crate::runtime::PackedDecomposeFoldParams;
 use crate::{MetalCommitError, MetalExecutionPolicy};
 
 /// Borrowed row-major selectors for the packed Metal root-commit kernel.
@@ -44,6 +46,47 @@ impl<'a> PackedOneHotCommitView<'a> {
         lanes: &'a [u8],
         active_zero_rows: &'a [u64],
         zero_column_mask: u64,
+    ) -> Result<Self, AkitaError> {
+        Self::new_inner(
+            onehot_k,
+            column_capacity,
+            num_columns,
+            lanes,
+            active_zero_rows,
+            zero_column_mask,
+            None,
+        )
+    }
+
+    /// Validate structural K256 geometry while reusing an exact entry count
+    /// accumulated when the selector bytes were produced.
+    pub fn new_k256_with_precomputed_hot_entries(
+        column_capacity: usize,
+        num_columns: usize,
+        lanes: &'a [u8],
+        active_zero_rows: &'a [u64],
+        zero_column_mask: u64,
+        hot_entries: usize,
+    ) -> Result<Self, AkitaError> {
+        Self::new_inner(
+            256,
+            column_capacity,
+            num_columns,
+            lanes,
+            active_zero_rows,
+            zero_column_mask,
+            Some(hot_entries),
+        )
+    }
+
+    fn new_inner(
+        onehot_k: usize,
+        column_capacity: usize,
+        num_columns: usize,
+        lanes: &'a [u8],
+        active_zero_rows: &'a [u64],
+        zero_column_mask: u64,
+        precomputed_hot_entries: Option<usize>,
     ) -> Result<Self, AkitaError> {
         if onehot_k == 0 || onehot_k > usize::from(u8::MAX) + 1 || !onehot_k.is_power_of_two() {
             return Err(AkitaError::InvalidInput(format!(
@@ -106,22 +149,33 @@ impl<'a> PackedOneHotCommitView<'a> {
                 actual: active_zero_rows.len(),
             });
         }
-        let mut hot_entries = 0usize;
-        for (position, &lane) in lanes.iter().enumerate() {
-            if usize::from(lane) >= onehot_k {
-                return Err(AkitaError::InvalidInput(format!(
-                    "packed one-hot lane {lane} at byte {position} is outside K={onehot_k}"
-                )));
+        let hot_entries = if let Some(hot_entries) = precomputed_hot_entries {
+            if onehot_k != 256 || hot_entries > lanes.len() {
+                return Err(AkitaError::InvalidInput(
+                    "precomputed packed entry counts require K256 and cannot exceed the lane count"
+                        .into(),
+                ));
             }
-            let row = position / num_columns;
-            let column = position % num_columns;
-            let committed_zero = lane == 0
-                && zero_column_mask & (1u64 << column) != 0
-                && active_zero_rows
-                    .get(row / u64::BITS as usize)
-                    .is_some_and(|word| word & (1u64 << (row % u64::BITS as usize)) != 0);
-            hot_entries += usize::from(lane != 0 || committed_zero);
-        }
+            hot_entries
+        } else {
+            let mut hot_entries = 0usize;
+            for (position, &lane) in lanes.iter().enumerate() {
+                if usize::from(lane) >= onehot_k {
+                    return Err(AkitaError::InvalidInput(format!(
+                        "packed one-hot lane {lane} at byte {position} is outside K={onehot_k}"
+                    )));
+                }
+                let row = position / num_columns;
+                let column = position % num_columns;
+                let committed_zero = lane == 0
+                    && zero_column_mask & (1u64 << column) != 0
+                    && active_zero_rows
+                        .get(row / u64::BITS as usize)
+                        .is_some_and(|word| word & (1u64 << (row % u64::BITS as usize)) != 0);
+                hot_entries += usize::from(lane != 0 || committed_zero);
+            }
+            hot_entries
+        };
         Ok(Self {
             lanes,
             active_zero_rows,
@@ -260,6 +314,188 @@ impl MetalBackend {
             AkitaError::InvalidSetup("CPU packed fallback returned no commitment witness".into())
         })
     }
+
+    /// Decompose and challenge-fold one resident packed K256 source at D512.
+    pub fn decompose_fold_packed_onehot<const D: usize>(
+        &self,
+        source: PackedOneHotCommitView<'_>,
+        plan: DecomposeFoldPlan<'_>,
+    ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
+        let total_start = std::time::Instant::now();
+        if D != 512
+            || source.onehot_k() != 256
+            || source.column_capacity() != 32
+            || plan.num_positions_per_block == 0
+            || plan.num_digits == 0
+            || !source.num_rows().is_multiple_of(2)
+        {
+            return Err(MetalCommitError::UnsupportedShape(
+                "packed opening requires D512/K256/capacity32 and nonempty output".into(),
+            )
+            .into_akita());
+        }
+
+        let segment_rings = source.num_rows() / 2;
+        if !segment_rings.is_multiple_of(plan.num_positions_per_block) {
+            return Err(MetalCommitError::UnsupportedShape(
+                "packed opening segment is not aligned to the scheduled positions".into(),
+            )
+            .into_akita());
+        }
+        let blocks_per_column = segment_rings / plan.num_positions_per_block;
+        let live_challenges = source
+            .num_columns()
+            .checked_mul(blocks_per_column)
+            .ok_or_else(|| {
+                MetalCommitError::ShapeOverflow("packed opening live challenges").into_akita()
+            })?;
+        let expected_challenges = source
+            .column_capacity()
+            .checked_mul(blocks_per_column)
+            .ok_or_else(|| {
+                MetalCommitError::ShapeOverflow("packed opening challenges").into_akita()
+            })?;
+        if plan.challenges.len() != expected_challenges {
+            return Err(AkitaError::InvalidSize {
+                expected: expected_challenges,
+                actual: plan.challenges.len(),
+            });
+        }
+        let challenge_weight = plan
+            .challenges
+            .first()
+            .map_or(0, |challenge| challenge.positions.len());
+        if challenge_weight == 0
+            || plan.challenges[..live_challenges].iter().any(|challenge| {
+                challenge.positions.len() != challenge_weight
+                    || challenge.coeffs.len() != challenge_weight
+            })
+        {
+            return Err(MetalCommitError::UnsupportedShape(
+                "packed opening requires a fixed nonzero challenge weight".into(),
+            )
+            .into_akita());
+        }
+
+        let challenge_terms = live_challenges
+            .checked_mul(challenge_weight)
+            .ok_or_else(|| {
+                MetalCommitError::ShapeOverflow("packed opening challenge terms").into_akita()
+            })?;
+        let mut positions = Vec::with_capacity(challenge_terms);
+        let mut coefficients = Vec::with_capacity(challenge_terms);
+        let dense_len = live_challenges.checked_mul(64).ok_or_else(|| {
+            MetalCommitError::ShapeOverflow("packed opening dense challenges").into_akita()
+        })?;
+        let mut dense_subring64 = vec![0i8; dense_len];
+        let mut has_subring64_embedding = true;
+        for (challenge_index, challenge) in plan.challenges[..live_challenges].iter().enumerate() {
+            challenge.validate::<D>()?;
+            for (&position, &coefficient) in challenge.positions.iter().zip(&challenge.coeffs) {
+                positions.push(u16::try_from(position).map_err(|_| {
+                    MetalCommitError::UnsupportedShape(
+                        "packed opening challenge position does not fit u16".into(),
+                    )
+                    .into_akita()
+                })?);
+                coefficients.push(coefficient);
+                let dense_position = usize::try_from(position)
+                    .ok()
+                    .filter(|position| position.is_multiple_of(8))
+                    .map(|position| position / 8)
+                    .filter(|&position| position < 64);
+                if let Some(dense_position) = dense_position {
+                    let slot = challenge_index * 64 + dense_position;
+                    if dense_subring64[slot] == 0 {
+                        dense_subring64[slot] = coefficient;
+                    } else {
+                        has_subring64_embedding = false;
+                    }
+                } else {
+                    has_subring64_embedding = false;
+                }
+            }
+        }
+        let dense_subring64 = has_subring64_embedding.then_some(dense_subring64);
+        let output_coefficients = plan.num_positions_per_block.checked_mul(D).ok_or_else(|| {
+            MetalCommitError::ShapeOverflow("packed opening output coefficients").into_akita()
+        })?;
+        let runtime = self
+            .runtime()
+            .ok_or_else(|| MetalCommitError::DeviceUnavailable.into_akita())?;
+        let params = PackedDecomposeFoldParams {
+            num_rows: source.num_rows() as u64,
+            num_columns: source.num_columns() as u64,
+            lane_stride: source.num_columns() as u64,
+            num_positions: plan.num_positions_per_block as u64,
+            position_start: 0,
+            blocks_per_column: blocks_per_column as u64,
+            challenge_weight: challenge_weight as u64,
+            output_coefficients: output_coefficients as u64,
+            zero_column_mask: source.zero_column_mask(),
+        };
+        let outcome = runtime
+            .dispatch_packed_fp128_d512_decompose_fold_streaming(
+                source.lanes(),
+                source.active_zero_rows(),
+                &positions,
+                &coefficients,
+                dense_subring64.as_deref(),
+                params,
+                plan.num_positions_per_block,
+                |_, _| {},
+            )
+            .map_err(MetalCommitError::into_akita)?;
+        let timings = outcome.timings;
+        let allocation_bytes = outcome.allocation_bytes;
+        let mut compressed = Vec::with_capacity(plan.num_positions_per_block);
+        let mut chunks = outcome.centered_coefficients.chunks_exact(D);
+        for coefficients in chunks.by_ref() {
+            let coefficients: &[i32; D] = coefficients.try_into().map_err(|_| {
+                AkitaError::InvalidSetup("packed opening produced a short coefficient row".into())
+            })?;
+            compressed.push(*coefficients);
+        }
+        if !chunks.remainder().is_empty() {
+            return Err(AkitaError::InvalidSize {
+                expected: D,
+                actual: chunks.remainder().len(),
+            });
+        }
+        let centered = if plan.num_digits == 1 {
+            compressed
+        } else {
+            let expanded_len = compressed
+                .len()
+                .checked_mul(plan.num_digits)
+                .ok_or_else(|| {
+                    MetalCommitError::ShapeOverflow("packed opening digit expansion").into_akita()
+                })?;
+            let mut expanded = Vec::with_capacity(expanded_len);
+            for coefficients in compressed {
+                expanded.push(coefficients);
+                expanded.extend((1..plan.num_digits).map(|_| [0i32; D]));
+            }
+            expanded
+        };
+        let modulus = (-F::one()).to_canonical_u128() + 1;
+        let witness = akita_prover::backend::poly_helpers::build_decompose_fold_witness::<F, D>(
+            centered, modulus,
+        );
+        self.update_opening_metrics(|metrics| {
+            metrics.command_wall_time += timings.command_wall;
+            metrics.gpu_active_time += timings.gpu.unwrap_or_default();
+            metrics.buffer_setup_time += timings.buffer_setup;
+            metrics.readback_time += timings.readback_copy;
+            metrics.allocation_bytes = metrics.allocation_bytes.saturating_add(allocation_bytes);
+        })
+        .map_err(MetalCommitError::into_akita)?;
+        tracing::debug!(
+            elapsed_s = total_start.elapsed().as_secs_f64(),
+            "completed packed Metal decompose-fold"
+        );
+        Ok(witness)
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +525,20 @@ mod tests {
         assert!(view.commits_zero_at(2, 0));
         assert!(!view.commits_zero_at(0, 1));
         assert_eq!(view.hot_entries(), 4);
+
+        let lanes = vec![0, 0, 0, 7, 0, 0, 3, 0];
+        let scanned =
+            PackedOneHotCommitView::new_with_active_zero_rows(256, 4, 2, &lanes, &[0b0101], 0b01)
+                .unwrap();
+        let precomputed = PackedOneHotCommitView::new_k256_with_precomputed_hot_entries(
+            4,
+            2,
+            &lanes,
+            &[0b0101],
+            0b01,
+            scanned.hot_entries(),
+        )
+        .unwrap();
+        assert_eq!(precomputed.hot_entries(), scanned.hot_entries());
     }
 }
