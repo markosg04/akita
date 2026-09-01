@@ -459,24 +459,6 @@ where
     }
     let witness_layout = instance.segment_layout(lp, None)?;
 
-    // Relation quotient `r`: each group owns a native consistency/A/B
-    // block, while the level owns the shared D tail. One trailing witness
-    // segment carries all quotient rows in canonical relation order.
-    let r = compute_multi_group_relation_quotient::<F, B>(
-        ring_switch_ctx,
-        lp,
-        opening_batch,
-        &owned,
-        instance.group_openings(),
-        instance.extension_degree(),
-        &d_quotients,
-        instance.rhs(),
-        compression.as_ref(),
-    )
-    .map_err(|err| {
-        AkitaError::InvalidInput(format!("relation quotient preparation failed: {err:?}"))
-    })?;
-
     // Every segment of the generated witness is balanced, but grouped roots
     // may mix decomposition bases. Z and the quotient tail use the opening
     // basis, E uses the opening basis, and T uses the outer basis. The inner
@@ -495,27 +477,51 @@ where
     let packed_width = u8::try_from(known_balanced_log_basis).map_err(|_| {
         AkitaError::InvalidSetup("recursive witness basis does not fit i8 storage".into())
     })?;
-    let mut out = {
-        let _span = tracing::info_span!("ring_switch_allocate_output").entered();
-        PackedSignedDigitWriter::new(witness_layout.live_coeff_len(), packed_width)?
-    };
-    for unit in witness_layout.units() {
-        let group_index = unit.group_index();
-        let _span = tracing::info_span!(
-            "ring_switch_emit_witness_unit",
-            group_index,
-            chunk_index = unit.chunk_index()
+    // Relation quotient construction and body emission have no data dependency.
+    // The former can use an accelerator while the latter packs host-owned digits.
+    let prepare_relation_quotient = || {
+        compute_multi_group_relation_quotient::<F, B>(
+            ring_switch_ctx,
+            lp,
+            opening_batch,
+            &owned,
+            instance.group_openings(),
+            instance.extension_degree(),
+            &d_quotients,
+            instance.rhs(),
+            compression.as_ref(),
         )
-        .entered();
-        let group_layout = opening_batch.group_layout(group_index)?;
-        emit_witness_unit::<F>(
-            &mut out,
-            unit,
-            &owned[group_index],
-            group_layout.num_polynomials(),
-            witness_layout.num_chunks_for_group(group_index),
-        )?;
-    }
+        .map_err(|err| {
+            AkitaError::InvalidInput(format!("relation quotient preparation failed: {err:?}"))
+        })
+    };
+    let emit_body = || -> Result<PackedSignedDigitWriter, AkitaError> {
+        let mut out = {
+            let _span = tracing::info_span!("ring_switch_allocate_output").entered();
+            PackedSignedDigitWriter::new(witness_layout.live_coeff_len(), packed_width)?
+        };
+        for unit in witness_layout.units() {
+            let group_index = unit.group_index();
+            let _span = tracing::info_span!(
+                "ring_switch_emit_witness_unit",
+                group_index,
+                chunk_index = unit.chunk_index()
+            )
+            .entered();
+            let group_layout = opening_batch.group_layout(group_index)?;
+            emit_witness_unit::<F>(
+                &mut out,
+                unit,
+                &owned[group_index],
+                group_layout.num_polynomials(),
+                witness_layout.num_chunks_for_group(group_index),
+            )?;
+        }
+        Ok(out)
+    };
+    let (r, out) = cfg_join!(prepare_relation_quotient, emit_body);
+    let r = r?;
+    let mut out = out?;
     let levels = r_decomp_levels::<F>(lp.open().digits.log_basis);
     {
         let _span = tracing::info_span!("ring_switch_emit_tail").entered();
