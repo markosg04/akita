@@ -13,6 +13,7 @@ use crate::packed_onehot::PackedOneHotCommitView;
 use crate::prepared::MetalPreparedSetup;
 use crate::runtime::{
     MetalOneHotKernel, MetalRuntime, PackedOneHotCommitParams, FP128_D512_POSITION_PARTIALS,
+    FP128_D512_TASKS_PER_STREAM,
 };
 use crate::MetalCommitError;
 
@@ -21,6 +22,25 @@ const K16_COLUMN_CAPACITY: usize = 64;
 const K256_COLUMN_CAPACITY: usize = 32;
 const INNER_RANK: usize = 1;
 const FIVE_STREAM_MAX_POSITIONS: usize = 1 << 16;
+const FP128_D512_POSITIONS_PER_TILE: usize = 4;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RootTaskDensityCensus {
+    sampled_stream_tiles: u64,
+    empty_stream_tiles: u64,
+    sampled_hot_entries: u64,
+    sampled_lane_slots: u64,
+    sampled_zero_mask_probes: u64,
+    sampled_selected_zero_entries: u64,
+    sampled_even_row_entries: u64,
+    sampled_zero_tasks: usize,
+    task_density_ppm: [u64; 5],
+    shift_quartiles: [u64; 4],
+    active_tasks_per_tile: [u64; 6],
+    current_barrier_iterations: u64,
+    column_major_barrier_iterations: u64,
+    ideal_barrier_iterations: u64,
+}
 
 pub(crate) struct ValidatedShape {
     active_a_cols: usize,
@@ -36,6 +56,219 @@ fn packed_streams_per_command(num_positions: usize) -> usize {
         5
     } else {
         1
+    }
+}
+
+fn root_census_tile_stride() -> Result<Option<usize>, AkitaError> {
+    let Some(value) = std::env::var_os("AKITA_METAL_ROOT_CENSUS_TILE_STRIDE") else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|_| {
+        AkitaError::InvalidInput("root census tile stride is not valid UTF-8".into())
+    })?;
+    let stride = value.parse::<usize>().map_err(|_| {
+        AkitaError::InvalidInput(format!("invalid root census tile stride {value:?}"))
+    })?;
+    if stride == 0 {
+        return Err(AkitaError::InvalidInput(
+            "root census tile stride must be nonzero".into(),
+        ));
+    }
+    Ok(Some(stride))
+}
+
+fn density_ppm(hot_entries: u64, lane_slots: u64) -> u64 {
+    if lane_slots == 0 {
+        return 0;
+    }
+    ((u128::from(hot_entries) * 1_000_000) / u128::from(lane_slots)) as u64
+}
+
+fn density_quantile(sorted: &[u64], numerator: usize, denominator: usize) -> u64 {
+    let index = (sorted.len() - 1) * numerator / denominator;
+    sorted[index]
+}
+
+fn sampled_tiles(tiles_per_block: usize, tile_stride: usize) -> Vec<usize> {
+    (0..tiles_per_block)
+        .step_by(tile_stride)
+        .enumerate()
+        .map(|(stratum, first_tile)| {
+            let stratum_len = (tiles_per_block - first_tile).min(tile_stride);
+            let offset = stratum
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(1_013_904_223)
+                % stratum_len;
+            first_tile + offset
+        })
+        .collect()
+}
+
+fn grouped_barrier_iterations(
+    selected_rows: &[u16],
+    sample_count: usize,
+    ordered_task: impl Fn(usize) -> usize,
+) -> u64 {
+    let task_count = selected_rows.len() / sample_count;
+    let mut iterations = 0u64;
+    for first_task in (0..task_count).step_by(FP128_D512_TASKS_PER_STREAM) {
+        let final_task = (first_task + FP128_D512_TASKS_PER_STREAM).min(task_count);
+        for sample in 0..sample_count {
+            let maximum = (first_task..final_task)
+                .map(|task| selected_rows[ordered_task(task) * sample_count + sample])
+                .max()
+                .unwrap_or_default();
+            iterations += u64::from(maximum);
+        }
+    }
+    iterations
+}
+
+fn ideal_barrier_iterations(
+    selected_rows: &[u16],
+    sample_count: usize,
+    rows_per_tile: usize,
+) -> u64 {
+    let task_count = selected_rows.len() / sample_count;
+    let mut iterations = 0u64;
+    let mut histogram = vec![0usize; rows_per_tile + 1];
+    for sample in 0..sample_count {
+        histogram.fill(0);
+        for task in 0..task_count {
+            histogram[usize::from(selected_rows[task * sample_count + sample])] += 1;
+        }
+        let mut slots_remaining = 0usize;
+        for selected_count in (0..=rows_per_tile).rev() {
+            let mut tasks_at_count = histogram[selected_count];
+            while tasks_at_count != 0 {
+                if slots_remaining == 0 {
+                    iterations += selected_count as u64;
+                    slots_remaining = FP128_D512_TASKS_PER_STREAM;
+                }
+                let grouped = tasks_at_count.min(slots_remaining);
+                tasks_at_count -= grouped;
+                slots_remaining -= grouped;
+            }
+        }
+    }
+    iterations
+}
+
+fn sample_root_task_density<const D: usize>(
+    source: PackedOneHotCommitView<'_>,
+    plan: CommitInnerPlan,
+    full_blocks_per_column: usize,
+    tile_stride: usize,
+) -> RootTaskDensityCensus {
+    let live_columns = source.num_columns();
+    let rows_per_position = D / source.onehot_k();
+    let rows_per_tile = FP128_D512_POSITIONS_PER_TILE * rows_per_position;
+    let rows_per_block = plan.num_positions_per_block * rows_per_position;
+    let tiles_per_block = plan.num_positions_per_block / FP128_D512_POSITIONS_PER_TILE;
+    let task_count = live_columns * full_blocks_per_column;
+    let stream_count = task_count.div_ceil(FP128_D512_TASKS_PER_STREAM);
+    let sampled_tiles = sampled_tiles(tiles_per_block, tile_stride);
+    let sample_count = sampled_tiles.len();
+    let mut selected_rows = vec![0u16; task_count * sample_count];
+    let mut task_hot_entries = vec![0u64; task_count];
+    let mut task_lane_slots = vec![0u64; task_count];
+    let mut sampled_hot_entries = 0u64;
+    let mut sampled_lane_slots = 0u64;
+    let mut sampled_zero_mask_probes = 0u64;
+    let mut sampled_selected_zero_entries = 0u64;
+    let mut sampled_even_row_entries = 0u64;
+    let mut shift_quartiles = [0u64; 4];
+    for task in 0..task_count {
+        let block = task / live_columns;
+        let column = task % live_columns;
+        for (sample, &tile) in sampled_tiles.iter().enumerate() {
+            let first_row = block * rows_per_block + tile * rows_per_tile;
+            let mut task_selected_rows = 0u16;
+            for row in first_row..first_row + rows_per_tile {
+                let lane = source.lanes()[row * live_columns + column];
+                sampled_zero_mask_probes +=
+                    u64::from(lane == 0 && source.zero_column_mask() & (1u64 << column) != 0);
+                let selected = lane != 0 || source.commits_zero_at(row, column);
+                task_hot_entries[task] += u64::from(selected);
+                sampled_hot_entries += u64::from(selected);
+                task_selected_rows += u16::from(selected);
+                if selected {
+                    sampled_selected_zero_entries += u64::from(lane == 0);
+                    sampled_even_row_entries +=
+                        u64::from((row - block * rows_per_block).is_multiple_of(2));
+                    shift_quartiles[usize::from(lane) / 64] += 1;
+                }
+            }
+            selected_rows[task * sample_count + sample] = task_selected_rows;
+            task_lane_slots[task] += rows_per_tile as u64;
+            sampled_lane_slots += rows_per_tile as u64;
+        }
+    }
+
+    let mut empty_stream_tiles = 0u64;
+    let mut active_tasks_per_tile = [0u64; 6];
+    for first_task in (0..task_count).step_by(FP128_D512_TASKS_PER_STREAM) {
+        let final_task = (first_task + FP128_D512_TASKS_PER_STREAM).min(task_count);
+        for sample in 0..sample_count {
+            let active_tasks = (first_task..final_task)
+                .filter(|&task| selected_rows[task * sample_count + sample] != 0)
+                .count();
+            let bin = match active_tasks {
+                0 => {
+                    empty_stream_tiles += 1;
+                    0
+                }
+                1..=4 => 1,
+                5..=8 => 2,
+                9..=16 => 3,
+                17..=24 => 4,
+                _ => 5,
+            };
+            active_tasks_per_tile[bin] += 1;
+        }
+    }
+    let sampled_stream_tiles = (stream_count * sample_count) as u64;
+    let current_barrier_iterations =
+        grouped_barrier_iterations(&selected_rows, sample_count, |task| task);
+    let column_major_barrier_iterations =
+        grouped_barrier_iterations(&selected_rows, sample_count, |task| {
+            let column = task / full_blocks_per_column;
+            let block = task % full_blocks_per_column;
+            block * live_columns + column
+        });
+    let ideal_barrier_iterations =
+        ideal_barrier_iterations(&selected_rows, sample_count, rows_per_tile);
+
+    let mut task_densities = task_hot_entries
+        .iter()
+        .zip(&task_lane_slots)
+        .map(|(&hot_entries, &lane_slots)| density_ppm(hot_entries, lane_slots))
+        .collect::<Vec<_>>();
+    task_densities.sort_unstable();
+    RootTaskDensityCensus {
+        sampled_stream_tiles,
+        empty_stream_tiles,
+        sampled_hot_entries,
+        sampled_lane_slots,
+        sampled_zero_mask_probes,
+        sampled_selected_zero_entries,
+        sampled_even_row_entries,
+        sampled_zero_tasks: task_hot_entries
+            .iter()
+            .filter(|&&hot_entries| hot_entries == 0)
+            .count(),
+        task_density_ppm: [
+            density_quantile(&task_densities, 10, 100),
+            density_quantile(&task_densities, 25, 100),
+            density_quantile(&task_densities, 50, 100),
+            density_quantile(&task_densities, 75, 100),
+            density_quantile(&task_densities, 90, 100),
+        ],
+        shift_quartiles,
+        active_tasks_per_tile,
+        current_barrier_iterations,
+        column_major_barrier_iterations,
+        ideal_barrier_iterations,
     }
 }
 
@@ -117,6 +350,61 @@ pub(crate) fn commit_validated<const D: usize>(
     plan: CommitInnerPlan,
     shape: ValidatedShape,
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
+    if let Some(tile_stride) = root_census_tile_stride()? {
+        let census_start = Instant::now();
+        let census =
+            sample_root_task_density::<D>(source, plan, shape.full_blocks_per_column, tile_stride);
+        tracing::debug!(
+            census_s = census_start.elapsed().as_secs_f64(),
+            tile_stride,
+            sampled_stream_tiles = census.sampled_stream_tiles,
+            empty_stream_tiles = census.empty_stream_tiles,
+            empty_stream_tile_fraction =
+                census.empty_stream_tiles as f64 / census.sampled_stream_tiles as f64,
+            sampled_hot_entries = census.sampled_hot_entries,
+            sampled_lane_slots = census.sampled_lane_slots,
+            zero_column_mask = source.zero_column_mask(),
+            zero_mask_columns = source.zero_column_mask().count_ones(),
+            sampled_zero_mask_probes = census.sampled_zero_mask_probes,
+            sampled_zero_mask_probe_fraction =
+                census.sampled_zero_mask_probes as f64 / census.sampled_lane_slots as f64,
+            sampled_zero_mask_success_fraction = census.sampled_selected_zero_entries as f64
+                / census.sampled_zero_mask_probes as f64,
+            sampled_selected_zero_entries = census.sampled_selected_zero_entries,
+            sampled_selected_zero_fraction =
+                census.sampled_selected_zero_entries as f64 / census.sampled_hot_entries as f64,
+            sampled_even_row_entries = census.sampled_even_row_entries,
+            sampled_even_row_fraction =
+                census.sampled_even_row_entries as f64 / census.sampled_hot_entries as f64,
+            shift_0_63 = census.shift_quartiles[0],
+            shift_64_127 = census.shift_quartiles[1],
+            shift_128_191 = census.shift_quartiles[2],
+            shift_192_255 = census.shift_quartiles[3],
+            sampled_density = census.sampled_hot_entries as f64 / census.sampled_lane_slots as f64,
+            exact_hot_entries = source.hot_entries(),
+            sampled_zero_tasks = census.sampled_zero_tasks,
+            task_density_p10 = census.task_density_ppm[0] as f64 / 1_000_000.0,
+            task_density_p25 = census.task_density_ppm[1] as f64 / 1_000_000.0,
+            task_density_p50 = census.task_density_ppm[2] as f64 / 1_000_000.0,
+            task_density_p75 = census.task_density_ppm[3] as f64 / 1_000_000.0,
+            task_density_p90 = census.task_density_ppm[4] as f64 / 1_000_000.0,
+            active_tasks_0 = census.active_tasks_per_tile[0],
+            active_tasks_1_4 = census.active_tasks_per_tile[1],
+            active_tasks_5_8 = census.active_tasks_per_tile[2],
+            active_tasks_9_16 = census.active_tasks_per_tile[3],
+            active_tasks_17_24 = census.active_tasks_per_tile[4],
+            active_tasks_25_32 = census.active_tasks_per_tile[5],
+            current_barrier_iterations = census.current_barrier_iterations,
+            column_major_barrier_iterations = census.column_major_barrier_iterations,
+            column_major_barrier_reduction = 1.0
+                - census.column_major_barrier_iterations as f64
+                    / census.current_barrier_iterations as f64,
+            ideal_barrier_iterations = census.ideal_barrier_iterations,
+            ideal_barrier_reduction = 1.0
+                - census.ideal_barrier_iterations as f64 / census.current_barrier_iterations as f64,
+            "sampled packed Metal root task density"
+        );
+    }
     let total_start = Instant::now();
     let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
     let work_units = shape
@@ -134,7 +422,10 @@ pub(crate) fn commit_validated<const D: usize>(
         positions_per_block: to_u64(plan.num_positions_per_block, "fp128 D512 block positions")?,
         num_digits_inner: 1,
         blocks_per_column: to_u64(shape.blocks_per_column, "fp128 D512 block count")?,
-        full_blocks_per_column: to_u64(shape.full_blocks_per_column, "fp128 D512 full blocks")?,
+        full_blocks_per_column: to_u64(
+            shape.full_blocks_per_column,
+            "fp128 D512 full block count",
+        )?,
         boundary_columns: 0,
         num_blocks: to_u64(work_units, "fp128 D512 work units")?,
         task_offset: 0,
@@ -188,6 +479,16 @@ pub(crate) fn commit_validated<const D: usize>(
         buffer_setup_s = outcome.timings.buffer_setup.as_secs_f64(),
         command_wall_s = outcome.timings.command_wall.as_secs_f64(),
         gpu_s = outcome.timings.gpu.map(|duration| duration.as_secs_f64()),
+        panel_gpu_active_s = outcome
+            .panel_gpu_active
+            .map(|duration| duration.as_secs_f64()),
+        panel_gpu_span_s = outcome
+            .panel_gpu_span
+            .map(|duration| duration.as_secs_f64()),
+        reduction_gpu_s = outcome.reduction_gpu.map(|duration| duration.as_secs_f64()),
+        command_buffers = outcome.command_buffers,
+        matrix_block_streams = outcome.matrix_block_streams,
+        input_zero_copy = outcome.input_zero_copy,
         readback_copy_s = outcome.timings.readback_copy.as_secs_f64(),
         reconstruction_s = output_reconstruction_time.as_secs_f64(),
         lane_bytes = source.lanes().len(),
@@ -220,6 +521,11 @@ pub(crate) fn commit_validated<const D: usize>(
             buffer_setup_time: outcome.timings.buffer_setup,
             command_wall_time: outcome.timings.command_wall,
             gpu_time: outcome.timings.gpu,
+            panel_gpu_active_time: outcome.panel_gpu_active,
+            panel_gpu_span: outcome.panel_gpu_span,
+            reduction_gpu_time: outcome.reduction_gpu,
+            command_buffers: outcome.command_buffers,
+            matrix_block_streams: outcome.matrix_block_streams,
             readback_copy_time: outcome.timings.readback_copy,
             output_reconstruction_time,
             total_time: total_start.elapsed(),
@@ -359,5 +665,54 @@ mod tests {
     #[test]
     fn parity_d512_k16_panels() {
         assert_panel_parity(16, 2048, 64, None);
+    }
+
+    #[test]
+    fn root_task_density_census_counts_selected_zero_and_empty_tiles() {
+        const ROWS: usize = 4096;
+        const LIVE_COLUMNS: usize = 5;
+        const ROWS_PER_BLOCK: usize = 128;
+        let mut lanes = vec![0u8; ROWS * LIVE_COLUMNS];
+        let mut active_zero_rows = vec![0u64; ROWS.div_ceil(u64::BITS as usize)];
+        for block in 0..ROWS / ROWS_PER_BLOCK {
+            let row = block * ROWS_PER_BLOCK;
+            active_zero_rows[row / u64::BITS as usize] |= 1u64 << (row % u64::BITS as usize);
+            for column in 1..LIVE_COLUMNS {
+                lanes[row * LIVE_COLUMNS + column] = column as u8;
+            }
+        }
+        let source = PackedOneHotCommitView::new_with_active_zero_rows(
+            256,
+            32,
+            LIVE_COLUMNS,
+            &lanes,
+            &active_zero_rows,
+            1,
+        )
+        .unwrap();
+        let plan = CommitInnerPlan {
+            n_a: 1,
+            num_positions_per_block: 64,
+            num_digits_inner: 1,
+            log_basis_inner: 8,
+        };
+
+        let census = sample_root_task_density::<RING_D>(source, plan, ROWS / ROWS_PER_BLOCK, 1);
+
+        assert_eq!(source.hot_entries(), 160);
+        assert_eq!(census.sampled_stream_tiles, 80);
+        assert_eq!(census.empty_stream_tiles, 75);
+        assert_eq!(census.sampled_hot_entries, 160);
+        assert_eq!(census.sampled_lane_slots, 20_480);
+        assert_eq!(census.sampled_zero_mask_probes, 4096);
+        assert_eq!(census.sampled_selected_zero_entries, 32);
+        assert_eq!(census.sampled_even_row_entries, 160);
+        assert_eq!(census.sampled_zero_tasks, 0);
+        assert_eq!(census.task_density_ppm, [7812; 5]);
+        assert_eq!(census.shift_quartiles, [160, 0, 0, 0]);
+        assert_eq!(census.active_tasks_per_tile, [75, 0, 0, 0, 0, 5]);
+        assert_eq!(census.current_barrier_iterations, 5);
+        assert_eq!(census.column_major_barrier_iterations, 5);
+        assert_eq!(census.ideal_barrier_iterations, 5);
     }
 }

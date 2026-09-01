@@ -73,6 +73,16 @@ pub struct MetalCommitMetrics {
     pub command_wall_time: Duration,
     /// GPU timestamp interval, when reported by the device.
     pub gpu_time: Option<Duration>,
+    /// Sum of panel-command GPU intervals, excluding the final reduction.
+    pub panel_gpu_active_time: Option<Duration>,
+    /// GPU interval from the first panel command through the last panel command.
+    pub panel_gpu_span: Option<Duration>,
+    /// Final partial-reduction GPU interval.
+    pub reduction_gpu_time: Option<Duration>,
+    /// Metal command buffers submitted by the commitment.
+    pub command_buffers: usize,
+    /// Matrix panel streams represented by the dispatch.
+    pub matrix_block_streams: usize,
     /// Copy from shared output storage into owned Rust limbs.
     pub readback_copy_time: Duration,
     /// Canonical field reconstruction and witness assembly.

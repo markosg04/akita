@@ -93,7 +93,7 @@ const FP128_DIRECT_RELATION_SPARSE_SOURCE_KERNEL_NAME: &str =
 const KERNEL_SOURCE: &str = include_str!("kernels/onehot.metal");
 const FP128_D512_THREADS: usize = 1_024;
 const PACKED_ONEHOT_BUFFER_ALIGNMENT: usize = 16 * 1024;
-const FP128_D512_TASKS_PER_STREAM: usize = 32;
+pub(crate) const FP128_D512_TASKS_PER_STREAM: usize = 32;
 pub(crate) const FP128_D512_POSITION_PARTIALS: usize = 16;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
@@ -675,6 +675,10 @@ pub(crate) struct DispatchTimings {
 pub(crate) struct DispatchOutcome {
     pub(crate) coefficients: Vec<Fp128Limbs>,
     pub(crate) timings: DispatchTimings,
+    pub(crate) panel_gpu_active: Option<Duration>,
+    pub(crate) panel_gpu_span: Option<Duration>,
+    pub(crate) reduction_gpu: Option<Duration>,
+    pub(crate) command_buffers: usize,
     pub(crate) kernel: MetalOneHotKernel,
     pub(crate) blocks_per_threadgroup: usize,
     pub(crate) columns_per_threadgroup: usize,
@@ -1829,6 +1833,10 @@ impl MetalRuntime {
                     gpu,
                     readback_copy: readback_start.elapsed(),
                 },
+                panel_gpu_active: gpu,
+                panel_gpu_span: gpu,
+                reduction_gpu: None,
+                command_buffers: 1,
                 kernel,
                 blocks_per_threadgroup,
                 columns_per_threadgroup: 0,
@@ -6251,6 +6259,14 @@ impl MetalRuntime {
                 validate_completed_command(command)?;
             }
             validate_completed_command(reduction_command)?;
+            let panel_gpu_active = commands.iter().try_fold(Duration::ZERO, |total, command| {
+                total.checked_add(completed_command_gpu_time(command)?)
+            });
+            let panel_gpu_span = commands
+                .first()
+                .zip(commands.last())
+                .and_then(|(first, last)| completed_commands_gpu_span(first, last));
+            let reduction_gpu = completed_command_gpu_time(reduction_command);
             let gpu = commands
                 .first()
                 .and_then(|first| completed_commands_gpu_span(first, reduction_command));
@@ -6270,6 +6286,10 @@ impl MetalRuntime {
                     gpu,
                     readback_copy: readback_start.elapsed(),
                 },
+                panel_gpu_active,
+                panel_gpu_span,
+                reduction_gpu,
+                command_buffers: commands.len() + 1,
                 kernel: MetalOneHotKernel::PackedFp128D512Panels,
                 blocks_per_threadgroup: FP128_D512_TASKS_PER_STREAM,
                 columns_per_threadgroup: 1,
