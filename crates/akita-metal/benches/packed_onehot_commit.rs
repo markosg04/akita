@@ -97,12 +97,26 @@ fn main() {
     assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
     assert!(metrics.matrix_cache_hit);
     println!(
-        "AKITA_METAL_PACKED_COMMIT log_rows={log_rows} onehot_k={onehot_k} capacity={capacity} columns={columns} positions_per_block={positions_per_block} density_percent={density_percent} samples={samples} mean_ms={:.6} gpu_ms={} command_ms={:.6} buffer_setup_ms={:.6} readback_ms={:.6} reconstruct_ms={:.6} total_ms={:.6} matrix_prepare_ms={:.6} lanes_bytes={} output_bytes={} scratch_bytes={} hot_entries={}",
+        "AKITA_METAL_PACKED_COMMIT log_rows={log_rows} onehot_k={onehot_k} capacity={capacity} columns={columns} positions_per_block={positions_per_block} density_percent={density_percent} samples={samples} mean_ms={:.6} gpu_ms={} panel_active_ms={} panel_span_ms={} reduction_ms={} command_buffers={} matrix_streams={} command_ms={:.6} buffer_setup_ms={:.6} readback_ms={:.6} reconstruct_ms={:.6} total_ms={:.6} matrix_prepare_ms={:.6} lanes_bytes={} output_bytes={} scratch_bytes={} hot_entries={}",
         mean.as_secs_f64() * 1e3,
         metrics
             .gpu_time
             .map(|time| format!("{:.6}", time.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "unavailable".into()),
+        metrics
+            .panel_gpu_active_time
+            .map(|time| format!("{:.6}", time.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "unavailable".into()),
+        metrics
+            .panel_gpu_span
+            .map(|time| format!("{:.6}", time.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "unavailable".into()),
+        metrics
+            .reduction_gpu_time
+            .map(|time| format!("{:.6}", time.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "unavailable".into()),
+        metrics.command_buffers,
+        metrics.matrix_block_streams,
         metrics.command_wall_time.as_secs_f64() * 1e3,
         metrics.buffer_setup_time.as_secs_f64() * 1e3,
         metrics.readback_copy_time.as_secs_f64() * 1e3,
