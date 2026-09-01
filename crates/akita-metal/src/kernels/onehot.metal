@@ -142,6 +142,7 @@ struct PackedDecomposeFoldParams {
     ulong blocks_per_column;
     ulong challenge_weight;
     ulong output_coefficients;
+    ulong zero_column_mask;
 };
 
 struct PackedFoldIndexParams {
@@ -1085,6 +1086,7 @@ kernel void akita_fp128_d512_decompose_fold(
     device const char *challenge_coefficients [[buffer(2)]],
     device int *output [[buffer(3)]],
     constant PackedDecomposeFoldParams &params [[buffer(4)]],
+    device const ulong *active_zero_rows [[buffer(5)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threadgroup_index [[threadgroup_position_in_grid]])
 {
@@ -1110,7 +1112,13 @@ kernel void akita_fp128_d512_decompose_fold(
         ulong ring = trace_block * params.num_positions + position;
         ulong row = ring * 2ul + row_in_ring;
         uchar hot = lanes[row * params.lane_stride + column];
-        if (hot == 0u) {
+        bool committed = hot != 0u;
+        if (!committed && column < 64ul
+            && ((params.zero_column_mask >> column) & 1ul) != 0ul) {
+            ulong active_word = active_zero_rows[row >> 6ul];
+            committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
+        }
+        if (!committed) {
             continue;
         }
 
@@ -1143,6 +1151,7 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
     device const char *dense_challenges [[buffer(1)]],
     device int *output [[buffer(2)]],
     constant PackedDecomposeFoldParams &params [[buffer(3)]],
+    device const ulong *active_zero_rows [[buffer(4)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threadgroup_index [[threadgroup_position_in_grid]])
 {
@@ -1174,7 +1183,13 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
             ulong ring = trace_block * params.num_positions + position;
             ulong row = ring * 2ul + row_in_ring;
             hot = (uint)lanes[row * params.lane_stride + column];
-            valid = hot != 0u;
+            bool committed = hot != 0u;
+            if (!committed && column < 64ul
+                && ((params.zero_column_mask >> column) & 1ul) != 0ul) {
+                ulong active_word = active_zero_rows[row >> 6ul];
+                committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
+            }
+            valid = committed;
             source_high = (uint)(row_in_ring * 32ul) + (hot >> 3u);
             challenge = (uint)(column * params.blocks_per_column + trace_block);
         }
