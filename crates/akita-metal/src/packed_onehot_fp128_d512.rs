@@ -174,6 +174,19 @@ pub(crate) fn commit_validated<const D: usize>(
     let gathered_matrix_bytes = field_additions
         .checked_mul(size_of::<Fp128Limbs>())
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 gathered bytes").into_akita())?;
+    tracing::debug!(
+        total_s = total_start.elapsed().as_secs_f64(),
+        matrix_prepare_s = matrix.prepare_time.as_secs_f64(),
+        matrix_cache_hit = matrix.cache_hit,
+        buffer_setup_s = outcome.timings.buffer_setup.as_secs_f64(),
+        command_wall_s = outcome.timings.command_wall.as_secs_f64(),
+        gpu_s = outcome.timings.gpu.map(|duration| duration.as_secs_f64()),
+        readback_copy_s = outcome.timings.readback_copy.as_secs_f64(),
+        reconstruction_s = output_reconstruction_time.as_secs_f64(),
+        lane_bytes = source.lanes().len(),
+        output_coefficients = shape.output_coefficients,
+        "completed packed Metal trace commitment"
+    );
     backend
         .record_commit_metrics(MetalCommitMetrics {
             kernel: MetalOneHotKernel::PackedFp128D512Panels,
