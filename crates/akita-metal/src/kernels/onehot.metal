@@ -2849,12 +2849,12 @@ kernel void akita_fp128_direct_range_initial_partials(
     uint thread_index [[thread_index_in_threadgroup]],
     uint3 threadgroup_index [[threadgroup_position_in_grid]])
 {
-    threadgroup AkitaFp128 reduction_0[256];
+    threadgroup AkitaFp128 reduction_1[256];
     threadgroup AkitaFp128 reduction_2[256];
     threadgroup AkitaFp128 reduction_3[256];
     threadgroup AkitaFp128 reduction_4[256];
 
-    AkitaFp128 sum_0 = akita_zero();
+    AkitaFp128 sum_1 = akita_zero();
     AkitaFp128 sum_2 = akita_zero();
     AkitaFp128 sum_3 = akita_zero();
     AkitaFp128 sum_4 = akita_zero();
@@ -2870,34 +2870,35 @@ kernel void akita_fp128_direct_range_initial_partials(
         long right = (long)right_digit * (long)(right_digit + 1);
         long delta = right - left;
         long delta_squared = delta * delta;
-        long c0 = 0l;
+        // Same `[q_1, ..., q_d]` layout as the fold kernels: q_0 is implied by the
+        // running claim and must not occupy the first slot.
+        long c1 = delta * (2l * left - 2l);
         long c2 = delta_squared;
         long c3 = 0l;
         long c4 = 0l;
         if (params.basis == 8ul) {
-            c0 = left * (left - 2l) * (left - 6l) * (left - 12l);
+            c1 = left * (left - 2l) * delta * (2l * left - 18l)
+                + delta * (2l * left - 2l) * (left * left - 18l * left + 72l);
             c2 = delta_squared * (108l - 60l * left + 6l * left * left);
             c3 = delta_squared * delta * (-20l + 4l * left);
             c4 = delta_squared * delta_squared;
-        } else {
-            c0 = left * (left - 2l);
         }
         AkitaFp128 weight = akita_direct_range_eq_weight(
             e_first, e_second, pair, params);
-        sum_0 = akita_add(sum_0, akita_mul_signed_small(weight, c0));
+        sum_1 = akita_add(sum_1, akita_mul_signed_small(weight, c1));
         sum_2 = akita_add(sum_2, akita_mul_signed_small(weight, c2));
         sum_3 = akita_add(sum_3, akita_mul_signed_small(weight, c3));
         sum_4 = akita_add(sum_4, akita_mul_signed_small(weight, c4));
     }
-    reduction_0[thread_index] = sum_0;
+    reduction_1[thread_index] = sum_1;
     reduction_2[thread_index] = sum_2;
     reduction_3[thread_index] = sum_3;
     reduction_4[thread_index] = sum_4;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint width = 128u; width != 0u; width >>= 1u) {
         if (thread_index < width) {
-            reduction_0[thread_index] = akita_add(
-                reduction_0[thread_index], reduction_0[thread_index + width]);
+            reduction_1[thread_index] = akita_add(
+                reduction_1[thread_index], reduction_1[thread_index + width]);
             reduction_2[thread_index] = akita_add(
                 reduction_2[thread_index], reduction_2[thread_index + width]);
             reduction_3[thread_index] = akita_add(
@@ -2909,7 +2910,7 @@ kernel void akita_fp128_direct_range_initial_partials(
     }
     if (thread_index == 0u) {
         ulong output = (ulong)threadgroup_index.x * 4ul;
-        partials[output] = reduction_0[0];
+        partials[output] = reduction_1[0];
         partials[output + 1ul] = reduction_2[0];
         partials[output + 2ul] = reduction_3[0];
         partials[output + 3ul] = reduction_4[0];
