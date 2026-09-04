@@ -4,7 +4,7 @@ use crate::compute::{
     prewarm_ntt_requirements, ComputeBackendSetup, DigitRowsComputeBackend, LevelProveStacks,
     NttExecutionRequirements, RuntimeCoefficientPackingBackendFor, RuntimeCommitBackendFor,
     RuntimeOpeningProveBackendFor, RuntimeRingSwitchProveBackend, RuntimeTensorBackendFor,
-    SuffixOpeningProveBackend, SuffixTensorProveBackend,
+    SuffixOpeningProveBackend, SuffixTensorProveBackend, NTT_PREWARM_STACK_BYTES,
 };
 use crate::SelectedProverOpeningData;
 use akita_config::{
@@ -122,7 +122,7 @@ where
         std::thread::scope(|scope| {
             let prewarm = std::thread::Builder::new()
                 .name("akita-ntt-prewarm".into())
-                .stack_size(64 << 20)
+                .stack_size(NTT_PREWARM_STACK_BYTES)
                 .spawn_scoped(scope, || {
                     prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)
                 })

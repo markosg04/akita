@@ -69,5 +69,5 @@ pub use runtime_capabilities::{
 pub use stack::{
     planned_ntt_cache_metrics, prewarm_ntt_requirements, LevelProveStacks, OperationCtx,
     PlannedNttCacheOwnerMetric, ProverComputeStack, ReleaseRootNttAfterFold, TieredProveStacks,
-    UniformProverStack,
+    UniformProverStack, NTT_PREWARM_STACK_BYTES,
 };

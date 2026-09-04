@@ -367,6 +367,11 @@ where
     }
 }
 
+/// Stack size for the threads that build retained NTT slots: the builds
+/// overflow the 2 MiB default, and the prewarm helper in `batched_prove`
+/// uses the same size.
+pub const NTT_PREWARM_STACK_BYTES: usize = 64 << 20;
+
 /// Prewarm the retained part of an exact execution plan.
 ///
 /// Each routed backend applies the same cache-retention policy as its runtime
@@ -401,14 +406,36 @@ where
     retained.sort_by_key(|(_, requirement)| std::cmp::Reverse(requirement.key.num_ring_elements));
     // Retained slots are distinct cache keys whose builds dedupe through a
     // per-key OnceLock, so building them concurrently is safe; the largest
-    // three keys dominate and otherwise serialize ~0.6 s at T=2^28.
+    // three keys dominate and otherwise serialize ~0.6 s at T=2^28. A slot
+    // build needs more stack than a rayon worker carries (it overflowed the
+    // default 2 MiB), so each runs on its own thread sized like the prewarm
+    // helper in `batched_prove`.
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        retained.into_par_iter().try_for_each(|(_, requirement)| {
-            stacks
-                .prove_stack_at_level(requirement.fold_level)
-                .prewarm_requirement(requirement)
+        std::thread::scope(|scope| {
+            let builders = retained
+                .into_iter()
+                .map(|(_, requirement)| {
+                    std::thread::Builder::new()
+                        .name("akita-ntt-slot-prewarm".into())
+                        .stack_size(NTT_PREWARM_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            stacks
+                                .prove_stack_at_level(requirement.fold_level)
+                                .prewarm_requirement(requirement)
+                        })
+                        .map_err(|err| {
+                            AkitaError::InvalidSetup(format!(
+                                "NTT prewarm thread spawn failed: {err}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            builders.into_iter().try_for_each(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| AkitaError::InvalidSetup("NTT prewarm thread panicked".into()))?
+            })
         })
     }
     #[cfg(not(feature = "parallel"))]
