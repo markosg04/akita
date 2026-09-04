@@ -126,14 +126,14 @@ where
     pub fn batched_prove<'a, T, P, B>(
         setup: &AkitaProverSetup<Cfg::Field>,
         opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
-        stacks: &'a impl LevelProveStacks<
+        stacks: &'a (impl LevelProveStacks<
             'a,
             Cfg::Field,
             Commit = B,
             Opening = B,
             Tensor = B,
             RingSwitch = B,
-        >,
+        > + Sync),
         transcript: &mut T,
         basis: BasisMode,
     ) -> Result<AkitaBatchedProof<Cfg::Field, Cfg::ExtField>, AkitaError>
@@ -189,14 +189,14 @@ where
     pub fn batched_prove_with_stack<'a, T, P, C, O, TS, R>(
         setup: &AkitaProverSetup<Cfg::Field>,
         opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
-        stacks: &'a impl LevelProveStacks<
+        stacks: &'a (impl LevelProveStacks<
             'a,
             Cfg::Field,
             Commit = C,
             Opening = O,
             Tensor = TS,
             RingSwitch = R,
-        >,
+        > + Sync),
         transcript: &mut T,
         basis: BasisMode,
     ) -> Result<AkitaBatchedProof<Cfg::Field, Cfg::ExtField>, AkitaError>

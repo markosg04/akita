@@ -378,7 +378,7 @@ pub fn prewarm_ntt_requirements<'a, F, S>(
 ) -> Result<(), AkitaError>
 where
     F: Field + CanonicalEncoding + 'a,
-    S: LevelProveStacks<'a, F> + ?Sized + 'a,
+    S: LevelProveStacks<'a, F> + ?Sized + Sync + 'a,
 {
     let mut retained = Vec::<(NttCacheOwnerId, RoutedNttRequirement)>::new();
     for requirement in requirements.entries() {
@@ -399,12 +399,27 @@ where
         }
     }
     retained.sort_by_key(|(_, requirement)| std::cmp::Reverse(requirement.key.num_ring_elements));
-    for (_, requirement) in retained {
-        stacks
-            .prove_stack_at_level(requirement.fold_level)
-            .prewarm_requirement(requirement)?;
+    // Retained slots are distinct cache keys whose builds dedupe through a
+    // per-key OnceLock, so building them concurrently is safe; the largest
+    // three keys dominate and otherwise serialize ~0.6 s at T=2^28.
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        retained.into_par_iter().try_for_each(|(_, requirement)| {
+            stacks
+                .prove_stack_at_level(requirement.fold_level)
+                .prewarm_requirement(requirement)
+        })
     }
-    Ok(())
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (_, requirement) in retained {
+            stacks
+                .prove_stack_at_level(requirement.fold_level)
+                .prewarm_requirement(requirement)?;
+        }
+        Ok(())
+    }
 }
 
 /// Planned cache state for one physical prepared owner after max-joining routes.

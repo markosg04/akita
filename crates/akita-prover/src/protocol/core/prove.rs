@@ -26,14 +26,8 @@ use jolt_field::{AdditiveGroup, CanonicalEncoding};
 pub fn batched_prove<'a, Cfg, T, P, C, O, TS, R>(
     expanded: &Arc<AkitaExpandedSetup<Cfg::Field>>,
     prefix_slots: &SetupPrefixProverRegistry<Cfg::Field>,
-    stacks: &'a impl LevelProveStacks<
-        'a,
-        Cfg::Field,
-        Commit = C,
-        Opening = O,
-        Tensor = TS,
-        RingSwitch = R,
-    >,
+    stacks: &'a (impl LevelProveStacks<'a, Cfg::Field, Commit = C, Opening = O, Tensor = TS, RingSwitch = R>
+             + Sync),
     opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
     transcript: &mut T,
     basis: BasisMode,
