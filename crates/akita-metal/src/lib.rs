@@ -61,7 +61,7 @@ mod runtime;
 #[cfg(target_os = "macos")]
 pub use backend::{MetalBackend, MetalCommitMetrics, MetalOpeningMetrics};
 #[cfg(target_os = "macos")]
-pub use packed_onehot::PackedOneHotCommitView;
+pub use packed_onehot::{LaneProgress, PackedOneHotCommitView};
 #[cfg(target_os = "macos")]
 pub use prepared::MetalPreparedSetup;
 #[cfg(target_os = "macos")]
