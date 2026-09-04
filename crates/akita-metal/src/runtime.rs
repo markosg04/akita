@@ -23,6 +23,8 @@ const DIRECT_KERNEL_NAME: &str = "akita_onehot_commit_gather";
 const BLOCK_BATCHED_KERNEL_NAME: &str = "akita_onehot_commit_block_batched";
 const PACKED_FP128_D512_PANELS_KERNEL_NAME: &str = "akita_packed_onehot_commit_fp128_d512_panels";
 const PACKED_PARTIAL_REDUCTION_KERNEL_NAME: &str = "akita_packed_onehot_reduce_partials";
+const PACKED_FP128_D128_RANK3_KERNEL_NAME: &str = "akita_packed_onehot_commit_fp128_d128_rank3";
+const FP128_D128_DECOMPOSE_FOLD_KERNEL_NAME: &str = "akita_fp128_d128_decompose_fold";
 const FP128_D64_DIGIT_ROWS_PARTIALS_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_partials";
 const FP128_D64_DIGIT_ROWS_REDUCE_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_reduce";
 const FP128_I8_COEFFICIENT_PACKING_KERNEL_NAME: &str = "akita_fp128_i8_coefficient_packing";
@@ -95,6 +97,10 @@ const FP128_D512_THREADS: usize = 1_024;
 const PACKED_ONEHOT_BUFFER_ALIGNMENT: usize = 16 * 1024;
 pub(crate) const FP128_D512_TASKS_PER_STREAM: usize = 32;
 pub(crate) const FP128_D512_POSITION_PARTIALS: usize = 16;
+pub(crate) const FP128_D128_RANK3_TASKS_PER_STREAM: usize = 64;
+pub(crate) const FP128_D128_RANK3_TILE_POSITIONS: usize = 16;
+const FP128_D128_RANK3_RING_D: u64 = 128;
+const FP128_D128_RANK3_INNER_RANK: u64 = 3;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
 const FP128_D512_THREADGROUP_BYTES: usize =
     FP128_D512_TILE_FIELD_ELEMENTS * size_of::<Fp128Limbs>();
@@ -221,6 +227,8 @@ pub enum MetalOneHotKernel {
     BlockBatched,
     /// Exact fp128 D512 panels with one block-column task per SIMDgroup.
     PackedFp128D512Panels,
+    /// Exact fp128 D128 rank-3 per-element tiles with two tasks per SIMDgroup.
+    PackedFp128D128Rank3,
 }
 
 /// Stable Metal device properties relevant to commitment scheduling.
@@ -941,6 +949,7 @@ pub(crate) struct MetalRuntime {
     direct_pipeline: ComputePipelineState,
     block_batched_pipeline: ComputePipelineState,
     packed_fp128_d512_pipeline: ComputePipelineState,
+    packed_fp128_d128_rank3_pipeline: ComputePipelineState,
     packed_partial_reduction_pipeline: ComputePipelineState,
     fp128_d64_digit_rows_partials_pipeline: ComputePipelineState,
     fp128_d64_digit_rows_reduce_pipeline: ComputePipelineState,
@@ -948,6 +957,7 @@ pub(crate) struct MetalRuntime {
     fp128_packed_onehot_coefficient_packing_partials_pipeline: ComputePipelineState,
     fp128_packed_onehot_coefficient_packing_reduce_pipeline: ComputePipelineState,
     fp128_d512_decompose_fold_pipeline: ComputePipelineState,
+    fp128_d128_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_build_fold_index_pipeline: ComputePipelineState,
     fp128_d512_build_coefficient_packing_index_pipeline: ComputePipelineState,
@@ -1233,6 +1243,7 @@ impl MetalRuntime {
             direct_pipeline: pipeline(DIRECT_KERNEL_NAME)?,
             block_batched_pipeline: pipeline(BLOCK_BATCHED_KERNEL_NAME)?,
             packed_fp128_d512_pipeline: pipeline(PACKED_FP128_D512_PANELS_KERNEL_NAME)?,
+            packed_fp128_d128_rank3_pipeline: pipeline(PACKED_FP128_D128_RANK3_KERNEL_NAME)?,
             packed_partial_reduction_pipeline: pipeline(PACKED_PARTIAL_REDUCTION_KERNEL_NAME)?,
             fp128_d64_digit_rows_partials_pipeline: pipeline(
                 FP128_D64_DIGIT_ROWS_PARTIALS_KERNEL_NAME,
@@ -1250,6 +1261,7 @@ impl MetalRuntime {
                 FP128_PACKED_ONEHOT_COEFFICIENT_PACKING_REDUCE_KERNEL_NAME,
             )?,
             fp128_d512_decompose_fold_pipeline: pipeline(FP128_D512_DECOMPOSE_FOLD_KERNEL_NAME)?,
+            fp128_d128_decompose_fold_pipeline: pipeline(FP128_D128_DECOMPOSE_FOLD_KERNEL_NAME)?,
             fp128_d512_subring64_decompose_fold_pipeline: pipeline(
                 FP128_D512_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
             )?,
@@ -1374,6 +1386,16 @@ impl MetalRuntime {
             >= FP128_D512_THREADS as u64
             && self
                 .packed_fp128_d512_pipeline
+                .static_threadgroup_memory_length()
+                == FP128_D512_THREADGROUP_BYTES as u64
+    }
+
+    pub(crate) fn supports_packed_fp128_d128_rank3(&self) -> bool {
+        self.packed_fp128_d128_rank3_pipeline
+            .max_total_threads_per_threadgroup()
+            >= FP128_D512_THREADS as u64
+            && self
+                .packed_fp128_d128_rank3_pipeline
                 .static_threadgroup_memory_length()
                 == FP128_D512_THREADGROUP_BYTES as u64
     }
@@ -1808,7 +1830,8 @@ impl MetalRuntime {
             encoder.set_label(match kernel {
                 MetalOneHotKernel::DirectGather => "Akita one-hot gather",
                 MetalOneHotKernel::BlockBatched => "Akita one-hot block batch",
-                MetalOneHotKernel::PackedFp128D512Panels => {
+                MetalOneHotKernel::PackedFp128D512Panels
+                | MetalOneHotKernel::PackedFp128D128Rank3 => {
                     return Err(MetalCommitError::UnsupportedShape(
                         "packed kernel requires packed parameters".into(),
                     ));
@@ -2478,9 +2501,51 @@ impl MetalRuntime {
         dense_subring64_challenges: Option<&[i8]>,
         params: PackedDecomposeFoldParams,
         position_chunk_len: usize,
+        consume: impl FnMut(usize, &[i32]),
+    ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
+        self.dispatch_packed_fp128_decompose_fold_streaming(
+            512,
+            lanes,
+            active_zero_rows,
+            challenge_positions,
+            challenge_coefficients,
+            dense_subring64_challenges,
+            params,
+            position_chunk_len,
+            consume,
+        )
+    }
+
+    /// Packed decompose-fold at ring dimension 512 (rank-1 row) or 128
+    /// (rank-3 row). The dense subring-64 challenge path exists only at 512.
+    pub(crate) fn dispatch_packed_fp128_decompose_fold_streaming(
+        &self,
+        ring_d: usize,
+        lanes: &[u8],
+        active_zero_rows: &[u64],
+        challenge_positions: &[u16],
+        challenge_coefficients: &[i8],
+        dense_subring64_challenges: Option<&[i8]>,
+        params: PackedDecomposeFoldParams,
+        position_chunk_len: usize,
         mut consume: impl FnMut(usize, &[i32]),
     ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
+            let (fold_pipeline, fold_threads) = match ring_d {
+                512 => (&self.fp128_d512_decompose_fold_pipeline, 256u64),
+                128 => (&self.fp128_d128_decompose_fold_pipeline, 128u64),
+                _ => {
+                    return Err(MetalCommitError::UnsupportedShape(
+                        "packed decompose-fold supports ring dimensions 512 and 128".into(),
+                    ));
+                }
+            };
+            if ring_d != 512 && dense_subring64_challenges.is_some() {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "dense subring-64 decompose-fold challenges require ring dimension 512".into(),
+                ));
+            }
+            let ring_d_u64 = ring_d as u64;
             let expected_challenge_terms = params
                 .num_columns
                 .checked_mul(params.blocks_per_column)
@@ -2494,7 +2559,7 @@ impl MetalRuntime {
                 .ok_or(MetalCommitError::ShapeOverflow("decompose-fold lanes"))?;
             let expected_output = params
                 .num_positions
-                .checked_mul(512)
+                .checked_mul(ring_d_u64)
                 .ok_or(MetalCommitError::ShapeOverflow("decompose-fold output"))?;
             let expected_dense_challenges = params
                 .num_columns
@@ -2528,13 +2593,10 @@ impl MetalRuntime {
                     u64::try_from(dense.len()).ok() != Some(expected_dense_challenges)
                 })
                 || params.num_positions > u64::from(u32::MAX)
-                || self
-                    .fp128_d512_decompose_fold_pipeline
-                    .max_total_threads_per_threadgroup()
-                    < 256
+                || fold_pipeline.max_total_threads_per_threadgroup() < fold_threads
             {
                 return Err(MetalCommitError::UnsupportedShape(
-                    "fp128 D512 packed decompose-fold geometry is unsupported".into(),
+                    "fp128 packed decompose-fold geometry is unsupported".into(),
                 ));
             }
 
@@ -2590,7 +2652,7 @@ impl MetalRuntime {
                     MetalCommitError::ShapeOverflow("decompose-fold position offset")
                 })?;
                 let output_offset = position_start
-                    .checked_mul(512)
+                    .checked_mul(ring_d)
                     .and_then(|count| count.checked_mul(size_of::<i32>()))
                     .ok_or(MetalCommitError::ShapeOverflow(
                         "decompose-fold output offset",
@@ -2609,7 +2671,7 @@ impl MetalRuntime {
                     set_inline_bytes(encoder, 3, &command_params);
                     encoder.set_buffer(4, Some(&active_zero_buffer), 0);
                 } else {
-                    encoder.set_compute_pipeline_state(&self.fp128_d512_decompose_fold_pipeline);
+                    encoder.set_compute_pipeline_state(fold_pipeline);
                     encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
                     encoder.set_buffer(1, Some(&positions), 0);
                     encoder.set_buffer(2, Some(&coefficients), 0);
@@ -2617,9 +2679,14 @@ impl MetalRuntime {
                     set_inline_bytes(encoder, 4, &command_params);
                     encoder.set_buffer(5, Some(&active_zero_buffer), 0);
                 }
+                let threads = if dense_challenges.is_some() {
+                    256
+                } else {
+                    fold_threads
+                };
                 encoder.dispatch_thread_groups(
                     MTLSize::new(position_count as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
+                    MTLSize::new(threads, 1, 1),
                 );
                 encoder.end_encoding();
                 command.commit();
@@ -2631,8 +2698,8 @@ impl MetalRuntime {
             for (command, position_start, position_end) in &commands {
                 command.wait_until_completed();
                 validate_completed_command(command)?;
-                let coefficient_start = position_start * 512;
-                let coefficient_end = position_end * 512;
+                let coefficient_start = position_start * ring_d;
+                let coefficient_end = position_end * ring_d;
                 if !output_zero_copy {
                     let readback_start = Instant::now();
                     // SAFETY: this completed command initialized the disjoint
@@ -6300,6 +6367,256 @@ impl MetalRuntime {
         })
     }
 
+    /// Dispatch the packed fp128 D128 rank-3 commit: threadgroups own one
+    /// matrix element and one position partial for 64 (column, block) tasks.
+    pub(crate) fn dispatch_packed_onehot_d128_rank3(
+        &self,
+        matrix: &Buffer,
+        lanes: &[u8],
+        active_zero_rows: &[u64],
+        mut params: PackedOneHotCommitParams,
+        streams_per_command: usize,
+    ) -> Result<DispatchOutcome, MetalCommitError> {
+        autoreleasepool(|| {
+            let expected_active_words = params.num_rows.div_ceil(u64::BITS as u64);
+            let zero_mask_exceeds_columns = params.num_columns < u64::BITS as u64
+                && params.zero_column_mask >> params.num_columns != 0;
+            if zero_mask_exceeds_columns
+                || (params.zero_column_mask == 0 && !active_zero_rows.is_empty())
+                || (params.zero_column_mask != 0
+                    && u64::try_from(active_zero_rows.len()).ok() != Some(expected_active_words))
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "packed committed-zero selector geometry is invalid".into(),
+                ));
+            }
+            let lane_count = params
+                .num_rows
+                .checked_mul(params.lane_stride)
+                .ok_or(MetalCommitError::ShapeOverflow("packed lane count"))?;
+            let expected_tasks = params
+                .num_columns
+                .checked_mul(params.full_blocks_per_column)
+                .ok_or(MetalCommitError::ShapeOverflow("packed task count"))?;
+            let expected_output = params
+                .column_capacity
+                .checked_mul(params.blocks_per_column)
+                .and_then(|count| count.checked_mul(params.n_a))
+                .and_then(|count| count.checked_mul(params.ring_d))
+                .ok_or(MetalCommitError::ShapeOverflow("packed output"))?;
+            let tile_positions = FP128_D128_RANK3_TILE_POSITIONS as u64;
+            if lane_count != lanes.len() as u64
+                || params.ring_d != FP128_D128_RANK3_RING_D
+                || params.onehot_k != 256
+                || params.column_capacity != 32
+                || params.num_columns == 0
+                || params.num_columns > params.column_capacity
+                || params.lane_stride != params.num_columns
+                || params.n_a != FP128_D128_RANK3_INNER_RANK
+                || params.num_digits_inner != 1
+                || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
+                || !params.positions_per_partial.is_multiple_of(tile_positions)
+                || !params.positions_per_block.is_multiple_of(2)
+                || !params.blocks_per_column.is_power_of_two()
+                || params.blocks_per_column > (1 << 12)
+                || params.full_blocks_per_column > params.blocks_per_column
+                || params.boundary_columns != 0
+                || params.num_blocks != expected_tasks
+                || params.task_offset != 0
+                || params.dispatch_tasks != params.num_blocks
+                || params.lane_row_offset != 0
+                || params.output_coefficients != expected_output
+                || streams_per_command == 0
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "packed fp128 D128 rank-3 dispatch geometry is outside the registered schedule"
+                        .into(),
+                ));
+            }
+            let expected_matrix_bytes = params
+                .n_a
+                .checked_mul(params.positions_per_block)
+                .and_then(|count| count.checked_mul(params.ring_d))
+                .and_then(|count| count.checked_mul(size_of::<Fp128Limbs>() as u64))
+                .ok_or(MetalCommitError::ShapeOverflow("packed matrix bytes"))?;
+            if matrix.length() < expected_matrix_bytes {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "packed fp128 D128 rank-3 matrix prefix is shorter than the plan".into(),
+                ));
+            }
+            if !self.supports_packed_fp128_d128_rank3() {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "packed fp128 D128 rank-3 pipeline does not expose the registered resources"
+                        .into(),
+                ));
+            }
+            params.columns_per_threadgroup = 1;
+            let tasks_per_stream = FP128_D128_RANK3_TASKS_PER_STREAM as u64;
+            let base_streams = params.num_blocks.div_ceil(tasks_per_stream);
+            let groups_per_stream = params
+                .n_a
+                .checked_mul(params.position_partials_per_block)
+                .ok_or(MetalCommitError::ShapeOverflow("packed partial groups"))?;
+            let threadgroups = base_streams
+                .checked_mul(groups_per_stream)
+                .ok_or(MetalCommitError::ShapeOverflow("packed threadgroups"))?;
+            if threadgroups > u64::from(u32::MAX)
+                || params.output_coefficients > u64::from(u32::MAX)
+                || params
+                    .output_coefficients
+                    .checked_mul(params.position_partials_per_block)
+                    .is_none_or(|count| count > u64::from(u32::MAX))
+            {
+                return Err(MetalCommitError::UnsupportedShape(
+                    "packed fp128 D128 rank-3 grid exceeds u32 indexing".into(),
+                ));
+            }
+
+            let buffer_start = Instant::now();
+            let output_count = usize::try_from(params.output_coefficients)
+                .map_err(|_| MetalCommitError::ShapeOverflow("output coefficients"))?;
+            let output_bytes = output_count
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow("output bytes"))?;
+            let output = self.shared_buffer(output_bytes)?;
+            let partial_count = output_count
+                .checked_mul(params.position_partials_per_block as usize)
+                .ok_or(MetalCommitError::ShapeOverflow("partial coefficients"))?;
+            let scratch_bytes = partial_count
+                .checked_mul(size_of::<Fp128Limbs>())
+                .ok_or(MetalCommitError::ShapeOverflow("partial bytes"))?;
+            let partials = self.private_buffer(scratch_bytes)?;
+            let no_active_zero_rows = [0u64];
+            let active_zero_rows = if active_zero_rows.is_empty() {
+                no_active_zero_rows.as_slice()
+            } else {
+                active_zero_rows
+            };
+            let active_zero_rows = self.shared_buffer_from_slice(active_zero_rows)?;
+            let mut buffer_setup = buffer_start.elapsed();
+
+            let source = ResidentPackedLanes { lanes };
+            let command_start = Instant::now();
+            let command_count = base_streams.div_ceil(streams_per_command as u64) as usize;
+            let mut commands = Vec::with_capacity(command_count);
+            let mut lane_buffers = Vec::with_capacity(command_count);
+            let mut input_zero_copy = true;
+            // Two ring positions per trace row at K = 256, D = 128.
+            let rows_per_block = params.positions_per_block / 2;
+            for first_stream in (0..base_streams).step_by(streams_per_command) {
+                let stream_count = (base_streams - first_stream).min(streams_per_command as u64);
+                let task_offset = first_stream * tasks_per_stream;
+                let mut dispatch_params = params;
+                dispatch_params.task_offset = task_offset;
+                dispatch_params.dispatch_tasks =
+                    (stream_count * tasks_per_stream).min(params.num_blocks - task_offset);
+                let final_task = task_offset + dispatch_params.dispatch_tasks - 1;
+                let first_block = task_offset / params.num_columns;
+                let final_block = final_task / params.num_columns;
+                let first_row = usize::try_from(first_block * rows_per_block)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed first row"))?;
+                let final_row = usize::try_from((final_block + 1) * rows_per_block)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed final row"))?;
+                let lane_stride = usize::try_from(params.lane_stride)
+                    .map_err(|_| MetalCommitError::ShapeOverflow("packed lane stride"))?;
+                let command_lanes = source.wait_lanes(first_row..final_row, lane_stride)?;
+                let lane_buffer_start = Instant::now();
+                let lane_buffer = self.packed_lane_buffer(command_lanes)?;
+                buffer_setup += lane_buffer_start.elapsed();
+                input_zero_copy &= lane_buffer.zero_copy;
+                dispatch_params.lane_row_offset = first_row as u64;
+                let command_threadgroups = stream_count.checked_mul(groups_per_stream).ok_or(
+                    MetalCommitError::ShapeOverflow("packed command threadgroups"),
+                )?;
+                let command = self.queue.new_command_buffer();
+                command.set_label("Akita packed fp128 D128 rank-3 root commitment");
+                let encoder = command.new_compute_command_encoder();
+                encoder.set_label("Akita packed fp128 D128 rank-3 element tiles");
+                encoder.set_compute_pipeline_state(&self.packed_fp128_d128_rank3_pipeline);
+                encoder.set_buffer(0, Some(matrix), 0);
+                encoder.set_buffer(1, Some(&lane_buffer.buffer), 0);
+                encoder.set_buffer(2, Some(&partials), 0);
+                set_inline_bytes(encoder, 3, &dispatch_params);
+                encoder.set_buffer(4, Some(&active_zero_rows), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(command_threadgroups, 1, 1),
+                    MTLSize::new(FP128_D512_THREADS as u64, 1, 1),
+                );
+                encoder.end_encoding();
+                command.commit();
+                commands.push(command);
+                lane_buffers.push(lane_buffer);
+            }
+
+            let reduction_command = self.queue.new_command_buffer();
+            reduction_command.set_label("Akita packed fp128 D128 rank-3 partial reduction");
+            let reduction = reduction_command.new_compute_command_encoder();
+            reduction.set_label("Akita packed fp128 D128 rank-3 partial reduction");
+            reduction.set_compute_pipeline_state(&self.packed_partial_reduction_pipeline);
+            reduction.set_buffer(0, Some(&partials), 0);
+            reduction.set_buffer(1, Some(&output), 0);
+            set_inline_bytes(reduction, 2, &params);
+            let reduction_width = (self
+                .packed_partial_reduction_pipeline
+                .thread_execution_width()
+                * 4)
+            .min(
+                self.packed_partial_reduction_pipeline
+                    .max_total_threads_per_threadgroup(),
+            );
+            reduction.dispatch_threads(
+                MTLSize::new(params.output_coefficients, 1, 1),
+                MTLSize::new(reduction_width, 1, 1),
+            );
+            reduction.end_encoding();
+            reduction_command.commit();
+            reduction_command.wait_until_completed();
+            let command_wall = command_start.elapsed();
+            for command in &commands {
+                validate_completed_command(command)?;
+            }
+            validate_completed_command(reduction_command)?;
+            let panel_gpu_active = commands.iter().try_fold(Duration::ZERO, |total, command| {
+                total.checked_add(completed_command_gpu_time(command)?)
+            });
+            let panel_gpu_span = commands
+                .first()
+                .zip(commands.last())
+                .and_then(|(first, last)| completed_commands_gpu_span(first, last));
+            let reduction_gpu = completed_command_gpu_time(reduction_command);
+            let gpu = commands
+                .first()
+                .and_then(|first| completed_commands_gpu_span(first, reduction_command));
+
+            let readback_start = Instant::now();
+            // SAFETY: `output` is live shared storage for exactly `output_count`
+            // aligned `Fp128Limbs` values.
+            let coefficients = unsafe {
+                std::slice::from_raw_parts(output.contents().cast::<Fp128Limbs>(), output_count)
+                    .to_vec()
+            };
+            Ok(DispatchOutcome {
+                coefficients,
+                timings: DispatchTimings {
+                    buffer_setup,
+                    command_wall,
+                    gpu,
+                    readback_copy: readback_start.elapsed(),
+                },
+                panel_gpu_active,
+                panel_gpu_span,
+                reduction_gpu,
+                command_buffers: commands.len() + 1,
+                kernel: MetalOneHotKernel::PackedFp128D128Rank3,
+                blocks_per_threadgroup: FP128_D128_RANK3_TASKS_PER_STREAM,
+                columns_per_threadgroup: 1,
+                matrix_block_streams: threadgroups as usize,
+                scratch_bytes,
+                input_zero_copy,
+            })
+        })
+    }
+
     fn dispatch_geometry(
         &self,
         params: OneHotCommitParams,
@@ -6323,9 +6640,11 @@ impl MetalRuntime {
                     Ok(blocks)
                 }
             }
-            MetalOneHotKernel::PackedFp128D512Panels => Err(MetalCommitError::UnsupportedShape(
-                "packed kernel requires packed parameters".into(),
-            )),
+            MetalOneHotKernel::PackedFp128D512Panels | MetalOneHotKernel::PackedFp128D128Rank3 => {
+                Err(MetalCommitError::UnsupportedShape(
+                    "packed kernel requires packed parameters".into(),
+                ))
+            }
         }
     }
 
@@ -6341,7 +6660,7 @@ impl MetalRuntime {
         let pipeline = match kernel {
             MetalOneHotKernel::DirectGather => &self.direct_pipeline,
             MetalOneHotKernel::BlockBatched => &self.block_batched_pipeline,
-            MetalOneHotKernel::PackedFp128D512Panels => {
+            MetalOneHotKernel::PackedFp128D512Panels | MetalOneHotKernel::PackedFp128D128Rank3 => {
                 return Err(MetalCommitError::UnsupportedShape(
                     "packed kernel requires packed parameters".into(),
                 ));
@@ -6373,7 +6692,9 @@ impl MetalRuntime {
                     MTLSize::new(params.blocks_per_threadgroup * params.ring_d, 1, 1),
                 );
             }
-            MetalOneHotKernel::PackedFp128D512Panels => unreachable!(),
+            MetalOneHotKernel::PackedFp128D512Panels | MetalOneHotKernel::PackedFp128D128Rank3 => {
+                unreachable!()
+            }
         }
         Ok(())
     }
@@ -6813,6 +7134,94 @@ mod tests {
             *output = evaluation;
             evaluation = alpha * evaluation - wrap_correction * coefficient;
         }
+    }
+
+    #[test]
+    fn packed_d128_decompose_fold_matches_model() {
+        // At K = 256, D = 128 one trace row spans two ring positions.
+        const POSITIONS: usize = 10;
+        const BLOCKS_PER_COLUMN: usize = 2;
+        const COLUMNS: usize = 3;
+        const CHALLENGE_WEIGHT: usize = 4;
+        let runtime = MetalRuntime::new().unwrap();
+        let num_rows = POSITIONS * BLOCKS_PER_COLUMN / 2;
+        let lanes = (0..num_rows * COLUMNS)
+            .map(|index| match index % 7 {
+                0 => 0,
+                1 => 255,
+                2 => 128,
+                _ => 1 + ((17 * index + 29) % 254) as u8,
+            })
+            .collect::<Vec<_>>();
+        let mut challenge_positions = Vec::new();
+        let mut challenge_coefficients = Vec::new();
+        for challenge in 0..COLUMNS * BLOCKS_PER_COLUMN {
+            for term in 0..CHALLENGE_WEIGHT {
+                challenge_positions.push(((97 * challenge + 131 * term) % 128) as u16);
+                challenge_coefficients.push([1, -2, 3, -4][term]);
+            }
+        }
+        let params = PackedDecomposeFoldParams {
+            num_rows: num_rows as u64,
+            num_columns: COLUMNS as u64,
+            lane_stride: COLUMNS as u64,
+            num_positions: POSITIONS as u64,
+            position_start: 0,
+            blocks_per_column: BLOCKS_PER_COLUMN as u64,
+            challenge_weight: CHALLENGE_WEIGHT as u64,
+            output_coefficients: (POSITIONS * 128) as u64,
+            zero_column_mask: 1,
+        };
+        let active_zero_rows = [0b1011u64];
+        let mut streamed = Vec::new();
+        let actual = runtime
+            .dispatch_packed_fp128_decompose_fold_streaming(
+                128,
+                &lanes,
+                &active_zero_rows,
+                &challenge_positions,
+                &challenge_coefficients,
+                None,
+                params,
+                4,
+                |_, coefficients| streamed.extend_from_slice(coefficients),
+            )
+            .unwrap()
+            .centered_coefficients;
+        let mut expected = vec![0i32; POSITIONS * 128];
+        for position in 0..POSITIONS {
+            for trace_block in 0..BLOCKS_PER_COLUMN {
+                for column in 0..COLUMNS {
+                    let ring = trace_block * POSITIONS + position;
+                    let row = ring / 2;
+                    let half = ring % 2;
+                    let hot = usize::from(lanes[row * COLUMNS + column]);
+                    let committed_zero = hot == 0
+                        && column == 0
+                        && active_zero_rows[row / u64::BITS as usize]
+                            & (1u64 << (row % u64::BITS as usize))
+                            != 0;
+                    if (hot == 0 && !committed_zero) || hot / 128 != half {
+                        continue;
+                    }
+                    let source_coefficient = hot % 128;
+                    let challenge = column * BLOCKS_PER_COLUMN + trace_block;
+                    let challenge_start = challenge * CHALLENGE_WEIGHT;
+                    for term in 0..CHALLENGE_WEIGHT {
+                        let mut destination = source_coefficient
+                            + usize::from(challenge_positions[challenge_start + term]);
+                        let mut value = i32::from(challenge_coefficients[challenge_start + term]);
+                        if destination >= 128 {
+                            destination -= 128;
+                            value = -value;
+                        }
+                        expected[position * 128 + destination] += value;
+                    }
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(streamed, expected);
     }
 
     #[test]
