@@ -4,6 +4,10 @@ dir = "target/nextest"
 [profile.ci.junit]
 path = "junit.xml"
 
+[[profile.default.overrides]]
+filter = 'package(akita-metal)'
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "5s" }
+
 # These production-sized fixtures use large-stack Rayon pools and otherwise
 # contend with every other test in the shard, inflating their own timing and
 # unrelated protocol E2Es. Reserve the full nextest pool while they run.

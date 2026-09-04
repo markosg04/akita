@@ -698,6 +698,7 @@ pub(crate) struct DispatchOutcome {
 pub(crate) struct DigitRowsDispatchOutcome {
     pub(crate) coefficients: Vec<Fp128Limbs>,
     pub(crate) timings: DispatchTimings,
+    pub(crate) allocation_bytes: usize,
 }
 
 pub(crate) struct CoefficientPackingDispatchOutcome {
@@ -2033,6 +2034,14 @@ impl MetalRuntime {
             };
             Ok(DigitRowsDispatchOutcome {
                 coefficients,
+                allocation_bytes: akita_error::checked::sum([
+                    digit_buffer.length() as usize,
+                    output.length() as usize,
+                    partials.length() as usize,
+                ])
+                .ok_or(MetalCommitError::ShapeOverflow(
+                    "digit-row allocation bytes",
+                ))?,
                 timings: DispatchTimings {
                     buffer_setup,
                     command_wall,
