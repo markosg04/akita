@@ -406,7 +406,8 @@ pub(crate) fn commit_validated<const D: usize>(
         );
     }
     let total_start = Instant::now();
-    let matrix = prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols)?;
+    let matrix = tracing::info_span!("packed_metal_matrix_prepare")
+        .in_scope(|| prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols))?;
     let work_units = shape
         .live_columns
         .checked_mul(shape.full_blocks_per_column)
@@ -441,16 +442,19 @@ pub(crate) fn commit_validated<const D: usize>(
         log_ring_d: 9,
         zero_column_mask: source.zero_column_mask(),
     };
-    let outcome = runtime
-        .dispatch_packed_onehot(
-            matrix.buffer.as_ref(),
-            source.lanes(),
-            source.active_zero_rows(),
-            params,
-            packed_streams_per_command(shape.active_a_cols),
-        )
+    let outcome = tracing::info_span!("packed_metal_dispatch")
+        .in_scope(|| {
+            runtime.dispatch_packed_onehot(
+                matrix.buffer.as_ref(),
+                source.lanes(),
+                source.active_zero_rows(),
+                params,
+                packed_streams_per_command(shape.active_a_cols),
+            )
+        })
         .map_err(MetalCommitError::into_akita)?;
 
+    let _reconstruction_span = tracing::info_span!("packed_metal_reconstruction").entered();
     let reconstruction_start = Instant::now();
     let coefficients = outcome
         .coefficients

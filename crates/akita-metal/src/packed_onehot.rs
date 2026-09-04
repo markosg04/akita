@@ -328,6 +328,36 @@ impl MetalBackend {
         )
     }
 
+    /// Build and cache the packed A-matrix prefix the D512/K256 commit will
+    /// use, so the commit itself does not pay `matrix_prepare` on the critical
+    /// path. Meant to run concurrently with the caller's row assembly. Returns
+    /// `Ok(true)` when the prefix was already resident, `Ok(false)` when this
+    /// call built it or when no Metal runtime is available (a later commit then
+    /// takes whatever path it would have taken anyway).
+    pub fn prewarm_packed_onehot_matrix(
+        &self,
+        prepared: &MetalPreparedSetup,
+        ring_d: usize,
+        n_a: usize,
+        active_a_cols: usize,
+    ) -> Result<bool, AkitaError> {
+        let Some(runtime) = self.runtime() else {
+            return Ok(false);
+        };
+        if !runtime.supports_packed_fp128_d512_panels() {
+            return Ok(false);
+        }
+        let _span = tracing::info_span!(
+            "MetalBackend::prewarm_packed_onehot_matrix",
+            ring_d,
+            n_a,
+            active_a_cols
+        )
+        .entered();
+        let matrix = prepared.matrix(runtime, ring_d, n_a, active_a_cols)?;
+        Ok(matrix.cache_hit)
+    }
+
     fn commit_packed_onehot_cpu<const D: usize>(
         &self,
         prepared: &MetalPreparedSetup,
