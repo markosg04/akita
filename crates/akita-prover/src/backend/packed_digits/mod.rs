@@ -280,6 +280,52 @@ impl PackedSignedDigitWriter {
         self.extend_digits(digits)
     }
 
+    /// Write a large contiguous digit run directly into packed storage.
+    ///
+    /// Equivalent to [`Self::write_at`] but encodes whole 64-digit blocks in
+    /// parallel without staging them, which is what the witness Z/T planes
+    /// (hundreds of MB per level) need; the sub-block tail goes through the
+    /// ordinary staging path so alignment invariants hold.
+    pub(crate) fn write_at_bulk(&mut self, start: usize, digits: &[i8]) -> Result<(), AkitaError> {
+        if start < self.position {
+            return Err(AkitaError::InvalidInput(
+                "packed signed-digit writes must be in physical order".into(),
+            ));
+        }
+        self.extend_zeros(start - self.position)?;
+        self.flush_staging()?;
+        debug_assert_eq!(self.position, self.flushed);
+        if !self.position.is_multiple_of(DIGITS_PER_BLOCK)
+            || digits.len() < PARALLEL_ENCODE_THRESHOLD
+        {
+            return self.extend_digits(digits);
+        }
+        let bulk_len = digits.len() - digits.len() % DIGITS_PER_BLOCK;
+        let (bulk, tail) = digits.split_at(bulk_len);
+        let end = self.checked_advance(bulk_len)?;
+        if end > self.len {
+            return Err(AkitaError::InvalidInput(
+                "packed signed-digit bulk write exceeds the witness length".into(),
+            ));
+        }
+        self.bounds
+            .include_bounds(signed_digit_bounds_parallel(bulk));
+        let encoded_start = encoded_byte_len(self.position, self.bit_width)?;
+        let encoded_end = encoded_byte_len(end, self.bit_width)?;
+        let storage = Arc::get_mut(&mut self.storage)
+            .expect("streaming packed storage remains uniquely owned");
+        encode_digits(
+            bulk,
+            self.bit_width,
+            storage
+                .get_mut(encoded_start..encoded_end)
+                .ok_or(AkitaError::InvalidProof)?,
+        );
+        self.position = end;
+        self.flushed = end;
+        self.extend_digits(tail)
+    }
+
     pub(crate) fn finish(mut self) -> Result<PackedSignedDigits, AkitaError> {
         self.extend_zeros(self.len - self.position)?;
         self.flush_staging()?;
@@ -673,6 +719,23 @@ fn validate_bounds(bounds: SignedDigitBounds, bit_width: u8) -> Result<(), Akita
         "digit bounds [-{}, {}] do not fit signed {bit_width}-bit storage",
         bounds.negative_abs_max, bounds.positive_max,
     )))
+}
+
+fn signed_digit_bounds_parallel(digits: &[i8]) -> SignedDigitBounds {
+    #[cfg(feature = "parallel")]
+    if digits.len() >= PARALLEL_ENCODE_THRESHOLD {
+        return digits.par_chunks(1 << 20).map(signed_digit_bounds).reduce(
+            || SignedDigitBounds {
+                negative_abs_max: 0,
+                positive_max: 0,
+            },
+            |mut left, right| {
+                left.include_bounds(right);
+                left
+            },
+        );
+    }
+    signed_digit_bounds(digits)
 }
 
 fn signed_digit_bounds(digits: &[i8]) -> SignedDigitBounds {

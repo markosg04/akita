@@ -16,9 +16,9 @@ use crate::DecomposeFoldWitness;
 use akita_algebra::balanced_decompose_coefficients_pow2_i8_into;
 use akita_serialization::AkitaSerialize;
 use akita_types::{
-    dispatch_for_field, emit_witness_e_planes, emit_witness_t_planes, emit_witness_z_planes,
-    CommitmentRingDims, CompressionWitnessSpan, DigitBlocks, PackedNegativeBinary, RingRole,
-    RingVec, WitnessLayout, WitnessUnitLayout,
+    dispatch_for_field, emit_witness_e_planes, emit_witness_t_planes, CommitmentRingDims,
+    CompressionWitnessSpan, DigitBlocks, PackedNegativeBinary, RingRole, RingVec, WitnessLayout,
+    WitnessUnitLayout,
 };
 use jolt_field::solinas::parallel::*;
 
@@ -202,8 +202,15 @@ fn emit_witness_unit<F: Field + CanonicalEncoding>(
             }
         )?;
     }
-    {
+    let e_range = unit.e_range();
+    let t_range = unit.t_range();
+    let fill_e = || -> Result<Vec<i8>, AkitaError> {
         let _span = tracing::info_span!("ring_switch_emit_e_segments").entered();
+        let mut buf = vec![0i8; e_range.len()];
+        let mut sink = OffsetSink {
+            base: e_range.start,
+            buf: &mut buf,
+        };
         let opening_width = unit.e_geometry().physical_coefficient_width();
         dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Opening),
@@ -211,7 +218,7 @@ fn emit_witness_unit<F: Field + CanonicalEncoding>(
             group.role_dims.d_d(),
             |D_D| {
                 emit_witness_e_planes::<D_D>(
-                    out,
+                    &mut sink,
                     unit,
                     opening_width,
                     num_claims,
@@ -221,9 +228,15 @@ fn emit_witness_unit<F: Field + CanonicalEncoding>(
                 )
             }
         )?;
-    }
-    {
+        Ok(buf)
+    };
+    let fill_t = || -> Result<Vec<i8>, AkitaError> {
         let _span = tracing::info_span!("ring_switch_emit_t_segments").entered();
+        let mut buf = vec![0i8; t_range.len()];
+        let mut sink = OffsetSink {
+            base: t_range.start,
+            buf: &mut buf,
+        };
         dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Inner),
             F,
@@ -235,7 +248,7 @@ fn emit_witness_unit<F: Field + CanonicalEncoding>(
                     group.role_dims.d_b(),
                     |D_B| {
                         emit_witness_t_planes::<D_A, D_B>(
-                            out,
+                            &mut sink,
                             unit,
                             num_claims,
                             group.params.a_rows_len(),
@@ -247,6 +260,18 @@ fn emit_witness_unit<F: Field + CanonicalEncoding>(
                 )
             }
         )?;
+        Ok(buf)
+    };
+    // E and T address disjoint ranges; assemble them concurrently, then write
+    // both in physical order through the bulk path.
+    let (e_buf, t_buf) = cfg_join!(fill_e, fill_t);
+    let (e_buf, t_buf) = (e_buf?, t_buf?);
+    if e_range.start <= t_range.start {
+        out.write_at_bulk(e_range.start, &e_buf)?;
+        out.write_at_bulk(t_range.start, &t_buf)?;
+    } else {
+        out.write_at_bulk(t_range.start, &t_buf)?;
+        out.write_at_bulk(e_range.start, &e_buf)?;
     }
     Ok(())
 }
@@ -281,14 +306,41 @@ fn emit_unit_z_segment<const D: usize>(
         });
     }
     let _span = tracing::info_span!("ring_switch_emit_z_planes").entered();
-    emit_witness_z_planes::<D>(
-        out,
-        unit,
-        group.params.num_positions_per_block(),
-        group.params.num_digits_inner(),
-        num_digits_fold,
-        &z_planes,
-    )
+    // `emit_witness_z_planes` walks (position, commit digit, fold digit) in the
+    // same order the Z index formula lays them out, so the flattened plane
+    // vector is already the physical Z segment; write it as one parallel bulk
+    // run instead of one staged write per plane.
+    debug_assert_eq!(
+        unit.z_coefficient_index(
+            D,
+            group.params.num_positions_per_block(),
+            group.params.num_digits_inner(),
+            num_digits_fold,
+            0,
+            0,
+            0,
+            0,
+        )?,
+        range.start
+    );
+    out.write_at_bulk(range.start, z_planes.as_flattened())
+}
+
+/// A `WitnessCoefficientSink` over a private buffer that mirrors one physical
+/// witness range, so a segment can be assembled off the streaming writer and
+/// then written in one bulk run.
+struct OffsetSink<'a> {
+    base: usize,
+    buf: &'a mut [i8],
+}
+
+impl akita_types::WitnessCoefficientSink for OffsetSink<'_> {
+    fn write_coefficients(&mut self, start: usize, coefficients: &[i8]) -> Result<(), AkitaError> {
+        let local = start
+            .checked_sub(self.base)
+            .ok_or(AkitaError::InvalidProof)?;
+        self.buf.write_coefficients(local, coefficients)
+    }
 }
 
 /// Build the witness vector `w` from the ring-relation witness.
