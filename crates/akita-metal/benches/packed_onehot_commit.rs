@@ -11,8 +11,6 @@ fn main() {
     use akita_types::SetupMatrixCapacity;
     use jolt_field::Prime128OffsetA7F7;
 
-    const D: usize = 512;
-
     fn setting(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
@@ -28,7 +26,17 @@ fn main() {
     }
 
     let log_rows = setting("AKITA_METAL_LOG_ROWS", 12);
+    let ring_d = setting("AKITA_METAL_RING_D", 512);
+    let (n_a, expected_kernel) = match ring_d {
+        512 => (1, MetalOneHotKernel::PackedFp128D512Panels),
+        128 => (3, MetalOneHotKernel::PackedFp128D128Rank3),
+        _ => panic!("AKITA_METAL_RING_D must be 512 or 128"),
+    };
     let onehot_k = setting("AKITA_METAL_ONEHOT_K", 256);
+    assert!(
+        ring_d == 512 || onehot_k == 256,
+        "the D128 rank-3 kernel is K256 only"
+    );
     let capacity = match onehot_k {
         16 => 64,
         256 => 32,
@@ -55,7 +63,7 @@ fn main() {
         .collect::<Vec<_>>();
     let source = PackedOneHotCommitView::new(onehot_k, capacity, columns, &lanes).unwrap();
     let plan = CommitInnerPlan {
-        n_a: 1,
+        n_a,
         num_positions_per_block: positions_per_block,
         num_digits_inner: 1,
         log_basis_inner: 3,
@@ -64,16 +72,18 @@ fn main() {
         log_rows + onehot_k.trailing_zeros() as usize + capacity.trailing_zeros() as usize,
         1,
         SetupMatrixCapacity {
-            num_field_elements: positions_per_block * D,
+            num_field_elements: n_a * positions_per_block * ring_d,
         },
     )
     .unwrap();
     let backend = MetalBackend::new(MetalExecutionPolicy::RequireMetal).unwrap();
     let prepared = backend.prepare_setup(&setup).unwrap();
 
-    let warm = backend
-        .commit_packed_onehot::<D>(&prepared, source, plan)
-        .unwrap();
+    let commit = |backend: &MetalBackend| match ring_d {
+        512 => backend.commit_packed_onehot::<512>(&prepared, source, plan),
+        _ => backend.commit_packed_onehot::<128>(&prepared, source, plan),
+    };
+    let warm = commit(&backend).unwrap();
     let matrix_prepare_time = backend
         .last_commit_metrics()
         .unwrap()
@@ -82,11 +92,7 @@ fn main() {
     let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
         let start = Instant::now();
-        let witness = black_box(
-            backend
-                .commit_packed_onehot::<D>(&prepared, source, plan)
-                .unwrap(),
-        );
+        let witness = black_box(commit(&backend).unwrap());
         times.push(start.elapsed());
         assert_eq!(warm.inner_rows, witness.inner_rows);
     }
@@ -94,10 +100,10 @@ fn main() {
         times.iter().map(Duration::as_secs_f64).sum::<f64>() / samples as f64,
     );
     let metrics = backend.last_commit_metrics().unwrap().unwrap();
-    assert_eq!(metrics.kernel, MetalOneHotKernel::PackedFp128D512Panels);
+    assert_eq!(metrics.kernel, expected_kernel);
     assert!(metrics.matrix_cache_hit);
     println!(
-        "AKITA_METAL_PACKED_COMMIT log_rows={log_rows} onehot_k={onehot_k} capacity={capacity} columns={columns} positions_per_block={positions_per_block} density_percent={density_percent} samples={samples} mean_ms={:.6} gpu_ms={} panel_active_ms={} panel_span_ms={} reduction_ms={} command_buffers={} matrix_streams={} command_ms={:.6} buffer_setup_ms={:.6} readback_ms={:.6} reconstruct_ms={:.6} total_ms={:.6} matrix_prepare_ms={:.6} lanes_bytes={} output_bytes={} scratch_bytes={} hot_entries={}",
+        "AKITA_METAL_PACKED_COMMIT log_rows={log_rows} ring_d={ring_d} n_a={n_a} onehot_k={onehot_k} capacity={capacity} columns={columns} positions_per_block={positions_per_block} density_percent={density_percent} samples={samples} mean_ms={:.6} gpu_ms={} panel_active_ms={} panel_span_ms={} reduction_ms={} command_buffers={} matrix_streams={} command_ms={:.6} buffer_setup_ms={:.6} readback_ms={:.6} reconstruct_ms={:.6} total_ms={:.6} matrix_prepare_ms={:.6} lanes_bytes={} output_bytes={} scratch_bytes={} hot_entries={}",
         mean.as_secs_f64() * 1e3,
         metrics
             .gpu_time

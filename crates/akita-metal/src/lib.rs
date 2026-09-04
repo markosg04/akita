@@ -45,6 +45,8 @@ mod onehot;
 #[cfg(target_os = "macos")]
 mod packed_onehot;
 #[cfg(target_os = "macos")]
+mod packed_onehot_fp128_d128_rank3;
+#[cfg(target_os = "macos")]
 mod packed_onehot_fp128_d512;
 #[cfg(target_os = "macos")]
 mod prepared;

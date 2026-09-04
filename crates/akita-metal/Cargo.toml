@@ -50,5 +50,9 @@ akita-prover = { version = "0.1.0", path = "../akita-prover" }
 name = "packed_onehot_commit"
 harness = false
 
+[[bench]]
+name = "d128_rank3_tiles"
+harness = false
+
 [lints]
 workspace = true

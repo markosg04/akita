@@ -290,13 +290,17 @@ impl<const D: usize> RootCommitKernel<PackedOneHotCommitView<'_>, F, D> for Meta
 }
 
 impl MetalBackend {
-    /// Commit one resident packed source through the D512/K256 Metal kernel.
+    /// Commit one resident packed source through the D512 rank-1 or the
+    /// D128 rank-3 K256 Metal kernel, selected by the plan's ring geometry.
     pub fn commit_packed_onehot<const D: usize>(
         &self,
         prepared: &MetalPreparedSetup,
         source: PackedOneHotCommitView<'_>,
         plan: CommitInnerPlan,
     ) -> Result<CommitInnerWitness<F>, AkitaError> {
+        if D == crate::packed_onehot_fp128_d128_rank3::RING_D {
+            return self.commit_packed_onehot_d128_rank3::<D>(prepared, source, plan);
+        }
         let shape = match crate::packed_onehot_fp128_d512::validate_shape::<D>(source, plan) {
             Ok(shape) => shape,
             Err(error) if self.policy() == MetalExecutionPolicy::RequireMetal => return Err(error),
@@ -328,8 +332,8 @@ impl MetalBackend {
         )
     }
 
-    /// Build and cache the packed A-matrix prefix the D512/K256 commit will
-    /// use, so the commit itself does not pay `matrix_prepare` on the critical
+    /// Build and cache the packed A-matrix prefix the D512 rank-1 or D128
+    /// rank-3 K256 commit will use, so the commit itself does not pay `matrix_prepare` on the critical
     /// path. Meant to run concurrently with the caller's row assembly. Returns
     /// `Ok(true)` when the prefix was already resident, `Ok(false)` when this
     /// call built it or when no Metal runtime is available (a later commit then
@@ -344,7 +348,12 @@ impl MetalBackend {
         let Some(runtime) = self.runtime() else {
             return Ok(false);
         };
-        if !runtime.supports_packed_fp128_d512_panels() {
+        let supported = match ring_d {
+            512 => runtime.supports_packed_fp128_d512_panels(),
+            128 => runtime.supports_packed_fp128_d128_rank3(),
+            _ => false,
+        };
+        if !supported {
             return Ok(false);
         }
         let _span = tracing::info_span!(
@@ -356,6 +365,43 @@ impl MetalBackend {
         .entered();
         let matrix = prepared.matrix(runtime, ring_d, n_a, active_a_cols)?;
         Ok(matrix.cache_hit)
+    }
+
+    fn commit_packed_onehot_d128_rank3<const D: usize>(
+        &self,
+        prepared: &MetalPreparedSetup,
+        source: PackedOneHotCommitView<'_>,
+        plan: CommitInnerPlan,
+    ) -> Result<CommitInnerWitness<F>, AkitaError> {
+        let shape = match crate::packed_onehot_fp128_d128_rank3::validate_shape::<D>(source, plan) {
+            Ok(shape) => shape,
+            Err(error) if self.policy() == MetalExecutionPolicy::RequireMetal => return Err(error),
+            Err(_) => return self.commit_packed_onehot_cpu::<D>(prepared, source, plan),
+        };
+        let Some(runtime) = self.runtime() else {
+            return match self.policy() {
+                MetalExecutionPolicy::RequireMetal => {
+                    Err(MetalCommitError::DeviceUnavailable.into_akita())
+                }
+                MetalExecutionPolicy::PreferMetal => {
+                    self.commit_packed_onehot_cpu::<D>(prepared, source, plan)
+                }
+            };
+        };
+        if !runtime.supports_packed_fp128_d128_rank3() {
+            return match self.policy() {
+                MetalExecutionPolicy::RequireMetal => Err(MetalCommitError::UnsupportedShape(
+                    "fp128 D128 rank-3 pipeline is unavailable".into(),
+                )
+                .into_akita()),
+                MetalExecutionPolicy::PreferMetal => {
+                    self.commit_packed_onehot_cpu::<D>(prepared, source, plan)
+                }
+            };
+        }
+        crate::packed_onehot_fp128_d128_rank3::commit_validated::<D>(
+            self, prepared, runtime, source, plan, shape,
+        )
     }
 
     fn commit_packed_onehot_cpu<const D: usize>(
@@ -386,27 +432,29 @@ impl MetalBackend {
         })
     }
 
-    /// Decompose and challenge-fold one resident packed K256 source at D512.
+    /// Decompose and challenge-fold one resident packed K256 source at D512
+    /// (rank-1 row) or D128 (rank-3 row).
     pub fn decompose_fold_packed_onehot<const D: usize>(
         &self,
         source: PackedOneHotCommitView<'_>,
         plan: DecomposeFoldPlan<'_>,
     ) -> Result<DecomposeFoldWitness<F>, AkitaError> {
         let total_start = std::time::Instant::now();
-        if D != 512
+        if !matches!(D, 128 | 512)
             || source.onehot_k() != 256
             || source.column_capacity() != 32
             || plan.num_positions_per_block == 0
             || plan.num_digits == 0
-            || !source.num_rows().is_multiple_of(2)
+            || !(source.num_rows() * source.onehot_k()).is_multiple_of(D)
         {
             return Err(MetalCommitError::UnsupportedShape(
-                "packed opening requires D512/K256/capacity32 and nonempty output".into(),
+                "packed opening requires D512 or D128 over K256/capacity32 and nonempty output"
+                    .into(),
             )
             .into_akita());
         }
 
-        let segment_rings = source.num_rows() / 2;
+        let segment_rings = source.num_rows() * source.onehot_k() / D;
         if !segment_rings.is_multiple_of(plan.num_positions_per_block) {
             return Err(MetalCommitError::UnsupportedShape(
                 "packed opening segment is not aligned to the scheduled positions".into(),
@@ -487,7 +535,7 @@ impl MetalBackend {
                 }
             }
         }
-        let dense_subring64 = has_subring64_embedding.then_some(dense_subring64);
+        let dense_subring64 = (D == 512 && has_subring64_embedding).then_some(dense_subring64);
         let output_coefficients = plan.num_positions_per_block.checked_mul(D).ok_or_else(|| {
             MetalCommitError::ShapeOverflow("packed opening output coefficients").into_akita()
         })?;
@@ -506,7 +554,8 @@ impl MetalBackend {
             zero_column_mask: source.zero_column_mask(),
         };
         let outcome = runtime
-            .dispatch_packed_fp128_d512_decompose_fold_streaming(
+            .dispatch_packed_fp128_decompose_fold_streaming(
+                D,
                 source.lanes(),
                 source.active_zero_rows(),
                 &positions,

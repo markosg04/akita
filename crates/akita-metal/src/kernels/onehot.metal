@@ -4623,3 +4623,228 @@ kernel void akita_onehot_commit_gather(
     }
     output[output_index] = accumulator;
 }
+
+// Packed fp128 D128 rank-3 root commitment.
+//
+// Mapping for K = 256, D = 128: local field = row * 256 + lane, position =
+// field / 128 (one trace row spans two ring positions), shift = field mod 128.
+// Every hot entry adds the negacyclic rotation of one 128-coefficient row of
+// each of the n_a = 3 matrix elements into the (column, block, element)
+// accumulator. A threadgroup owns one matrix element: it streams that
+// element's rows for sixteen positions per 32 KiB tile (the same plane stride
+// as the D512 panel tile, so the D512 gather and transposed-add helpers apply)
+// and each SIMD group accumulates two tasks with four coefficients per lane.
+#define PACKED_FP128_D128_RANK3_D 128u
+#define PACKED_FP128_D128_RANK3_TILE_POSITIONS 16u
+#define PACKED_FP128_D128_RANK3_ROWS_PER_TILE 8u
+#define PACKED_FP128_D128_RANK3_TASKS_PER_SIMDGROUP 2u
+#define PACKED_FP128_D128_RANK3_TASKS_PER_STREAM 64u
+
+static_assert(
+    PACKED_FP128_D128_RANK3_TILE_POSITIONS * PACKED_FP128_D128_RANK3_D
+        == PACKED_FP128_D512_PANEL_TILE_ELEMENTS,
+    "D128 rank-3 tile must reuse the D512 panel tile plane stride");
+
+inline void akita_fp128_d128_rank3_accumulate_task_tile(
+    thread AkitaTransposedFp128Accumulator &accumulator,
+    threadgroup const uint *shared_matrix,
+    device const uchar *lanes,
+    device const ulong *active_zero_rows,
+    constant PackedOneHotCommitParams &params,
+    ulong tile_row_base,
+    uint task_column,
+    uint simd_lane)
+{
+    uint local_hot = 0u;
+    bool local_selected = false;
+    if (simd_lane < PACKED_FP128_D128_RANK3_ROWS_PER_TILE) {
+        ulong trace_row = tile_row_base + (ulong)simd_lane;
+        local_hot = (uint)lanes[
+            (trace_row - params.lane_row_offset) * params.lane_stride + (ulong)task_column];
+        local_selected = local_hot != 0u;
+        if (!local_selected
+            && ((params.zero_column_mask >> task_column) & 1ul) != 0ul) {
+            ulong active_word = active_zero_rows[trace_row >> 6ul];
+            local_selected = ((active_word >> (trace_row & 63ul)) & 1ul) != 0ul;
+        }
+    }
+    uint selected = uint(simd_ballot(local_selected).operator unsigned long());
+    uint4 coefficients = uint4(simd_lane, simd_lane + 32u, simd_lane + 64u, simd_lane + 96u);
+    while (selected != 0u) {
+        uint selected_lane = ctz(selected);
+        uint selected_hot = simd_shuffle(local_hot, selected_lane);
+        uint local_position = 2u * selected_lane + (selected_hot >> 7u);
+        uint4 shift = uint4(selected_hot & 127u);
+        akita_fp128_d512_accumulate_mixed(
+            accumulator, shared_matrix, local_position * PACKED_FP128_D128_RANK3_D,
+            (coefficients - shift) & uint4(127u), coefficients >= shift);
+        selected &= selected - 1u;
+    }
+}
+
+inline void akita_store_fp128_d128_rank3(
+    device AkitaFp128 *partials,
+    AkitaTransposedFp128Accumulator accumulator,
+    constant PackedOneHotCommitParams &params,
+    uint task_column,
+    uint task_block,
+    uint element,
+    uint position_partial,
+    uint simd_lane)
+{
+    ulong block = (ulong)task_column * params.blocks_per_column + (ulong)task_block;
+    ulong output_base = (block * params.n_a + (ulong)element) * (ulong)PACKED_FP128_D128_RANK3_D;
+    ulong partial_base = (ulong)position_partial * params.output_coefficients + output_base;
+    partials[partial_base + simd_lane] = akita_reduce_transposed_fp128(accumulator, 0u);
+    partials[partial_base + simd_lane + 32ul] = akita_reduce_transposed_fp128(accumulator, 1u);
+    partials[partial_base + simd_lane + 64ul] = akita_reduce_transposed_fp128(accumulator, 2u);
+    partials[partial_base + simd_lane + 96ul] = akita_reduce_transposed_fp128(accumulator, 3u);
+}
+
+kernel void akita_packed_onehot_commit_fp128_d128_rank3(
+    device const AkitaFp128 *matrix [[buffer(0)]],
+    device const uchar *lanes [[buffer(1)]],
+    device AkitaFp128 *partials [[buffer(2)]],
+    constant PackedOneHotCommitParams &params [[buffer(3)]],
+    device const ulong *active_zero_rows [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS * 4];
+
+    constexpr uint tasks_per_stream = PACKED_FP128_D128_RANK3_TASKS_PER_STREAM;
+    constexpr uint threads_per_threadgroup = 1024u;
+    uint num_tasks = (uint)params.dispatch_tasks;
+    uint streams = (num_tasks + tasks_per_stream - 1u) / tasks_per_stream;
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    uint position_partials = (uint)params.position_partials_per_block;
+    uint stream = threadgroup_index.x % streams;
+    uint partial_group = threadgroup_index.x / streams;
+    uint position_partial = partial_group % position_partials;
+    uint element = partial_group / position_partials;
+    uint positions_per_partial = (uint)params.positions_per_partial;
+    uint partial_start = position_partial * positions_per_partial;
+    ulong rows_per_partial = (ulong)positions_per_partial / 2ul;
+    ulong rows_per_block = params.positions_per_block / 2ul;
+    uint live_columns = (uint)params.num_columns;
+    uint dispatch_task_0 = stream * tasks_per_stream
+        + simdgroup * PACKED_FP128_D128_RANK3_TASKS_PER_SIMDGROUP;
+    bool active_0 = dispatch_task_0 < num_tasks;
+    bool active_1 = dispatch_task_0 + 1u < num_tasks;
+    uint global_0 = (uint)params.task_offset + dispatch_task_0;
+    uint global_1 = global_0 + 1u;
+    uint block_0 = global_0 / live_columns;
+    uint column_0 = global_0 % live_columns;
+    uint block_1 = global_1 / live_columns;
+    uint column_1 = global_1 % live_columns;
+    ulong matrix_cursor =
+        ((ulong)element * params.positions_per_block + (ulong)partial_start)
+        * (ulong)PACKED_FP128_D128_RANK3_D;
+
+    AkitaTransposedFp128Accumulator accumulator_0 = akita_transposed_fp128_zero();
+    AkitaTransposedFp128Accumulator accumulator_1 = akita_transposed_fp128_zero();
+
+    uint tile_count = positions_per_partial / PACKED_FP128_D128_RANK3_TILE_POSITIONS;
+    for (uint tile = 0u; tile < tile_count; ++tile) {
+        for (uint shared_index = thread_index;
+             shared_index < PACKED_FP128_D512_PANEL_TILE_ELEMENTS;
+             shared_index += threads_per_threadgroup) {
+            AkitaFp128 value = matrix[matrix_cursor + (ulong)shared_index];
+            shared_matrix[shared_index] = value.limb[0];
+            shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS + shared_index] = value.limb[1];
+            shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS * 2u + shared_index] =
+                value.limb[2];
+            shared_matrix[PACKED_FP128_D512_PANEL_TILE_ELEMENTS * 3u + shared_index] =
+                value.limb[3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ulong tile_rows = (ulong)position_partial * rows_per_partial
+            + (ulong)tile * (ulong)PACKED_FP128_D128_RANK3_ROWS_PER_TILE;
+        if (active_0) {
+            akita_fp128_d128_rank3_accumulate_task_tile(
+                accumulator_0, shared_matrix, lanes, active_zero_rows, params,
+                (ulong)block_0 * rows_per_block + tile_rows, column_0, simd_lane);
+        }
+        if (active_1) {
+            akita_fp128_d128_rank3_accumulate_task_tile(
+                accumulator_1, shared_matrix, lanes, active_zero_rows, params,
+                (ulong)block_1 * rows_per_block + tile_rows, column_1, simd_lane);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        matrix_cursor += (ulong)PACKED_FP128_D512_PANEL_TILE_ELEMENTS;
+    }
+
+    if (active_0) {
+        akita_store_fp128_d128_rank3(
+            partials, accumulator_0, params, column_0, block_0, element, position_partial,
+            simd_lane);
+    }
+    if (active_1) {
+        akita_store_fp128_d128_rank3(
+            partials, accumulator_1, params, column_1, block_1, element, position_partial,
+            simd_lane);
+    }
+}
+
+// Packed decompose-fold for the D128 rank-3 row. One threadgroup of 128
+// threads owns one ring position: at K = 256, D = 128 a trace row spans two
+// positions, so position `p` of a block reads row `p / 2` and keeps the hot
+// lanes whose top bit equals `p & 1`; committed-zero lanes (hot = 0) belong to
+// the even position with coefficient 0.
+kernel void akita_fp128_d128_decompose_fold(
+    device const uchar *lanes [[buffer(0)]],
+    device const ushort *challenge_positions [[buffer(1)]],
+    device const char *challenge_coefficients [[buffer(2)]],
+    device int *output [[buffer(3)]],
+    constant PackedDecomposeFoldParams &params [[buffer(4)]],
+    device const ulong *active_zero_rows [[buffer(5)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup atomic_int accumulators[128];
+
+    uint local_position = threadgroup_index.x;
+    ulong position = params.position_start + (ulong)local_position;
+    atomic_store_explicit(&accumulators[thread_index], 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong tasks_per_position = params.blocks_per_column * params.num_columns;
+    for (ulong task = (ulong)thread_index; task < tasks_per_position; task += 128ul) {
+        ulong trace_block = task / params.num_columns;
+        ulong column = task % params.num_columns;
+        ulong ring = trace_block * params.num_positions + position;
+        ulong row = ring >> 1ul;
+        uint ring_half = (uint)(ring & 1ul);
+        uchar hot = lanes[row * params.lane_stride + column];
+        bool committed = hot != 0u;
+        if (!committed && column < 64ul
+            && ((params.zero_column_mask >> column) & 1ul) != 0ul) {
+            ulong active_word = active_zero_rows[row >> 6ul];
+            committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
+        }
+        if (!committed || ((uint)hot >> 7u) != ring_half) {
+            continue;
+        }
+
+        uint source_coefficient = (uint)hot & 127u;
+        ulong challenge = column * params.blocks_per_column + trace_block;
+        ulong challenge_start = challenge * params.challenge_weight;
+        for (ulong term = 0ul; term < params.challenge_weight; ++term) {
+            uint destination = source_coefficient
+                + (uint)challenge_positions[challenge_start + term];
+            int value = (int)challenge_coefficients[challenge_start + term];
+            if (destination >= 128u) {
+                destination -= 128u;
+                value = -value;
+            }
+            atomic_fetch_add_explicit(
+                &accumulators[destination], value, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong output_base = (ulong)local_position * 128ul;
+    output[output_base + (ulong)thread_index] = atomic_load_explicit(
+        &accumulators[thread_index], memory_order_relaxed);
+}
