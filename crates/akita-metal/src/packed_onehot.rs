@@ -14,7 +14,21 @@ use crate::{MetalCommitError, MetalExecutionPolicy};
 /// Byte zero denotes an absent coefficient. Values in `1..onehot_k` select
 /// that coefficient within the row's one-hot chunk. Logical chunks are
 /// column-major through `column_capacity`; omitted suffix columns are zero.
-#[derive(Clone, Copy, Debug)]
+/// Progress of a lane table that is still being written while the commit runs.
+///
+/// The producer publishes a monotone count of fully written leading rows; the
+/// commit only reads rows below that count, and reads the whole table only
+/// after `wait_complete` returns. Implementations must make the row bytes
+/// visible before the count (release/acquire).
+pub trait LaneProgress: Sync {
+    /// Block until at least `rows` leading rows are written.
+    fn wait_for_rows(&self, rows: usize) -> Result<(), AkitaError>;
+
+    /// Block until every row is written; returns the final hot-entry count.
+    fn wait_complete(&self) -> Result<usize, AkitaError>;
+}
+
+#[derive(Clone, Copy)]
 pub struct PackedOneHotCommitView<'a> {
     lanes: &'a [u8],
     active_zero_rows: &'a [u64],
@@ -25,9 +39,45 @@ pub struct PackedOneHotCommitView<'a> {
     onehot_k: usize,
     hot_entries: usize,
     zero_suffix_start: usize,
+    progress: Option<&'a dyn LaneProgress>,
+}
+
+impl std::fmt::Debug for PackedOneHotCommitView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedOneHotCommitView")
+            .field("num_rows", &self.num_rows)
+            .field("num_columns", &self.num_columns)
+            .field("column_capacity", &self.column_capacity)
+            .field("onehot_k", &self.onehot_k)
+            .field("hot_entries", &self.hot_entries)
+            .field("zero_suffix_start", &self.zero_suffix_start)
+            .field("streaming", &self.progress.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> PackedOneHotCommitView<'a> {
+    /// Attach a producer progress handle: the lane table may still be filling
+    /// and the commit waits per command buffer for the rows it dispatches.
+    #[must_use]
+    pub fn with_lane_progress(mut self, progress: &'a dyn LaneProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub(crate) fn lane_progress(&self) -> Option<&'a dyn LaneProgress> {
+        self.progress
+    }
+
+    /// Hot entries once the producer is done; with a resident table this is the
+    /// precomputed count, with a streaming one it waits for completion.
+    pub(crate) fn completed_hot_entries(&self) -> Result<usize, AkitaError> {
+        match self.progress {
+            Some(progress) => progress.wait_complete(),
+            None => Ok(self.hot_entries),
+        }
+    }
+
     /// Validate a borrowed packed selector matrix without copying it.
     pub fn new(
         onehot_k: usize,
@@ -214,6 +264,7 @@ impl<'a> PackedOneHotCommitView<'a> {
         };
         Ok(Self {
             lanes,
+            progress: None,
             active_zero_rows,
             zero_column_mask,
             num_rows,
@@ -364,6 +415,9 @@ impl MetalBackend {
         source: PackedOneHotCommitView<'_>,
         plan: CommitInnerPlan,
     ) -> Result<CommitInnerWitness<F>, AkitaError> {
+        if let Some(progress) = source.lane_progress() {
+            progress.wait_complete()?;
+        }
         let indices = (0..source.column_capacity())
             .flat_map(|column| {
                 (0..source.num_rows()).map(move |row| {

@@ -351,6 +351,9 @@ pub(crate) fn commit_validated<const D: usize>(
     shape: ValidatedShape,
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
     if let Some(tile_stride) = root_census_tile_stride()? {
+        if let Some(progress) = source.lane_progress() {
+            progress.wait_complete()?;
+        }
         let census_start = Instant::now();
         let census =
             sample_root_task_density::<D>(source, plan, shape.full_blocks_per_column, tile_stride);
@@ -450,6 +453,7 @@ pub(crate) fn commit_validated<const D: usize>(
                 source.active_zero_rows(),
                 params,
                 packed_streams_per_command(shape.active_a_cols),
+                source.lane_progress(),
             )
         })
         .map_err(MetalCommitError::into_akita)?;
@@ -468,8 +472,8 @@ pub(crate) fn commit_validated<const D: usize>(
     };
     let output_reconstruction_time = reconstruction_start.elapsed();
 
-    let field_additions = source
-        .hot_entries()
+    let hot_entries = source.completed_hot_entries()?;
+    let field_additions = hot_entries
         .checked_mul(INNER_RANK)
         .and_then(|count| count.checked_mul(D))
         .ok_or_else(|| MetalCommitError::ShapeOverflow("fp128 D512 additions").into_akita())?;
@@ -496,7 +500,7 @@ pub(crate) fn commit_validated<const D: usize>(
         readback_copy_s = outcome.timings.readback_copy.as_secs_f64(),
         reconstruction_s = output_reconstruction_time.as_secs_f64(),
         lane_bytes = source.lanes().len(),
-        hot_entries = source.hot_entries(),
+        hot_entries,
         zero_suffix_start = source.zero_suffix_start(),
         blocks_per_column = shape.blocks_per_column,
         full_blocks_per_column = shape.full_blocks_per_column,
@@ -508,7 +512,7 @@ pub(crate) fn commit_validated<const D: usize>(
             kernel: MetalOneHotKernel::PackedFp128D512Panels,
             blocks_per_threadgroup: outcome.blocks_per_threadgroup,
             num_sources: 1,
-            hot_entries: source.hot_entries(),
+            hot_entries,
             field_additions: to_u64(field_additions, "fp128 D512 additions")?,
             gathered_matrix_bytes: to_u64(gathered_matrix_bytes, "fp128 D512 gathered bytes")?,
             output_bytes: shape

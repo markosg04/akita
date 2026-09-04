@@ -664,6 +664,39 @@ impl PackedLaneSource for ResidentPackedLanes<'_> {
     }
 }
 
+/// Lane table still being written by its producer; each command buffer waits
+/// for the rows it dispatches before its lanes are bound.
+struct StreamingPackedLanes<'a> {
+    lanes: &'a [u8],
+    progress: &'a dyn crate::packed_onehot::LaneProgress,
+}
+
+impl PackedLaneSource for StreamingPackedLanes<'_> {
+    fn lane_count(&self) -> usize {
+        self.lanes.len()
+    }
+
+    fn wait_lanes(
+        &self,
+        rows: Range<usize>,
+        lane_stride: usize,
+    ) -> Result<&[u8], MetalCommitError> {
+        self.progress.wait_for_rows(rows.end).map_err(|error| {
+            MetalCommitError::UnsupportedShape(format!(
+                "streaming lane producer failed before row {}: {error}",
+                rows.end
+            ))
+        })?;
+        ResidentPackedLanes { lanes: self.lanes }
+            .wait_lanes(rows, lane_stride)
+            .map(|lanes| {
+                // The slice borrows `self.lanes`, not the temporary source.
+                let start = lanes.as_ptr().addr() - self.lanes.as_ptr().addr();
+                &self.lanes[start..start + lanes.len()]
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DispatchTimings {
     pub(crate) buffer_setup: Duration,
@@ -6036,6 +6069,7 @@ impl MetalRuntime {
         active_zero_rows: &[u64],
         params: PackedOneHotCommitParams,
         streams_per_command: usize,
+        progress: Option<&dyn crate::packed_onehot::LaneProgress>,
     ) -> Result<DispatchOutcome, MetalCommitError> {
         let expected_active_words = params.num_rows.div_ceil(u64::BITS as u64);
         let zero_mask_exceeds_columns = params.num_columns < u64::BITS as u64
@@ -6049,13 +6083,24 @@ impl MetalRuntime {
                 "packed committed-zero selector geometry is invalid".into(),
             ));
         }
-        self.dispatch_packed_onehot_source(
-            matrix,
-            &ResidentPackedLanes { lanes },
-            active_zero_rows,
-            params,
-            streams_per_command,
-        )
+        match progress {
+            Some(progress) => self.dispatch_packed_onehot_source(
+                matrix,
+                &StreamingPackedLanes { lanes, progress },
+                active_zero_rows,
+                params,
+                streams_per_command,
+                Some(progress),
+            ),
+            None => self.dispatch_packed_onehot_source(
+                matrix,
+                &ResidentPackedLanes { lanes },
+                active_zero_rows,
+                params,
+                streams_per_command,
+                None,
+            ),
+        }
     }
 
     fn dispatch_packed_onehot_source<S: PackedLaneSource>(
@@ -6065,6 +6110,7 @@ impl MetalRuntime {
         active_zero_rows: &[u64],
         mut params: PackedOneHotCommitParams,
         streams_per_command: usize,
+        progress: Option<&dyn crate::packed_onehot::LaneProgress>,
     ) -> Result<DispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
             let lane_count = params
@@ -6167,7 +6213,36 @@ impl MetalRuntime {
             } else {
                 active_zero_rows
             };
-            let active_zero_rows = self.shared_buffer_from_slice(active_zero_rows)?;
+            // A streaming producer is still writing the RAM-active words, so
+            // bind them without copying (the kernel reads a word only after the
+            // rows it covers were published) or wait for the table to finish.
+            let active_zero_rows = match progress {
+                Some(progress) => {
+                    let bytes = size_of_val(active_zero_rows);
+                    let aligned = active_zero_rows
+                        .as_ptr()
+                        .addr()
+                        .is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT)
+                        && bytes.is_multiple_of(PACKED_ONEHOT_BUFFER_ALIGNMENT);
+                    if aligned {
+                        self.validate_buffer_length(bytes)?;
+                        self.device.new_buffer_with_bytes_no_copy(
+                            active_zero_rows.as_ptr().cast::<c_void>(),
+                            bytes as u64,
+                            MTLResourceOptions::StorageModeShared,
+                            None,
+                        )
+                    } else {
+                        progress.wait_complete().map_err(|error| {
+                            MetalCommitError::UnsupportedShape(format!(
+                                "streaming lane producer failed: {error}"
+                            ))
+                        })?;
+                        self.shared_buffer_from_slice(active_zero_rows)?
+                    }
+                }
+                None => self.shared_buffer_from_slice(active_zero_rows)?,
+            };
             let mut buffer_setup = buffer_start.elapsed();
 
             let command_start = Instant::now();
