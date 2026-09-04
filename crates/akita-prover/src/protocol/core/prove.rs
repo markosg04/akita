@@ -89,27 +89,58 @@ where
     schedule.validate_nonterminal_opening_execution(Cfg::EXT_DEGREE)?;
     ensure_prover_schedule_fits_setup::<Cfg>(expanded.as_ref(), schedule, &opening_batch)?;
     let ntt_requirements = NttExecutionRequirements::from_prove_schedule(schedule)?;
-    prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)?;
-    let grinding_plan = bind_transcript_instance_descriptor::<Cfg::Field, T, Cfg>(
-        expanded.as_ref(),
-        &opening_batch,
-        selection,
-        schedule,
-        basis,
-        transcript,
-    )?;
-
-    prove::<Cfg, T, P, C, O, TS, R>(
-        expanded,
-        prefix_slots,
-        stacks,
-        transcript,
-        claims,
-        schedule,
-        basis,
-        &grinding_plan,
-    )
-    .map(|(proof, _total_levels)| proof)
+    let run_prove = |transcript: &mut T| -> Result<_, AkitaError> {
+        let grinding_plan = bind_transcript_instance_descriptor::<Cfg::Field, T, Cfg>(
+            expanded.as_ref(),
+            &opening_batch,
+            selection,
+            schedule,
+            basis,
+            transcript,
+        )?;
+        prove::<Cfg, T, P, C, O, TS, R>(
+            expanded,
+            prefix_slots,
+            stacks,
+            transcript,
+            claims,
+            schedule,
+            basis,
+            &grinding_plan,
+        )
+        .map(|(proof, _total_levels)| proof)
+    };
+    // The retained NTT slots are only consumed once the first level reaches its
+    // host commit and ring-switch work, after the root packing and fold have
+    // run on the accelerator. Building them alongside that device work hides
+    // about half a second at T=2^28; a slot the prover reaches first is built
+    // lazily through the same per-key OnceLock, so the race is benign.
+    // The prove side keeps the caller's (not necessarily Send) polynomial
+    // sources on this thread; only the prewarm moves to a helper thread.
+    #[cfg(feature = "parallel")]
+    {
+        std::thread::scope(|scope| {
+            let prewarm = std::thread::Builder::new()
+                .name("akita-ntt-prewarm".into())
+                .stack_size(64 << 20)
+                .spawn_scoped(scope, || {
+                    prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)
+                })
+                .map_err(|err| {
+                    AkitaError::InvalidSetup(format!("NTT prewarm thread spawn failed: {err}"))
+                })?;
+            let proof = run_prove(transcript);
+            prewarm
+                .join()
+                .map_err(|_| AkitaError::InvalidSetup("NTT prewarm thread panicked".into()))??;
+            proof
+        })
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        prewarm_ntt_requirements::<Cfg::Field, _>(stacks, &ntt_requirements)?;
+        run_prove(transcript)
+    }
 }
 
 /// Prove a folded batched root and assemble the recursive suffix under config
