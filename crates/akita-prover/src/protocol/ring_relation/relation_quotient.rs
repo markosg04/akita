@@ -535,6 +535,7 @@ where
             group_dims.d_b(),
         )?;
 
+        let a_span = tracing::info_span!("relation_quotient_a_rows", group_index).entered();
         let (consistency_quotient, a_quotients) = akita_types::dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Inner),
             F,
@@ -547,6 +548,7 @@ where
                 )
             }
         )?;
+        drop(a_span);
         if result
             .get(consistency_row)
             .ok_or(AkitaError::InvalidProof)?
@@ -599,6 +601,7 @@ where
                     .to_vec(),
             )
         };
+        let _b_span = tracing::info_span!("relation_quotient_b_rows", group_index).entered();
         akita_types::dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Outer),
             F,
@@ -664,6 +667,7 @@ where
     }
 
     if n_d_active != 0 {
+        let _d_span = tracing::info_span!("relation_quotient_d_tail").entered();
         let d_coeff_len = n_d_active
             .checked_mul(rhs_layout.d_ring_dimension)
             .ok_or(AkitaError::InvalidProof)?;
