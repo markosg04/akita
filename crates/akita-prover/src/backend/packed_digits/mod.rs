@@ -21,11 +21,9 @@ const VECTOR_LOAD_PADDING: usize = 16;
 /// physical order. A 64-MiB batch amortizes parallel encoding without scaling
 /// scratch memory with the total witness size.
 const STREAM_BUFFER_DIGITS: usize = 1 << 26;
-/// Avoid Rayon scheduling for the small recursive tails where serial packing
-/// is cheaper. Large ring-switch outputs cross this threshold by orders of
-/// magnitude and encode independent 64-digit blocks in parallel.
-#[cfg(feature = "parallel")]
-const PARALLEL_ENCODE_THRESHOLD: usize = 1 << 16;
+/// Avoid bulk-encoding setup for small recursive tails. This also selects
+/// parallel chunk encoding when Rayon is enabled.
+const BULK_ENCODE_THRESHOLD: usize = 1 << 16;
 
 /// Exact signed extrema observed while packing a digit buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,9 +293,7 @@ impl PackedSignedDigitWriter {
         self.extend_zeros(start - self.position)?;
         self.flush_staging()?;
         debug_assert_eq!(self.position, self.flushed);
-        if !self.position.is_multiple_of(DIGITS_PER_BLOCK)
-            || digits.len() < PARALLEL_ENCODE_THRESHOLD
-        {
+        if !self.position.is_multiple_of(DIGITS_PER_BLOCK) || digits.len() < BULK_ENCODE_THRESHOLD {
             return self.extend_digits(digits);
         }
         let bulk_len = digits.len() - digits.len() % DIGITS_PER_BLOCK;
@@ -723,7 +719,7 @@ fn validate_bounds(bounds: SignedDigitBounds, bit_width: u8) -> Result<(), Akita
 
 fn signed_digit_bounds_parallel(digits: &[i8]) -> SignedDigitBounds {
     #[cfg(feature = "parallel")]
-    if digits.len() >= PARALLEL_ENCODE_THRESHOLD {
+    if digits.len() >= BULK_ENCODE_THRESHOLD {
         return digits.par_chunks(1 << 20).map(signed_digit_bounds).reduce(
             || SignedDigitBounds {
                 negative_abs_max: 0,
@@ -771,7 +767,7 @@ fn encode_digits(digits: &[i8], bit_width: u8, output: &mut [u8]) {
     let block_bytes = usize::from(bit_width) * 8;
 
     #[cfg(feature = "parallel")]
-    if digits.len() >= PARALLEL_ENCODE_THRESHOLD {
+    if digits.len() >= BULK_ENCODE_THRESHOLD {
         output
             .par_chunks_mut(block_bytes)
             .zip(digits.par_chunks(DIGITS_PER_BLOCK))
