@@ -25,6 +25,8 @@ const PACKED_FP128_D512_PANELS_KERNEL_NAME: &str = "akita_packed_onehot_commit_f
 const PACKED_PARTIAL_REDUCTION_KERNEL_NAME: &str = "akita_packed_onehot_reduce_partials";
 const PACKED_FP128_D128_RANK3_KERNEL_NAME: &str = "akita_packed_onehot_commit_fp128_d128_rank3";
 const FP128_D128_DECOMPOSE_FOLD_KERNEL_NAME: &str = "akita_fp128_d128_decompose_fold";
+const FP128_D128_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME: &str =
+    "akita_fp128_d128_subring64_decompose_fold";
 const FP128_D64_DIGIT_ROWS_PARTIALS_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_partials";
 const FP128_D64_DIGIT_ROWS_REDUCE_KERNEL_NAME: &str = "akita_fp128_d64_digit_rows_reduce";
 const FP128_I8_COEFFICIENT_PACKING_KERNEL_NAME: &str = "akita_fp128_i8_coefficient_packing";
@@ -959,6 +961,7 @@ pub(crate) struct MetalRuntime {
     fp128_packed_onehot_coefficient_packing_reduce_pipeline: ComputePipelineState,
     fp128_d512_decompose_fold_pipeline: ComputePipelineState,
     fp128_d128_decompose_fold_pipeline: ComputePipelineState,
+    fp128_d128_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_subring64_decompose_fold_pipeline: ComputePipelineState,
     fp128_d512_build_fold_index_pipeline: ComputePipelineState,
     fp128_d512_build_coefficient_packing_index_pipeline: ComputePipelineState,
@@ -1263,6 +1266,9 @@ impl MetalRuntime {
             )?,
             fp128_d512_decompose_fold_pipeline: pipeline(FP128_D512_DECOMPOSE_FOLD_KERNEL_NAME)?,
             fp128_d128_decompose_fold_pipeline: pipeline(FP128_D128_DECOMPOSE_FOLD_KERNEL_NAME)?,
+            fp128_d128_subring64_decompose_fold_pipeline: pipeline(
+                FP128_D128_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
+            )?,
             fp128_d512_subring64_decompose_fold_pipeline: pipeline(
                 FP128_D512_SUBRING64_DECOMPOSE_FOLD_KERNEL_NAME,
             )?,
@@ -2526,7 +2532,7 @@ impl MetalRuntime {
     }
 
     /// Packed decompose-fold at ring dimension 512 (rank-1 row) or 128
-    /// (rank-3 row). The dense subring-64 challenge path exists only at 512.
+    /// (rank-3 row), with sparse or embedded subring-64 challenges.
     pub(crate) fn dispatch_packed_fp128_decompose_fold_streaming(
         &self,
         ring_d: usize,
@@ -2540,20 +2546,18 @@ impl MetalRuntime {
         mut consume: impl FnMut(usize, &[i32]),
     ) -> Result<PackedDecomposeFoldDispatchOutcome, MetalCommitError> {
         autoreleasepool(|| {
-            let (fold_pipeline, fold_threads) = match ring_d {
-                512 => (&self.fp128_d512_decompose_fold_pipeline, 256u64),
-                128 => (&self.fp128_d128_decompose_fold_pipeline, 128u64),
+            let dense = dense_subring64_challenges.is_some();
+            let (fold_pipeline, fold_threads) = match (ring_d, dense) {
+                (512, false) => (&self.fp128_d512_decompose_fold_pipeline, 256u64),
+                (128, false) => (&self.fp128_d128_decompose_fold_pipeline, 128u64),
+                (512, true) => (&self.fp128_d512_subring64_decompose_fold_pipeline, 256u64),
+                (128, true) => (&self.fp128_d128_subring64_decompose_fold_pipeline, 256u64),
                 _ => {
                     return Err(MetalCommitError::UnsupportedShape(
                         "packed decompose-fold supports ring dimensions 512 and 128".into(),
                     ));
                 }
             };
-            if ring_d != 512 && dense_subring64_challenges.is_some() {
-                return Err(MetalCommitError::UnsupportedShape(
-                    "dense subring-64 decompose-fold challenges require ring dimension 512".into(),
-                ));
-            }
             let ring_d_u64 = ring_d as u64;
             let expected_challenge_terms = params
                 .num_columns
@@ -2600,6 +2604,7 @@ impl MetalRuntime {
                 || challenge_positions.len() != challenge_coefficients.len()
                 || dense_subring64_challenges.is_some_and(|dense| {
                     u64::try_from(dense.len()).ok() != Some(expected_dense_challenges)
+                        || expected_dense_challenges > u64::from(u32::MAX) + 1
                 })
                 || params.num_positions > u64::from(u32::MAX)
                 || fold_pipeline.max_total_threads_per_threadgroup() < fold_threads
@@ -2667,20 +2672,17 @@ impl MetalRuntime {
                         "decompose-fold output offset",
                     ))?;
                 let command = self.queue.new_command_buffer();
-                command.set_label("Akita fp128 D512 packed decompose-fold");
+                command.set_label("Akita fp128 packed decompose-fold");
                 let encoder = command.new_compute_command_encoder();
-                encoder.set_label("Akita fp128 D512 packed decompose-fold");
+                encoder.set_label("Akita fp128 packed decompose-fold");
+                encoder.set_compute_pipeline_state(fold_pipeline);
                 if let Some(dense_challenges) = dense_challenges.as_ref() {
-                    encoder.set_compute_pipeline_state(
-                        &self.fp128_d512_subring64_decompose_fold_pipeline,
-                    );
                     encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
                     encoder.set_buffer(1, Some(dense_challenges), 0);
                     encoder.set_buffer(2, Some(&output), output_offset as u64);
                     set_inline_bytes(encoder, 3, &command_params);
                     encoder.set_buffer(4, Some(&active_zero_buffer), 0);
                 } else {
-                    encoder.set_compute_pipeline_state(fold_pipeline);
                     encoder.set_buffer(0, Some(&lane_buffer.buffer), 0);
                     encoder.set_buffer(1, Some(&positions), 0);
                     encoder.set_buffer(2, Some(&coefficients), 0);
@@ -2688,14 +2690,9 @@ impl MetalRuntime {
                     set_inline_bytes(encoder, 4, &command_params);
                     encoder.set_buffer(5, Some(&active_zero_buffer), 0);
                 }
-                let threads = if dense_challenges.is_some() {
-                    256
-                } else {
-                    fold_threads
-                };
                 encoder.dispatch_thread_groups(
                     MTLSize::new(position_count as u64, 1, 1),
-                    MTLSize::new(threads, 1, 1),
+                    MTLSize::new(fold_threads, 1, 1),
                 );
                 encoder.end_encoding();
                 command.commit();
@@ -7149,7 +7146,7 @@ mod tests {
     fn packed_d128_decompose_fold_matches_model() {
         // At K = 256, D = 128 one trace row spans two ring positions.
         const POSITIONS: usize = 10;
-        const BLOCKS_PER_COLUMN: usize = 2;
+        const BLOCKS_PER_COLUMN: usize = 129;
         const COLUMNS: usize = 3;
         const CHALLENGE_WEIGHT: usize = 4;
         let runtime = MetalRuntime::new().unwrap();
@@ -7162,75 +7159,86 @@ mod tests {
                 _ => 1 + ((17 * index + 29) % 254) as u8,
             })
             .collect::<Vec<_>>();
-        let mut challenge_positions = Vec::new();
-        let mut challenge_coefficients = Vec::new();
-        for challenge in 0..COLUMNS * BLOCKS_PER_COLUMN {
-            for term in 0..CHALLENGE_WEIGHT {
-                challenge_positions.push(((97 * challenge + 131 * term) % 128) as u16);
-                challenge_coefficients.push([1, -2, 3, -4][term]);
-            }
-        }
-        let params = PackedDecomposeFoldParams {
-            num_rows: num_rows as u64,
-            num_columns: COLUMNS as u64,
-            lane_stride: COLUMNS as u64,
-            num_positions: POSITIONS as u64,
-            position_start: 0,
-            blocks_per_column: BLOCKS_PER_COLUMN as u64,
-            challenge_weight: CHALLENGE_WEIGHT as u64,
-            output_coefficients: (POSITIONS * 128) as u64,
-            zero_column_mask: 1,
-        };
-        let active_zero_rows = [0b1011u64];
-        let mut streamed = Vec::new();
-        let actual = runtime
-            .dispatch_packed_fp128_decompose_fold_streaming(
-                128,
-                &lanes,
-                &active_zero_rows,
-                &challenge_positions,
-                &challenge_coefficients,
-                None,
-                params,
-                4,
-                |_, coefficients| streamed.extend_from_slice(coefficients),
-            )
-            .unwrap()
-            .centered_coefficients;
-        let mut expected = vec![0i32; POSITIONS * 128];
-        for position in 0..POSITIONS {
-            for trace_block in 0..BLOCKS_PER_COLUMN {
-                for column in 0..COLUMNS {
-                    let ring = trace_block * POSITIONS + position;
-                    let row = ring / 2;
-                    let half = ring % 2;
-                    let hot = usize::from(lanes[row * COLUMNS + column]);
-                    let committed_zero = hot == 0
-                        && column == 0
-                        && active_zero_rows[row / u64::BITS as usize]
-                            & (1u64 << (row % u64::BITS as usize))
-                            != 0;
-                    if (hot == 0 && !committed_zero) || hot / 128 != half {
-                        continue;
-                    }
-                    let source_coefficient = hot % 128;
-                    let challenge = column * BLOCKS_PER_COLUMN + trace_block;
-                    let challenge_start = challenge * CHALLENGE_WEIGHT;
-                    for term in 0..CHALLENGE_WEIGHT {
-                        let mut destination = source_coefficient
-                            + usize::from(challenge_positions[challenge_start + term]);
-                        let mut value = i32::from(challenge_coefficients[challenge_start + term]);
-                        if destination >= 128 {
-                            destination -= 128;
-                            value = -value;
-                        }
-                        expected[position * 128 + destination] += value;
+        for embedding_stride in [1, 2] {
+            let mut challenge_positions = Vec::new();
+            let mut challenge_coefficients = Vec::new();
+            let mut dense_challenges = vec![0i8; COLUMNS * BLOCKS_PER_COLUMN * 64];
+            for challenge in 0..COLUMNS * BLOCKS_PER_COLUMN {
+                for term in 0..CHALLENGE_WEIGHT {
+                    let position = ((97 * challenge + 131 * term) % (128 / embedding_stride))
+                        * embedding_stride;
+                    let coefficient = [1, -2, 3, -4][term];
+                    challenge_positions.push(position as u16);
+                    challenge_coefficients.push(coefficient);
+                    if embedding_stride == 2 {
+                        dense_challenges[challenge * 64 + position / 2] = coefficient;
                     }
                 }
             }
+            let params = PackedDecomposeFoldParams {
+                num_rows: num_rows as u64,
+                num_columns: COLUMNS as u64,
+                lane_stride: COLUMNS as u64,
+                num_positions: POSITIONS as u64,
+                position_start: 0,
+                blocks_per_column: BLOCKS_PER_COLUMN as u64,
+                challenge_weight: CHALLENGE_WEIGHT as u64,
+                output_coefficients: (POSITIONS * 128) as u64,
+                zero_column_mask: 1,
+            };
+            let mut active_zero_rows = vec![0u64; num_rows.div_ceil(u64::BITS as usize)];
+            active_zero_rows[0] = 0b1011;
+            let mut streamed = Vec::new();
+            let actual = runtime
+                .dispatch_packed_fp128_decompose_fold_streaming(
+                    128,
+                    &lanes,
+                    &active_zero_rows,
+                    &challenge_positions,
+                    &challenge_coefficients,
+                    (embedding_stride == 2).then_some(dense_challenges.as_slice()),
+                    params,
+                    4,
+                    |_, coefficients| streamed.extend_from_slice(coefficients),
+                )
+                .unwrap()
+                .centered_coefficients;
+            let mut expected = vec![0i32; POSITIONS * 128];
+            for position in 0..POSITIONS {
+                for trace_block in 0..BLOCKS_PER_COLUMN {
+                    for column in 0..COLUMNS {
+                        let ring = trace_block * POSITIONS + position;
+                        let row = ring / 2;
+                        let half = ring % 2;
+                        let hot = usize::from(lanes[row * COLUMNS + column]);
+                        let committed_zero = hot == 0
+                            && column == 0
+                            && active_zero_rows[row / u64::BITS as usize]
+                                & (1u64 << (row % u64::BITS as usize))
+                                != 0;
+                        if (hot == 0 && !committed_zero) || hot / 128 != half {
+                            continue;
+                        }
+                        let source_coefficient = hot % 128;
+                        let challenge = column * BLOCKS_PER_COLUMN + trace_block;
+                        let challenge_start = challenge * CHALLENGE_WEIGHT;
+                        for term in 0..CHALLENGE_WEIGHT {
+                            let mut destination = source_coefficient
+                                + usize::from(challenge_positions[challenge_start + term]);
+                            let mut value =
+                                i32::from(challenge_coefficients[challenge_start + term]);
+                            if destination >= 128 {
+                                destination -= 128;
+                                value = -value;
+                            }
+                            expected[position * 128 + destination] += value;
+                        }
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(streamed, expected);
         }
-        assert_eq!(actual, expected);
-        assert_eq!(streamed, expected);
     }
 
     #[test]

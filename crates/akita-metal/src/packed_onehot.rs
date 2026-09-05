@@ -508,6 +508,7 @@ impl MetalBackend {
         })?;
         let mut dense_subring64 = vec![0i8; dense_len];
         let mut has_subring64_embedding = true;
+        let subring_stride = D / 64;
         for (challenge_index, challenge) in plan.challenges[..live_challenges].iter().enumerate() {
             challenge.validate::<D>()?;
             for (&position, &coefficient) in challenge.positions.iter().zip(&challenge.coeffs) {
@@ -520,8 +521,8 @@ impl MetalBackend {
                 coefficients.push(coefficient);
                 let dense_position = usize::try_from(position)
                     .ok()
-                    .filter(|position| position.is_multiple_of(8))
-                    .map(|position| position / 8)
+                    .filter(|position| position.is_multiple_of(subring_stride))
+                    .map(|position| position / subring_stride)
                     .filter(|&position| position < 64);
                 if let Some(dense_position) = dense_position {
                     let slot = challenge_index * 64 + dense_position;
@@ -535,7 +536,7 @@ impl MetalBackend {
                 }
             }
         }
-        let dense_subring64 = (D == 512 && has_subring64_embedding).then_some(dense_subring64);
+        let dense_subring64 = has_subring64_embedding.then_some(dense_subring64);
         let output_coefficients = plan.num_positions_per_block.checked_mul(D).ok_or_else(|| {
             MetalCommitError::ShapeOverflow("packed opening output coefficients").into_akita()
         })?;

@@ -1245,6 +1245,103 @@ kernel void akita_fp128_d512_subring64_decompose_fold(
         + 8ul * (ulong)(simd_lane + 32u)] = accumulator_high;
 }
 
+// Four producer partitions share each coefficient-parity class. Their sums
+// meet only after the task loop, avoiding an atomic update for every term.
+kernel void akita_fp128_d128_subring64_decompose_fold(
+    device const uchar *lanes [[buffer(0)]],
+    device const char *dense_challenges [[buffer(1)]],
+    device int *output [[buffer(2)]],
+    constant PackedDecomposeFoldParams &params [[buffer(3)]],
+    device const ulong *active_zero_rows [[buffer(4)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint3 threadgroup_index [[threadgroup_position_in_grid]])
+{
+    threadgroup uint partitioned_tasks[8 * 2 * 32];
+    threadgroup uint partition_counts[8 * 2];
+    threadgroup int partial_sums[4 * 128];
+
+    uint simd_lane = thread_index & 31u;
+    uint simdgroup = thread_index >> 5u;
+    uint local_position = threadgroup_index.x;
+    ulong position = params.position_start + (ulong)local_position;
+    ulong tasks_per_position = params.blocks_per_column * params.num_columns;
+    int accumulator_low = 0;
+    int accumulator_high = 0;
+
+    for (ulong task_base = 0ul; task_base < tasks_per_position; task_base += 256ul) {
+        ulong task = task_base + (ulong)thread_index;
+        bool valid = task < tasks_per_position;
+        uint hot = 0u;
+        uint source_high = 0u;
+        uint challenge = 0u;
+        if (valid) {
+            ulong trace_block = task / params.num_columns;
+            ulong column = task % params.num_columns;
+            ulong ring = trace_block * params.num_positions + position;
+            ulong row = ring >> 1ul;
+            hot = (uint)lanes[row * params.lane_stride + column];
+            bool committed = hot != 0u;
+            if (!committed && column < 64ul
+                && ((params.zero_column_mask >> column) & 1ul) != 0ul) {
+                ulong active_word = active_zero_rows[row >> 6ul];
+                committed = ((active_word >> (row & 63ul)) & 1ul) != 0ul;
+            }
+            valid = committed && (hot >> 7u) == (uint)(ring & 1ul);
+            source_high = (hot & 127u) >> 1u;
+            challenge = (uint)(column * params.blocks_per_column + trace_block);
+        }
+
+        for (uint low = 0u; low < 2u; ++low) {
+            bool selected = valid && ((hot & 1u) == low);
+            uint selected_mask = uint(simd_ballot(selected).operator unsigned long());
+            uint partition = simdgroup * 2u + low;
+            if (simd_lane == 0u) {
+                partition_counts[partition] = popcount(selected_mask);
+            }
+            if (selected) {
+                uint preceding_mask = simd_lane == 0u ? 0u : ((1u << simd_lane) - 1u);
+                uint rank = popcount(selected_mask & preceding_mask);
+                partitioned_tasks[partition * 32u + rank] =
+                    (challenge << 6u) | source_high;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint destination_low = simdgroup & 1u;
+        uint producer_start = 2u * (simdgroup >> 1u);
+        for (uint producer = producer_start; producer < producer_start + 2u; ++producer) {
+            uint partition = producer * 2u + destination_low;
+            uint count = partition_counts[partition];
+            for (uint index = 0u; index < count; ++index) {
+                uint packed = partitioned_tasks[partition * 32u + index];
+                uint source = packed & 63u;
+                uint challenge_index = packed >> 6u;
+                uint destination_0 = simd_lane;
+                uint destination_1 = simd_lane + 32u;
+                int value_0 = (int)dense_challenges[
+                    (ulong)challenge_index * 64ul + ((destination_0 + 64u - source) & 63u)];
+                int value_1 = (int)dense_challenges[
+                    (ulong)challenge_index * 64ul + ((destination_1 + 64u - source) & 63u)];
+                accumulator_low += destination_0 < source ? -value_0 : value_0;
+                accumulator_high += destination_1 < source ? -value_1 : value_1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint partial_base = (simdgroup >> 1u) * 128u + (simdgroup & 1u);
+    partial_sums[partial_base + 2u * simd_lane] = accumulator_low;
+    partial_sums[partial_base + 2u * (simd_lane + 32u)] = accumulator_high;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (thread_index < 128u) {
+        int sum = 0;
+        for (uint partition = 0u; partition < 4u; ++partition) {
+            sum += partial_sums[partition * 128u + thread_index];
+        }
+        output[(ulong)local_position * 128ul + thread_index] = sum;
+    }
+}
+
 kernel void akita_fp128_d512_build_fold_index(
     device const uchar *lanes [[buffer(0)]],
     device uint *records [[buffer(1)]],
