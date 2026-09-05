@@ -1262,18 +1262,17 @@ kernel void akita_fp128_d128_subring64_decompose_fold(
     uint simdgroup = thread_index >> 5u;
     uint local_position = threadgroup_index.x;
     ulong position = params.position_start + (ulong)local_position;
-    ulong tasks_per_position = params.blocks_per_column * params.num_columns;
     int2 accumulators[2] = { int2(0), int2(0) };
 
-    for (ulong task_base = 0ul; task_base < tasks_per_position; task_base += 256ul) {
-        ulong task = task_base + (ulong)thread_index;
-        bool valid = task < tasks_per_position;
+    for (ulong trace_block = (ulong)simdgroup;
+         trace_block < params.blocks_per_column;
+         trace_block += 8ul) {
+        ulong column = (ulong)simd_lane;
+        bool valid = column < params.num_columns;
         uint hot = 0u;
         uint source_high = 0u;
         uint challenge = 0u;
         if (valid) {
-            ulong trace_block = task / params.num_columns;
-            ulong column = task % params.num_columns;
             ulong ring = trace_block * params.num_positions + position;
             ulong row = ring >> 1ul;
             hot = (uint)lanes[row * params.lane_stride + column];

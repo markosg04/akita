@@ -2590,6 +2590,7 @@ impl MetalRuntime {
             if params.num_rows == 0
                 || params.num_columns == 0
                 || params.num_columns > params.lane_stride
+                || (ring_d == 128 && dense && params.num_columns > 32)
                 || params.zero_column_mask & !live_column_mask != 0
                 || (params.zero_column_mask == 0 && !active_zero_rows.is_empty())
                 || (params.zero_column_mask != 0
