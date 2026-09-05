@@ -3,11 +3,13 @@ fn main() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    use akita_challenges::SparseChallenge;
+    use akita_challenges::{FoldChallengeDrawDomain, FoldDraw, LiveFoldDraw};
     use akita_metal::{MetalBackend, MetalExecutionPolicy, PackedOneHotCommitView};
     use akita_prover::backend::OneHotPoly;
     use akita_prover::compute::{DecomposeFoldPlan, OpeningFoldKernel, RootOpeningSource};
     use akita_prover::CpuBackend;
+    use akita_transcript::AkitaTranscript;
+    use akita_types::{CoefficientPackingChallenges, SubringCoefficientPackingGeometry};
     use jolt_field::Prime128OffsetA7F7;
 
     fn setting(name: &str, default: usize) -> usize {
@@ -46,24 +48,26 @@ fn main() {
         })
         .collect::<Vec<_>>();
     let source = PackedOneHotCommitView::new(256, CAPACITY, columns, &lanes).unwrap();
-    let challenges = (0..CAPACITY * blocks)
-        .map(|index| SparseChallenge {
-            positions: (0..19)
-                .map(|term| (2 * ((17 * index + 7 * term) % 64)) as u32)
-                .collect(),
-            coeffs: (0..19)
-                .map(|term| {
-                    if mix((index * 19 + term) as u64) & 1 == 0 {
-                        1
-                    } else {
-                        -1
-                    }
-                })
-                .collect(),
-        })
-        .collect::<Vec<_>>();
+    let geometry = SubringCoefficientPackingGeometry::try_new(1, D, 64).unwrap();
+    let config = geometry.fold_challenge_config();
+    let mut transcript = AkitaTranscript::<Prime128OffsetA7F7>::new(b"c2-production-fold-control");
+    let subring = LiveFoldDraw::new(&mut transcript)
+        .draw_folding_challenges_with_rejection(
+            FoldChallengeDrawDomain::SubringCoefficientPacking {
+                challenge_subring_dimension: 64,
+            },
+            64,
+            0,
+            CAPACITY * blocks,
+            1,
+            &config,
+            0,
+            None,
+        )
+        .unwrap();
+    let challenges = CoefficientPackingChallenges::new(geometry, subring).unwrap();
     let plan = DecomposeFoldPlan {
-        challenges: &challenges,
+        challenges: challenges.ambient_a().as_slice(),
         num_positions_per_block: positions,
         num_digits: 1,
         log_basis: 3,
@@ -138,7 +142,8 @@ fn main() {
     }
     let metrics = backend.last_opening_metrics().unwrap().unwrap();
     assert_eq!(metrics.cpu_fallback_calls, 0);
-    println!("AKITA_METAL_PACKED_FOLD log_rows={log_rows} columns={columns} positions={positions} density_percent={density} cold_s={:.6} warm_s={:.6} gpu_s={:.6} buffer_s={:.6} cpu_sample_s={cpu_sample_s:.6} cpu_checked_positions={checked_positions} parity={} checksum={checksum:016x}",
+    println!("AKITA_METAL_PACKED_FOLD log_rows={log_rows} columns={columns} positions={positions} density_percent={density} challenge_pm1={} challenge_pm2={} cold_s={:.6} warm_s={:.6} gpu_s={:.6} buffer_s={:.6} cpu_sample_s={cpu_sample_s:.6} cpu_checked_positions={checked_positions} parity={} checksum={checksum:016x}",
+        config.count_pm1, config.count_pm2,
         times[0], times[1], metrics.gpu_active_time.as_secs_f64(), metrics.buffer_setup_time.as_secs_f64(),
         if checked_positions == positions { "full" } else { "sampled" });
 }
