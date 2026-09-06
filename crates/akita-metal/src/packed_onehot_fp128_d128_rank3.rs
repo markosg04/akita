@@ -7,10 +7,7 @@
 //! shrinks by the same factor (see `specs/akita-metal-d128-rank3-root-floor.md`
 //! in Jolt).
 
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
 use std::mem::size_of;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use akita_error::AkitaError;
@@ -24,8 +21,8 @@ use crate::onehot::to_u64;
 use crate::packed_onehot::PackedOneHotCommitView;
 use crate::prepared::MetalPreparedSetup;
 use crate::runtime::{
-    MetalOneHotKernel, MetalRuntime, PackedOneHotCommitParams, FP128_D128_RANK3_TILE_POSITIONS,
-    FP128_D512_POSITION_PARTIALS,
+    MetalOneHotKernel, MetalRuntime, PackedOneHotCommitParams,
+    FP128_D128_RANK3_POSITION_PARTIAL_ALIGNMENT, FP128_D512_POSITION_PARTIALS,
 };
 use crate::MetalCommitError;
 
@@ -48,53 +45,6 @@ pub(crate) struct ValidatedShape {
     live_columns: usize,
 }
 
-impl PackedOneHotCommitView<'_> {
-    fn capture_diagnostic(
-        self,
-        directory: &Path,
-        plan: CommitInnerPlan,
-        shape: &ValidatedShape,
-    ) -> Result<(), AkitaError> {
-        let capture = || -> std::io::Result<()> {
-            std::fs::create_dir(directory)?;
-            let mut lanes = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(directory.join("lanes.u8"))?;
-            lanes.write_all(self.lanes())?;
-            lanes.sync_all()?;
-            let mut zeros = BufWriter::new(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(directory.join("active_zero_rows.u64le"))?,
-            );
-            for word in self.active_zero_rows() {
-                zeros.write_all(&word.to_le_bytes())?;
-            }
-            zeros.flush()?;
-            zeros.get_ref().sync_all()?;
-            let mut metadata = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(directory.join("metadata.json"))?;
-            writeln!(
-                metadata,
-                "{{\"version\":1,\"rows\":{},\"columns\":{},\"capacity\":{},\"positions\":{},\"ring_d\":128,\"rank\":3,\"partials\":16,\"blocks\":{},\"full_blocks\":{},\"hot_entries\":{},\"zero_suffix_start\":{},\"zero_mask\":{},\"lanes_bytes\":{},\"active_zero_words\":{}}}",
-                self.num_rows(), self.num_columns(), self.column_capacity(),
-                plan.num_positions_per_block, shape.blocks_per_column,
-                shape.full_blocks_per_column, self.hot_entries(),
-                self.zero_suffix_start(), self.zero_column_mask(), self.lanes().len(),
-                self.active_zero_rows().len(),
-            )?;
-            metadata.sync_all()
-        };
-        capture().map_err(|error| {
-            AkitaError::InvalidInput(format!("opt-in commit diagnostic capture failed: {error}"))
-        })
-    }
-}
-
 fn streams_per_command(num_positions: usize) -> usize {
     if num_positions >= LARGE_BLOCK_POSITIONS {
         8
@@ -107,7 +57,8 @@ pub(crate) fn validate_shape<const D: usize>(
     source: PackedOneHotCommitView<'_>,
     plan: CommitInnerPlan,
 ) -> Result<ValidatedShape, AkitaError> {
-    let tile_positions = FP128_D512_POSITION_PARTIALS * FP128_D128_RANK3_TILE_POSITIONS;
+    let partial_alignment =
+        FP128_D512_POSITION_PARTIALS * FP128_D128_RANK3_POSITION_PARTIAL_ALIGNMENT;
     if D != RING_D
         || source.onehot_k() != ONEHOT_K
         || source.column_capacity() != COLUMN_CAPACITY
@@ -115,10 +66,12 @@ pub(crate) fn validate_shape<const D: usize>(
         || plan.n_a != INNER_RANK
         || plan.num_digits_inner != 1
         || plan.num_positions_per_block == 0
-        || !plan.num_positions_per_block.is_multiple_of(tile_positions)
+        || !plan
+            .num_positions_per_block
+            .is_multiple_of(partial_alignment)
     {
         return Err(MetalCommitError::UnsupportedShape(
-            "fp128 Metal D128 rank-3 commit requires K256/capacity-32, rank 3, and whole sixteen-position tiles in every position partial"
+            "fp128 Metal D128 rank-3 commit requires K256/capacity-32, rank 3, and sixteen-position alignment in every position partial"
                 .into(),
         )
         .into_akita());
@@ -176,13 +129,6 @@ pub(crate) fn commit_validated<const D: usize>(
     plan: CommitInnerPlan,
     shape: ValidatedShape,
 ) -> Result<CommitInnerWitness<F>, AkitaError> {
-    if let Some(directory) = std::env::var_os("AKITA_COMMIT_CAPTURE_DIR") {
-        source.capture_diagnostic(Path::new(&directory), plan, &shape)?;
-        eprintln!(
-            "COMMIT_DIAGNOSTIC_CAPTURE complete=true hot_entries={}",
-            source.hot_entries()
-        );
-    }
     let total_start = Instant::now();
     let matrix = tracing::info_span!("packed_metal_matrix_prepare")
         .in_scope(|| prepared.matrix(runtime, D, plan.n_a, shape.active_a_cols))?;

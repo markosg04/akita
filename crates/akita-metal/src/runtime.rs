@@ -100,7 +100,8 @@ const PACKED_ONEHOT_BUFFER_ALIGNMENT: usize = 16 * 1024;
 pub(crate) const FP128_D512_TASKS_PER_STREAM: usize = 32;
 pub(crate) const FP128_D512_POSITION_PARTIALS: usize = 16;
 pub(crate) const FP128_D128_RANK3_TASKS_PER_STREAM: usize = 64;
-pub(crate) const FP128_D128_RANK3_TILE_POSITIONS: usize = 16;
+pub(crate) const FP128_D128_RANK3_POSITION_PARTIAL_ALIGNMENT: usize = 16;
+const FP128_D128_RANK3_THREADGROUP_BYTES: usize = 5 * 1_024 * size_of::<u32>();
 const FP128_D128_RANK3_RING_D: u64 = 128;
 const FP128_D128_RANK3_INNER_RANK: u64 = 3;
 const FP128_D512_TILE_FIELD_ELEMENTS: usize = 2_048;
@@ -1404,7 +1405,7 @@ impl MetalRuntime {
             && self
                 .packed_fp128_d128_rank3_pipeline
                 .static_threadgroup_memory_length()
-                == FP128_D512_THREADGROUP_BYTES as u64
+                == FP128_D128_RANK3_THREADGROUP_BYTES as u64
     }
 
     pub(crate) fn supports_fp128_d64_digit_rows<const D: usize>(
@@ -6411,7 +6412,7 @@ impl MetalRuntime {
                 .and_then(|count| count.checked_mul(params.n_a))
                 .and_then(|count| count.checked_mul(params.ring_d))
                 .ok_or(MetalCommitError::ShapeOverflow("packed output"))?;
-            let tile_positions = FP128_D128_RANK3_TILE_POSITIONS as u64;
+            let partial_alignment = FP128_D128_RANK3_POSITION_PARTIAL_ALIGNMENT as u64;
             if lane_count != lanes.len() as u64
                 || params.ring_d != FP128_D128_RANK3_RING_D
                 || params.onehot_k != 256
@@ -6422,7 +6423,9 @@ impl MetalRuntime {
                 || params.n_a != FP128_D128_RANK3_INNER_RANK
                 || params.num_digits_inner != 1
                 || params.position_partials_per_block != FP128_D512_POSITION_PARTIALS as u64
-                || !params.positions_per_partial.is_multiple_of(tile_positions)
+                || !params
+                    .positions_per_partial
+                    .is_multiple_of(partial_alignment)
                 || !params.positions_per_block.is_multiple_of(2)
                 || !params.blocks_per_column.is_power_of_two()
                 || params.blocks_per_column > (1 << 12)
