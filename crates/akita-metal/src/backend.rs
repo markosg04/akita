@@ -393,7 +393,7 @@ fn direct_relation_host_round(
     Ok(DirectRelationHostRound {
         e_first: to_limbs(e_first),
         e_second: to_limbs(e_second),
-        alpha: to_limbs(state.common_alpha_factor()),
+        alpha: to_limbs(state.common_alpha_factor()?),
         additional_pairs,
         scalars: DirectRelationScalars {
             l_at_0: crate::field::Fp128Limbs::from_field(l_at_0),
@@ -979,8 +979,8 @@ impl DirectRelationRangeProofBackend<F, F> for MetalBackend {
         let mut state = DirectRelationRangeProofState::new(prover);
         let num_rounds = state.num_rounds();
         let domain_len = state
-            .current_coefficient_count()
-            .checked_mul(state.current_lane_capacity())
+            .current_coefficient_count()?
+            .checked_mul(state.current_lane_capacity()?)
             .ok_or_else(|| {
                 AkitaError::InvalidSetup("direct relation domain length overflow".into())
             })?;
@@ -1057,7 +1057,7 @@ impl DirectRelationRangeProofBackend<F, F> for MetalBackend {
             claim = next_poly.eval_from_hint(&claim, &challenge);
             challenges.push(challenge);
             round_polys.push(next_poly.clone());
-            state.bind_without_linear_terms(challenge);
+            state.bind_without_linear_terms(challenge)?;
             if round == 0 {
                 if let Some(prefix_reconstruction) = &prefix_reconstruction {
                     let prefix_weights = EqPolynomial::evals(&challenges)?
@@ -1221,6 +1221,15 @@ impl ComputeBackendSetup<F> for MetalBackend {
 }
 
 impl CompressionComputeBackend<F> for MetalBackend {
+    fn compression_negacyclic_rows<const D: usize>(
+        &self,
+        prepared: &Self::PreparedSetup,
+        digit_vectors: &[&[[i8; D]]],
+    ) -> Result<Vec<Vec<CyclotomicRing<F, D>>>, AkitaError> {
+        self.cpu_backend()
+            .compression_negacyclic_rows(&prepared.cpu, digit_vectors)
+    }
+
     fn compression_cache_bytes(&self, prepared: &Self::PreparedSetup) -> Option<usize> {
         self.cpu_backend().compression_cache_bytes(&prepared.cpu)
     }

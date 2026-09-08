@@ -16,6 +16,7 @@ pub use digit_range::{
     LowBasisRangeCheckProver,
 };
 pub(crate) use relation_range_image::AdditionalRelationTerms;
+pub(crate) use relation_range_image::{DenseRelationWeights, RelationWeightOracle};
 pub use relation_range_image::{
     DirectAdditionalPair, DirectAdditionalRound, DirectLinearLayout, DirectLinearRound,
     DirectLinearSegment, DirectRelationRangePreparationInput, DirectRelationRangeProofBackend,

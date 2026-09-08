@@ -339,12 +339,12 @@ pub(crate) fn to_u64(value: usize, name: &'static str) -> Result<u64, AkitaError
 
 #[cfg(test)]
 mod tests {
-    use akita_config::{proof_optimized::fp128, CommitmentConfig};
+    use akita_config::{proof_optimized::fp128, test_support::workspace_schedule_catalog};
     use akita_prover::{
         AkitaProverSetup, ComputeBackendSetup, CpuBackend, GroupContext, OneHotPoly,
         RootCommitSource, UniformProverStack,
     };
-    use akita_types::{PolynomialGroupLayout, SetupMatrixCapacity};
+    use akita_types::{AkitaScheduleLookupKey, PolynomialGroupLayout, SetupMatrixCapacity};
 
     use super::*;
 
@@ -497,11 +497,14 @@ mod tests {
             .map(|chunk| Some((chunk.wrapping_mul(37) % 256) as u8))
             .collect();
         let polys = [OneHotPoly::<F, u8>::new(256, indices).unwrap()];
-        let profile = Cfg::profile_without_precommitted_groups(PolynomialGroupLayout::new(
-            num_vars,
-            polys.len(),
-        ))
-        .unwrap();
+        let schedules = workspace_schedule_catalog::<Cfg>().unwrap();
+        let row = schedules
+            .resolve_key(&AkitaScheduleLookupKey::single(PolynomialGroupLayout::new(
+                num_vars,
+                polys.len(),
+            )))
+            .unwrap();
+        let profile = &row.profiles().final_group;
         let setup = AkitaProverSetup::<F>::generate_with_capacity(
             num_vars,
             polys.len(),
@@ -519,10 +522,11 @@ mod tests {
         let metal_prepared = metal.prepare_setup(&setup).unwrap();
         let metal_stack =
             UniformProverStack::uniform(&metal, &metal_prepared, setup.expanded.as_ref()).unwrap();
-        let context = GroupContext::explicit(&profile);
+        let context = GroupContext::explicit(profile);
         let cpu_output = akita_prover::commit::<Cfg, OneHotPoly<F, u8>, CpuBackend>(
             &polys,
             setup.expanded.as_ref(),
+            &schedules,
             &cpu_stack,
             context,
         )
@@ -530,6 +534,7 @@ mod tests {
         let metal_output = akita_prover::commit::<Cfg, OneHotPoly<F, u8>, MetalBackend>(
             &polys,
             setup.expanded.as_ref(),
+            &schedules,
             &metal_stack,
             context,
         )

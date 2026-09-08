@@ -9,16 +9,14 @@ use crate::compute::{
     SuffixOpeningProveBackend, SuffixTensorProveBackend,
 };
 use crate::SelectedProverOpeningData;
-use akita_config::{
-    effective_batched_schedule, ensure_prover_schedule_fits_setup, CommitmentConfig,
-};
+use akita_config::{ensure_prover_schedule_fits_setup, CommitmentConfig, TrustedScheduleCatalog};
 use jolt_field::{AdditiveGroup, CanonicalEncoding};
 
 /// Drive batched proving end-to-end under config `Cfg`.
 ///
 /// This owns the full top-level prover work: validate/flatten public prover
-/// claims, select the folded schedule from `Cfg`, bind the transcript instance
-/// descriptor, and run the folded prover.
+/// claims, select the folded schedule from the trusted catalog, bind the
+/// transcript instance descriptor, and run the folded prover.
 ///
 /// # Errors
 ///
@@ -28,6 +26,7 @@ use jolt_field::{AdditiveGroup, CanonicalEncoding};
 pub fn batched_prove<'a, Cfg, T, P, C, O, TS, R>(
     expanded: &Arc<AkitaExpandedSetup<Cfg::Field>>,
     prefix_slots: &SetupPrefixProverRegistry<Cfg::Field>,
+    schedules: &TrustedScheduleCatalog<Cfg>,
     stacks: &'a (impl LevelProveStacks<'a, Cfg::Field, Commit = C, Opening = O, Tensor = TS, RingSwitch = R>
              + Sync),
     opening: SelectedProverOpeningData<'a, Cfg::ExtField, P, Cfg::Field>,
@@ -82,11 +81,9 @@ where
     <R as ComputeBackendSetup<Cfg::Field>>::PreparedSetup: 'a,
 {
     let (selection, claims) = opening.into_low_level_parts();
-    let opening_claims = claims.opening_claims();
     let opening_batch = claims.opening_layout()?;
-    let final_group_point = opening_claims.group_point(opening_batch.root_final_group_index()?)?;
-    let resolved = Cfg::resolve_schedule_selection(selection)?;
-    let resolved = effective_batched_schedule::<Cfg>(resolved, &opening_batch, final_group_point)?;
+    let resolved = schedules.resolve_selection(selection)?;
+    resolved.validate_opening_layout(&opening_batch)?;
     let schedule = resolved.schedule();
     schedule.validate_nonterminal_opening_execution(Cfg::EXT_DEGREE)?;
     ensure_prover_schedule_fits_setup::<Cfg>(expanded.as_ref(), schedule, &opening_batch)?;
