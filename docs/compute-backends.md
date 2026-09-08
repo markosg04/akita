@@ -1,8 +1,10 @@
 # Akita Compute Backends
 
 Akita prover compute is now routed through an explicit backend operation
-boundary. The first implementation is `CpuBackend`; Metal and true hybrid
-scheduling remain follow-up work.
+boundary. `CpuBackend` is the reference implementation; the optional
+`akita-metal` crate accelerates admitted operations on macOS. The
+[book's Metal chapter](../book/src/roadmap/compute-backends.md) describes its
+supported operations and fallback policy.
 
 ## Ownership
 

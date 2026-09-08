@@ -10,8 +10,14 @@ profile_traces/
 
 bench_results/
 
-scripts/__pycache__/
-scripts/tests/__pycache__/
+__pycache__/
+
+# Local experiment workspaces, measurements, and captured GPU traces
+/.worktrees/
+/.autoresearch/
+/goal.md
+/benchmark-runs/
+*.gputrace
 
 .cursor/
 crates/akita-types/src/sis/generated_l2_sis_table/audit.csv

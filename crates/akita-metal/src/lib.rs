@@ -56,7 +56,7 @@ mod ring_switch;
 #[expect(
     dead_code,
     clippy::too_many_arguments,
-    reason = "runtime operations are enabled incrementally during the current backend port"
+    reason = "runtime retains unported operation routes; dispatch methods bind each kernel ABI"
 )]
 mod runtime;
 

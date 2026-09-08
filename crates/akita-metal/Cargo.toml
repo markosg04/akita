@@ -26,7 +26,6 @@ parallel = [
 akita-algebra = { version = "0.1.0", path = "../akita-algebra" }
 akita-error = { version = "0.1.0", path = "../akita-error" }
 akita-prover = { version = "0.1.0", path = "../akita-prover" }
-akita-serialization = { version = "0.1.0", path = "../akita-serialization" }
 akita-sumcheck = { version = "0.1.0", path = "../akita-sumcheck", default-features = false }
 akita-transcript = { version = "0.1.0", path = "../akita-transcript", default-features = false }
 akita-types = { version = "0.1.0", path = "../akita-types", default-features = false }
@@ -43,7 +42,6 @@ metal = "0.33.0"
 [dev-dependencies]
 akita-challenges = { version = "0.1.0", path = "../akita-challenges" }
 akita-config = { version = "0.1.0", path = "../akita-config" }
-akita-planner = { version = "0.1.0", path = "../akita-planner" }
 akita-prover = { version = "0.1.0", path = "../akita-prover" }
 
 [[bench]]

@@ -29,6 +29,7 @@ orchestration lives in `akita-pcs`.
 | `akita-setup` | Setup construction and optional cache |
 | `akita-verifier` | Verifier replay (no prover polynomial backends) |
 | `akita-prover` | Commitment, proving, witnesses, polynomial backends |
+| `akita-metal` | Optional macOS compute backend with CPU fallback for unqualified shapes |
 | `akita-pcs` | Umbrella orchestration, examples, integration tests |
 
 ## Dependency Layers
@@ -50,6 +51,7 @@ graph TD
   Config["akita-config"]
   Verifier["akita-verifier"]
   Prover["akita-prover"]
+  Metal["akita-metal"]
   Setup["akita-setup"]
   Pcs["akita-pcs"]
 
@@ -109,6 +111,13 @@ graph TD
   Prover --> Sumcheck
   Prover --> Transcript
   Prover --> Types
+  Metal --> Error
+  Metal --> Algebra
+  Metal --> Field
+  Metal --> Prover
+  Metal --> Sumcheck
+  Metal --> Transcript
+  Metal --> Types
   Setup --> Error
   Setup --> Algebra
   Setup --> Config
