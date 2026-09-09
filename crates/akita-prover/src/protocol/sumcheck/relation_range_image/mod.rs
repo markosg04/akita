@@ -102,6 +102,7 @@ use jolt_field::solinas::parallel::*;
 use jolt_field::{CanonicalEncoding, ExtField, Field, Ring, Zero};
 use jolt_field::{Fold, Unreduced};
 use std::mem;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::backend::packed_digits::{
@@ -115,7 +116,7 @@ enum WitnessState<E: Field> {
 }
 
 struct DeferredCompactPrefix<E: Field> {
-    skip_state: Stage2BivariateSkipState<E>,
+    skip_state: OnceLock<Stage2BivariateSkipState<E>>,
     phase: DeferredCompactPrefixPhase<E>,
     stage1_point: Vec<E>,
     range_image_evaluation: E,

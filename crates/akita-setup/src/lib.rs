@@ -35,6 +35,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "disk-persistence")]
 use std::sync::{Arc, LazyLock, Mutex};
+use tracing::Span;
 
 #[cfg(feature = "disk-persistence")]
 static CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -51,7 +52,16 @@ static PUBLIC_MATRIX_CACHE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mu
 ///
 /// Returns an error if the requested setup capacity is invalid or setup
 /// expansion fails.
-#[tracing::instrument(skip_all, name = "new_prover_setup")]
+#[tracing::instrument(
+    skip_all,
+    name = "new_prover_setup",
+    fields(
+        max_num_vars,
+        max_num_batched_polys,
+        required_matrix_fields = tracing::field::Empty,
+        required_prefix_slots = tracing::field::Empty,
+    )
+)]
 pub fn new_prover_setup<F, Cfg>(
     schedules: &TrustedScheduleCatalog<Cfg>,
     max_num_vars: usize,
@@ -69,6 +79,11 @@ where
 {
     let requirements =
         SetupRequirements::from_catalog::<Cfg>(schedules, max_num_vars, max_num_batched_polys)?;
+    let _ = Span::current().record(
+        "required_matrix_fields",
+        requirements.matrix_capacity.num_field_elements,
+    );
+    let _ = Span::current().record("required_prefix_slots", requirements.prefix_slot_ids.len());
     #[cfg(feature = "disk-persistence")]
     {
         match load_prover_setup::<F>(

@@ -187,37 +187,8 @@ impl<E: Field + Ring + Unreduced> RelationRangeImageProver<E> {
         let relation_state = match relation_weights {
             RelationWeightOracle::QuotientFactored(weights) => {
                 let prefix = if can_use_stage2_two_round_prefix(coefficient_bits, b) {
-                    let proof = build_stage2_bivariate_skip_proof_from_m_compact(
-                        w_evals_compact.view(),
-                        weights.common_alpha_factor(),
-                        weights.relation_lane_weights(),
-                        &linear_terms,
-                        stage1_point,
-                        b,
-                        live_lane_count,
-                        lane_bits,
-                        coefficient_bits,
-                    )
-                    .ok_or_else(|| {
-                        AkitaError::InvalidSetup(
-                            "stage-2 compact prefix is unavailable for the validated geometry"
-                                .into(),
-                        )
-                    })?;
-                    let skip_state = Stage2BivariateSkipState::new(
-                        &proof,
-                        stage1_point,
-                        range_image_evaluation,
-                        relation_linear_claim,
-                        batching_coeff,
-                    )
-                    .ok_or_else(|| {
-                        AkitaError::InvalidSetup(
-                            "stage-2 compact prefix claim recovery failed".into(),
-                        )
-                    })?;
                     QuotientPrefixState::Deferred(DeferredCompactPrefix {
-                        skip_state,
+                        skip_state: OnceLock::new(),
                         phase: DeferredCompactPrefixPhase::Round0,
                         stage1_point: stage1_point.to_vec(),
                         range_image_evaluation,

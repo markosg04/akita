@@ -7,7 +7,6 @@ use crate::compute::{
     CommitInnerPlan, DigitRowsComputeBackend, OperationCtx, RootCommitKernel, RootCommitSource,
 };
 use crate::kernels::linear::decompose_commit_blocks_into;
-use akita_algebra::CyclotomicRing;
 use akita_error::AkitaError;
 use akita_types::{
     dispatch_for_field, AkitaCommitmentHint, AkitaExpandedSetup, CompressionChainPlan,
@@ -76,8 +75,10 @@ where
         ));
     }
 
-    let ring_elems = extract_setup_prefix_ring_elems::<F, D>(expanded, full_prefix_ring_slots)?;
-    let dense = DensePoly::from_ring_coeffs::<D>(ring_elems);
+    let dense = DensePoly::from_field_evals(
+        commitment_profile.group.num_vars(),
+        &expanded.shared_matrix().as_field_slice()[..n_prefix],
+    )?;
     let view = <DensePoly<F> as RootCommitSource<F, D>>::commit_view(&dense)?;
     let witnesses = backend.commit_inner_group(
         prepared,
@@ -188,33 +189,6 @@ where
         },
         hint,
     })
-}
-
-fn extract_setup_prefix_ring_elems<F, const D: usize>(
-    expanded: &AkitaExpandedSetup<F>,
-    full_prefix_ring_slots: usize,
-) -> Result<Vec<CyclotomicRing<F, D>>, AkitaError>
-where
-    F: Field,
-{
-    let fields = expanded.shared_matrix().as_field_slice();
-    let full_prefix_field_len = full_prefix_ring_slots.checked_mul(D).ok_or_else(|| {
-        AkitaError::InvalidSetup("setup prefix full field length overflow".to_string())
-    })?;
-    if full_prefix_field_len > fields.len() {
-        return Err(AkitaError::InvalidSetup(
-            "setup prefix length exceeds shared matrix capacity".to_string(),
-        ));
-    }
-
-    fields[..full_prefix_field_len]
-        .chunks_exact(D)
-        .map(|coeffs| {
-            let mut ring = CyclotomicRing::zero();
-            ring.coefficients_mut().copy_from_slice(coeffs);
-            Ok(ring)
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -340,32 +314,6 @@ mod tests {
             },
         )
         .expect("setup")
-    }
-
-    #[test]
-    fn setup_prefix_extraction_preserves_actual_tail() {
-        let padded_ring_slots = 4usize;
-        let setup = AkitaProverSetup::<F>::generate_with_capacity(
-            8,
-            1,
-            SetupMatrixCapacity {
-                num_field_elements: padded_ring_slots * 64,
-            },
-        )
-        .expect("setup");
-        let fields = setup.expanded.shared_matrix().as_field_slice();
-        assert_eq!(fields.len(), padded_ring_slots * 64);
-
-        let ring_elems =
-            extract_setup_prefix_ring_elems::<F, 64>(&setup.expanded, padded_ring_slots)
-                .expect("extract setup prefix");
-
-        assert_eq!(ring_elems.len(), padded_ring_slots);
-        assert_eq!(ring_elems[0].coefficients(), &fields[..64]);
-        assert_eq!(ring_elems[1].coefficients(), &fields[64..128]);
-        assert_eq!(ring_elems[2].coefficients()[0], fields[128]);
-        assert_eq!(ring_elems[2].coefficients(), &fields[128..192]);
-        assert_eq!(ring_elems[3].coefficients(), &fields[192..256]);
     }
 
     #[test]

@@ -75,7 +75,7 @@ fn stage2_two_shared_sources_match_direct_path_through_all_transitions() {
         coefficient_bits,
     };
     let (structured, dense) = two_source_linear_terms(live_lane_count, coeff_count);
-    let mut optimized = new_stage2_test_prover_with_linear_terms(
+    let optimized = new_stage2_test_prover_with_linear_terms(
         F::from_u64(701),
         compact_witness.clone(),
         common_alpha_factor.clone(),
@@ -85,6 +85,16 @@ fn stage2_two_shared_sources_match_direct_path_through_all_transitions() {
         params,
     );
     assert!(optimized.can_use_deferred_compact_prefix());
+    let state = DirectRelationRangeProofState::new(optimized);
+    assert!(state.two_round_prefix_data().unwrap().is_some());
+    assert!(state
+        .prover
+        .deferred_compact_prefix()
+        .unwrap()
+        .skip_state
+        .get()
+        .is_none());
+    let mut optimized = state.into_prover();
     let (structured, _) = two_source_linear_terms(live_lane_count, coeff_count);
     let mut direct = new_stage2_test_prover_with_linear_terms(
         F::from_u64(701),
@@ -102,6 +112,14 @@ fn stage2_two_shared_sources_match_direct_path_through_all_transitions() {
     assert_eq!(optimized_claim, direct_claim);
     for round in 0..lane_bits + coefficient_bits {
         let optimized_poly = optimized.compute_round_univariate(round, optimized_claim);
+        if round == 0 {
+            assert!(optimized
+                .deferred_compact_prefix()
+                .unwrap()
+                .skip_state
+                .get()
+                .is_some());
+        }
         let direct_poly = direct.compute_round_univariate(round, direct_claim);
         assert_eq!(optimized_poly, direct_poly, "mismatch at round {round}");
         let challenge = F::from_u64(809 + 23 * round as u64);

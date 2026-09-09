@@ -57,12 +57,39 @@ impl<E: Field + Ring + Unreduced> RelationRangeImageProver<E> {
     ) -> (UniPoly<E>, UniPoly<E>) {
         if self.using_deferred_compact_prefix() {
             if let Some(prefix) = self.deferred_compact_prefix() {
+                // Metal reconstructs this prefix from device evaluations and never
+                // requests a CPU round. Keep the host witness scan lazy.
+                let skip_state = prefix.skip_state.get_or_init(|| {
+                    let WitnessState::CompactPrefix(witness) = &self.witness_state else {
+                        unreachable!("deferred prefix retains the compact witness for two rounds")
+                    };
+                    let proof = build_stage2_bivariate_skip_proof_from_m_compact(
+                        witness.view(),
+                        weights.common_alpha_factor(),
+                        weights.relation_lane_weights(),
+                        &self.linear_terms,
+                        &prefix.stage1_point,
+                        self.b,
+                        self.live_lane_count,
+                        self.lane_bits,
+                        self.coefficient_bits(),
+                    )
+                    .expect("deferred prefix geometry is validated at construction");
+                    // The canonical builder omits a nonzero-weight corner; the
+                    // four corner weights sum to one, so recovery is defined.
+                    Stage2BivariateSkipState::new(
+                        &proof,
+                        &prefix.stage1_point,
+                        prefix.range_image_evaluation,
+                        prefix.relation_linear_claim,
+                        prefix.batching_coeff,
+                    )
+                    .expect("canonical prefix has an invertible omitted-corner weight")
+                });
                 let (virt_poly, rel_poly) = match prefix.phase {
-                    DeferredCompactPrefixPhase::Round0 => {
-                        prefix.skip_state.reconstruct_round0_polys()
-                    }
+                    DeferredCompactPrefixPhase::Round0 => skip_state.reconstruct_round0_polys(),
                     DeferredCompactPrefixPhase::Round1 { first_challenge } => {
-                        prefix.skip_state.reconstruct_round1_polys(first_challenge)
+                        skip_state.reconstruct_round1_polys(first_challenge)
                     }
                 };
                 let combined = self.combine_polys(&virt_poly, &rel_poly);
