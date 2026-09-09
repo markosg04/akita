@@ -84,7 +84,7 @@ pub fn peel_first_balanced_digit(
     } else {
         let d = c & mask;
         let balanced = if d >= half_b { d - b } else { d };
-        ((c - balanced) >> log_basis, balanced)
+        ((c >> log_basis) + i128::from(balanced < 0), balanced)
     }
 }
 
@@ -408,7 +408,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d0
                 };
-                c0 = (c0 - balanced0) >> params.log_basis;
+                c0 = (c0 >> params.log_basis) + i128::from(balanced0 < 0);
                 plane[base] = T::from_i128(balanced0);
 
                 let d1 = c1 & params.mask;
@@ -417,7 +417,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d1
                 };
-                c1 = (c1 - balanced1) >> params.log_basis;
+                c1 = (c1 >> params.log_basis) + i128::from(balanced1 < 0);
                 plane[base + 1] = T::from_i128(balanced1);
 
                 let d2 = c2 & params.mask;
@@ -426,7 +426,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d2
                 };
-                c2 = (c2 - balanced2) >> params.log_basis;
+                c2 = (c2 >> params.log_basis) + i128::from(balanced2 < 0);
                 plane[base + 2] = T::from_i128(balanced2);
             }
         }
@@ -447,7 +447,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
             for plane in remaining.chunks_exact_mut(width) {
                 let d = c & params.mask;
                 let balanced = if d >= params.half_b { d - params.b } else { d };
-                c = (c - balanced) >> params.log_basis;
+                c = (c >> params.log_basis) + i128::from(balanced < 0);
                 plane[coefficient] = T::from_i128(balanced);
             }
         }
@@ -485,7 +485,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d0
                 };
-                c0 = (c0 - balanced0) >> params.log_basis;
+                c0 = (c0 >> params.log_basis) + i128::from(balanced0 < 0);
                 plane[base] = T::from_i128(balanced0);
 
                 let d1 = c1 & params.mask;
@@ -494,7 +494,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d1
                 };
-                c1 = (c1 - balanced1) >> params.log_basis;
+                c1 = (c1 >> params.log_basis) + i128::from(balanced1 < 0);
                 plane[base + 1] = T::from_i128(balanced1);
 
                 let d2 = c2 & params.mask;
@@ -503,7 +503,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
                 } else {
                     d2
                 };
-                c2 = (c2 - balanced2) >> params.log_basis;
+                c2 = (c2 >> params.log_basis) + i128::from(balanced2 < 0);
                 plane[base + 2] = T::from_i128(balanced2);
             }
         }
@@ -520,7 +520,7 @@ fn balanced_decompose_coefficients_pow2_signed_into_with_params<
             for plane in out.chunks_exact_mut(width) {
                 let d = c & params.mask;
                 let balanced = if d >= params.half_b { d - params.b } else { d };
-                c = (c - balanced) >> params.log_basis;
+                c = (c >> params.log_basis) + i128::from(balanced < 0);
                 plane[coefficient] = T::from_i128(balanced);
             }
         }
@@ -572,7 +572,7 @@ impl<F: Field + CanonicalEncoding, const D: usize> CyclotomicRing<F, D> {
                 for plane in remaining.iter_mut() {
                     let d = c & mask;
                     let balanced = if d >= half_b { d - b } else { d };
-                    c = (c - balanced) >> log_basis;
+                    c = (c >> log_basis) + i128::from(balanced < 0);
                     plane.coeffs[i] = balanced_digit_to_field::<F>(balanced, q);
                 }
             }
@@ -590,7 +590,7 @@ impl<F: Field + CanonicalEncoding, const D: usize> CyclotomicRing<F, D> {
                 for plane in out.iter_mut() {
                     let d = c & mask;
                     let balanced = if d >= half_b { d - b } else { d };
-                    c = (c - balanced) >> log_basis;
+                    c = (c >> log_basis) + i128::from(balanced < 0);
                     plane.coeffs[i] = balanced_digit_to_field::<F>(balanced, q);
                 }
             }
@@ -876,7 +876,7 @@ impl<F: Field + CanonicalEncoding, const D: usize> CyclotomicRing<F, D> {
                 } else {
                     let d = c.rem_euclid(b);
                     let digit = if d >= half_b { d - b } else { d };
-                    c = (c - digit) / b;
+                    c = (c >> log_basis) + i128::from(digit < 0);
                     digit
                 };
 

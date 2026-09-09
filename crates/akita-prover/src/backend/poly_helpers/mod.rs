@@ -320,7 +320,7 @@ pub(crate) fn extract_balanced_digit(c: &mut i128, p: &DecomposeParams) -> i32 {
     if p.log_basis == 2 {
         let d = (*c as i32) & 3;
         let balanced = if d >= 2 { d - 4 } else { d };
-        *c = (*c - i128::from(balanced)) >> 2;
+        *c = (*c >> 2) + i128::from(balanced < 0);
         return balanced;
     }
 
@@ -330,7 +330,9 @@ pub(crate) fn extract_balanced_digit(c: &mut i128, p: &DecomposeParams) -> i32 {
     } else {
         d
     };
-    *c = (*c - i128::from(balanced)) >> p.log_basis;
+    // z = B*floor(z/B) + r; a negative balanced digit adds one to the quotient.
+    // Shift first so rounding near i128::MAX cannot overflow the intermediate.
+    *c = (*c >> p.log_basis) + i128::from(balanced < 0);
     balanced
 }
 

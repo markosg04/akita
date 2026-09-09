@@ -3,9 +3,9 @@ use super::rotated_accum::{
 };
 use super::{
     balanced_ring_decompose_fold_partitioned, cached_digit_decompose_fold_partitioned,
-    decompose_ring_interleaved, fill_rotated_challenge, sparse_mul_acc, sparse_mul_acc_i16,
-    sparse_mul_acc_i16_pm1, sparse_mul_acc_i16_scalar, sparse_mul_acc_pm1, sparse_mul_acc_scalar,
-    DecomposeParams,
+    decompose_ring_interleaved, decompose_ring_interleaved_i16, fill_rotated_challenge,
+    sparse_mul_acc, sparse_mul_acc_i16, sparse_mul_acc_i16_pm1, sparse_mul_acc_i16_scalar,
+    sparse_mul_acc_pm1, sparse_mul_acc_scalar, DecomposeParams,
 };
 use akita_algebra::CyclotomicRing;
 use akita_challenges::SparseChallenge;
@@ -299,6 +299,61 @@ fn sparse_mul_acc_rejects_out_of_range_challenge_before_dispatch() {
         coeffs: vec![1].into(),
     };
     sparse_mul_acc_i16(&[0; D], &challenge, &mut [0; D]);
+}
+
+#[test]
+fn full_width_centered_digits_preserve_positive_carry() {
+    type F = Prime128Offset275;
+    const D: usize = 64;
+    let q = u128::MAX - 274;
+    let mut ring = CyclotomicRing::<F, D>::zero();
+    ring.coeffs[0] = F::from_u128_reduced(q / 2);
+    ring.coeffs[1] = F::from_u128_reduced(q - q / 2);
+    let params = DecomposeParams {
+        threshold: q / 2,
+        q,
+        mask: 1023,
+        half_b: 512,
+        b_val: 1024,
+        log_basis: 10,
+        overflow_possible: false,
+    };
+    let mut actual = vec![[0i16; D]; 13];
+    decompose_ring_interleaved_i16(&ring, &mut actual, 13, &params);
+    let mut expected = vec![[0i16; D]; 13];
+    expected[0][0] = -138;
+    expected[0][1] = 138;
+    expected[12][0] = 128;
+    expected[12][1] = -128;
+    assert_eq!(actual, expected);
+    assert_eq!(ring.balanced_decompose_pow2_i16(13, 10), expected);
+    let field_digits: Vec<CyclotomicRing<F, D>> = expected
+        .iter()
+        .map(|plane| {
+            CyclotomicRing::from_coefficients(plane.map(|digit| {
+                F::from_u128_reduced(if digit < 0 {
+                    q - u128::from(digit.unsigned_abs())
+                } else {
+                    digit as u128
+                })
+            }))
+        })
+        .collect();
+    assert_eq!(ring.balanced_decompose_pow2(13, 10), field_digits);
+    assert_eq!(
+        ring.balanced_decompose_pow2_with_carry(13, 10),
+        field_digits
+    );
+}
+
+#[test]
+fn narrow_rotation_preserves_signed_minimum() {
+    const D: usize = 128;
+    let mut plane = [0i16; D];
+    plane[0] = i16::MIN;
+    let mut actual = [0i16; D];
+    super::narrow_accum::sparse_mul_acc_i16_terms(&plane, &[0], &[1], &mut actual);
+    assert_eq!(actual, plane);
 }
 
 #[test]
