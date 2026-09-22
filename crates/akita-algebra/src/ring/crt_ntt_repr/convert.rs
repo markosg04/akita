@@ -18,6 +18,8 @@ enum CenteredI16NttStrategy<W: PrimeWidth, const K: usize> {
     NeonI16,
     #[cfg(target_arch = "aarch64")]
     NeonI32,
+    #[cfg(all(feature = "ntt-inline", target_arch = "riscv64"))]
+    Inline,
 }
 
 /// Prepared conversion policy for repeated centered-i16 NTT inputs.
@@ -28,6 +30,13 @@ pub(super) struct CenteredI16NttConverter<'a, W: PrimeWidth, const K: usize, con
 
 impl<'a, W: PrimeWidth, const K: usize, const D: usize> CenteredI16NttConverter<'a, W, K, D> {
     pub(super) fn new(params: &'a CrtNttParamSet<W, K, D>, rhs: &[[i16; D]]) -> Self {
+        #[cfg(all(feature = "ntt-inline", target_arch = "riscv64"))]
+        if D == 64 && W::R_LOG == 32 {
+            return Self {
+                params,
+                strategy: CenteredI16NttStrategy::Inline,
+            };
+        }
         #[cfg(target_arch = "aarch64")]
         if params.kernel_plan.uses_neon() {
             if size_of::<W>() == size_of::<i16>() {
@@ -66,7 +75,34 @@ impl<'a, W: PrimeWidth, const K: usize, const D: usize> CenteredI16NttConverter<
             CenteredI16NttStrategy::NeonI16 => self.transform_neon_i16(coefficients),
             #[cfg(target_arch = "aarch64")]
             CenteredI16NttStrategy::NeonI32 => self.transform_neon_i32(coefficients),
+            #[cfg(all(feature = "ntt-inline", target_arch = "riscv64"))]
+            CenteredI16NttStrategy::Inline => self.transform_inline(coefficients),
         }
+    }
+
+    #[cfg(all(feature = "ntt-inline", any(target_arch = "riscv64", test)))]
+    pub(super) fn transform_inline(&self, coefficients: &[i16; D]) -> CyclotomicCrtNtt<W, K, D> {
+        assert!(D == 64 && W::R_LOG == 32);
+        let raw = coefficients.map(|value| MontCoeff::from_raw(W::from_i64(i64::from(value))));
+        let mut limbs = [raw; K];
+        for ((limb, prime), twiddles) in limbs
+            .iter_mut()
+            .zip(self.params.primes.iter())
+            .zip(self.params.twiddles.iter())
+        {
+            // The R² twist folds signed coefficient conversion into the first product.
+            // SAFETY: The checked degree and sealed width pin these array layouts.
+            unsafe {
+                jolt_inlines_ntt::forward_ntt64(
+                    &mut *(limb as *mut _ as *mut [i32; 64]),
+                    &*(&twiddles.psi_pows_r2 as *const _ as *const [i32; 64]),
+                    &*(&twiddles.fwd_twiddles as *const _ as *const [i32; 64]),
+                    prime.p.to_i64() as i32,
+                    prime.pinv.to_i64() as i32,
+                );
+            }
+        }
+        CyclotomicCrtNtt { limbs }
     }
 
     #[cfg(target_arch = "aarch64")]

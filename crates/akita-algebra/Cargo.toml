@@ -9,8 +9,9 @@ repository = "https://github.com/LayerZero-Labs/akita"
 readme = "../../README.md"
 
 [dependencies]
+jolt-inlines-ntt = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "c2372a0a9ffd2b37768e501b90037c146664757d", default-features = false, optional = true }
 akita-error = { version = "0.1.0", path = "../akita-error" }
-jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = [
+jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "c2372a0a9ffd2b37768e501b90037c146664757d", default-features = false, features = [
   "asm",
   "solinas",
 ] }
@@ -32,6 +33,7 @@ name = "offset_eq_window"
 harness = false
 
 [features]
+ntt-inline = ["dep:jolt-inlines-ntt"]
 default = []
 parallel = ["dep:rayon", "jolt-field/parallel"]
 

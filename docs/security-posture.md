@@ -52,3 +52,23 @@ Validated proof-shape decoding must reject shape dimensions that exceed the gene
 
 Akita currently relies on strict Rust CI, crate-boundary checks, specs for large protocol changes, and targeted tests.
 The hardening roadmap adds supply-chain checks, fuzzing, property tests, bounded untrusted decoding, and clearer unsafe and panic discipline.
+
+## Prepared Catalog Codec
+
+Prepared binary schedule catalogs use pinned bincode 2.0.1. The exception for
+[RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141) accepts its
+unmaintained status to preserve the existing binary format; it does not resolve
+the advisory or establish that the codec is free of defects. Other advisory and
+yanked-dependency checks remain enabled.
+
+`from_trusted_artifact_binary` accepts catalogs from the application's trusted
+setup path. Both binary decoders enforce the 64 MiB byte/decode limit, exact
+consumption, format and configuration binding, and shared semantic row validation.
+Selected catalogs also validate their ordered identities and available-row
+membership. These checks do not authenticate the artifact's provenance; the
+application supplies that authority.
+
+Replacing the codec requires a format-version decision, compatibility or explicit
+conversion tests, malformed/trailing/oversized artifact controls, and replay of
+preserved trusted artifacts. A maintenance exception is not a substitute for that
+migration work.

@@ -9,10 +9,11 @@ repository = "https://github.com/LayerZero-Labs/akita"
 readme = "../../README.md"
 
 [dependencies]
+jolt-inlines-blake2 = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "c2372a0a9ffd2b37768e501b90037c146664757d", default-features = false, optional = true }
 akita-error = { version = "0.1.0", path = "../akita-error" }
 akita-algebra = { version = "0.1.0", path = "../akita-algebra" }
 akita-challenges = { version = "0.1.0", path = "../akita-challenges", default-features = false }
-jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = [
+jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "c2372a0a9ffd2b37768e501b90037c146664757d", default-features = false, features = [
   "asm",
   "solinas",
 ] }
@@ -28,6 +29,8 @@ tracing = "0.1"
 
 [features]
 default = ["transcript-blake2b"]
+# Descriptor digests over the jolt-inlines Blake2b (guest verifiers).
+blake2-inline = ["dep:jolt-inlines-blake2"]
 test-support = []
 transcript-blake2b = [
   "akita-challenges/transcript-blake2b",
@@ -44,7 +47,7 @@ logging-transcript = ["akita-transcript/logging-transcript"]
 
 [dev-dependencies]
 sha3 = "0.12.0"
-jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = [
+jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "c2372a0a9ffd2b37768e501b90037c146664757d", default-features = false, features = [
   "bn254",
 ] }
 criterion = { version = "0.8", features = ["html_reports"] }

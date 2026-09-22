@@ -210,14 +210,8 @@ impl<F: Field + CanonicalEncoding> AkitaVerifierSetup<F> {
         artifact: &[u8],
         schedule_row_digest: crate::ScheduleRowDigest,
     ) -> Result<(), AkitaError> {
-        let metadata = crate::prepared_verifier_ntt_cache_metadata(artifact)?;
-        let setup_seed_digest = crate::setup_seed_digest(&self.expanded.descriptor.setup_seed)
-            .map_err(|error| AkitaError::InvalidSetup(format!("setup seed identity: {error}")))?;
-        let expected_binding = crate::PreparedVerifierNttCacheBinding {
-            setup_seed_digest,
-            schedule_row_digest,
-            setup_field_elements: self.expanded.descriptor.num_field_elements,
-        };
+        let (metadata, expected_binding) =
+            self.prepared_ntt_cache_binding(artifact, schedule_row_digest)?;
         crate::dispatch_for_field!(
             ProtocolDispatchSlot::Role(RingRole::Inner),
             F,
@@ -232,6 +226,63 @@ impl<F: Field + CanonicalEncoding> AkitaVerifierSetup<F> {
                     .install_trusted(decoded_metadata, prepared)
             }
         )
+    }
+
+    /// [`Self::install_trusted_prepared_verifier_ntt_cache`] for an artifact
+    /// that outlives the program (a verifier's own image or input): the
+    /// residues are used where they lie, without a copy and without the
+    /// range pass, so the caller vouches for them as it does for the matrix
+    /// of an unvalidated setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the artifact does not match this setup and row
+    /// digest, or its body is misaligned for in-place use.
+    pub fn install_trusted_prepared_verifier_ntt_cache_in_place(
+        &self,
+        artifact: &'static [u8],
+        schedule_row_digest: crate::ScheduleRowDigest,
+    ) -> Result<(), AkitaError> {
+        let (metadata, expected_binding) =
+            self.prepared_ntt_cache_binding(artifact, schedule_row_digest)?;
+        crate::dispatch_for_field!(
+            ProtocolDispatchSlot::Role(RingRole::Inner),
+            F,
+            metadata.ring_dimension,
+            |D| {
+                let (decoded_metadata, prepared) =
+                    crate::ntt_cache::view_riscv64_scalar_q128_cache::<F, D>(
+                        artifact,
+                        expected_binding,
+                    )?;
+                self.verifier_ntt
+                    .install_trusted(decoded_metadata, prepared)
+            }
+        )
+    }
+
+    fn prepared_ntt_cache_binding(
+        &self,
+        artifact: &[u8],
+        schedule_row_digest: crate::ScheduleRowDigest,
+    ) -> Result<
+        (
+            crate::PreparedVerifierNttCacheMetadata,
+            crate::PreparedVerifierNttCacheBinding,
+        ),
+        AkitaError,
+    > {
+        let metadata = crate::prepared_verifier_ntt_cache_metadata(artifact)?;
+        let setup_seed_digest = crate::setup_seed_digest(&self.expanded.descriptor.setup_seed)
+            .map_err(|error| AkitaError::InvalidSetup(format!("setup seed identity: {error}")))?;
+        Ok((
+            metadata,
+            crate::PreparedVerifierNttCacheBinding {
+                setup_seed_digest,
+                schedule_row_digest,
+                setup_field_elements: self.expanded.descriptor.num_field_elements,
+            },
+        ))
     }
 
     /// Return an exact or covering negacyclic prefix, preparing it on demand.
@@ -663,6 +714,79 @@ impl<F: Field + CanonicalEncoding + Valid + AkitaDeserialize<Context = ()>> Akit
                 shared_matrix,
             ))
         }
+    }
+}
+
+impl<F: Field + CanonicalEncoding + Valid + AkitaDeserialize<Context = ()> + 'static>
+    AkitaExpandedSetup<F>
+{
+    /// View a trusted, uncompressed serialized setup in place (see
+    /// [`FlatMatrix::borrow_trusted_with_expected_shape`]), returning it with
+    /// the unread remainder of `bytes`. Like an unvalidated
+    /// `deserialize_with_mode`, this takes the matrix as seed-derived without
+    /// re-deriving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor is malformed or the matrix cannot be
+    /// viewed in place.
+    pub fn borrow_trusted(
+        bytes: &'static [u8],
+    ) -> Result<(Self, &'static [u8]), SerializationError> {
+        let mut reader = bytes;
+        let descriptor = AkitaSetupDescriptor::deserialize_with_mode(
+            &mut reader,
+            Compress::No,
+            Validate::No,
+            &(),
+        )?;
+        descriptor.check()?;
+        let (shared_matrix, rest) = FlatMatrix::borrow_trusted_with_expected_shape(
+            reader,
+            descriptor.num_field_elements,
+            MAX_GENERIC_SETUP_DECODE_FIELD_ELEMENTS,
+        )?;
+        Ok((
+            Self::from_trusted_seed_derived_parts_unchecked(descriptor, shared_matrix),
+            rest,
+        ))
+    }
+
+    /// Offset of the first matrix coefficient in an uncompressed serialized
+    /// setup: the position [`Self::borrow_trusted`] needs 8-byte aligned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor header is malformed.
+    pub fn coefficient_offset(bytes: &[u8]) -> Result<usize, SerializationError> {
+        let mut reader = bytes;
+        AkitaSetupDescriptor::deserialize_with_mode(&mut reader, Compress::No, Validate::No, &())?;
+        let count_header = 0usize.serialized_size(Compress::No);
+        Ok(bytes.len() - reader.len() + count_header)
+    }
+}
+
+impl<F: Field + CanonicalEncoding + Valid + AkitaDeserialize<Context = ()> + 'static>
+    AkitaVerifierSetup<F>
+{
+    /// View a trusted, uncompressed serialized verifier setup in place: the
+    /// public matrix is used where it lies in `bytes` instead of copied. The
+    /// caller vouches for the bytes as it would for `Validate::No`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the setup is malformed or the matrix cannot be
+    /// viewed in place.
+    pub fn borrow_trusted(bytes: &'static [u8]) -> Result<Self, SerializationError> {
+        let (expanded, rest) = AkitaExpandedSetup::borrow_trusted(bytes)?;
+        let prefix_slots = SetupPrefixVerifierRegistry::deserialize_with_mode(
+            rest,
+            Compress::No,
+            Validate::No,
+            &(),
+        )?;
+        Self::from_parts(Arc::new(expanded), prefix_slots)
+            .map_err(|err| SerializationError::InvalidData(err.to_string()))
     }
 }
 

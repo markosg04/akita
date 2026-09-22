@@ -310,12 +310,15 @@ impl<E: Field> SetupContributionPlan<E> {
                         })?;
                     }
                 }
-                let mut term = E::zero();
-                for (ring, weight) in setup.iter().zip(weights) {
-                    if !weight.is_zero() {
-                        term += eval_ring_at_pows_fast(ring, base_pows) * weight;
-                    }
-                }
+                // Rows with a zero weight contribute nothing; the rest go
+                // through the shared-powers kernel in one call.
+                let (rows, weights): (Vec<&[F]>, Vec<E>) = setup
+                    .iter()
+                    .zip(weights)
+                    .filter(|(_, weight)| !weight.is_zero())
+                    .map(|(ring, weight)| (ring.coefficients().as_slice(), weight))
+                    .unzip();
+                let term = E::weighted_dot_base_rows(&rows, &weights, base_pows);
                 Ok(acc + term)
             },
             |lhs, rhs| Ok(lhs + rhs)
