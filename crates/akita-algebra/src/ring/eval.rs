@@ -132,7 +132,7 @@ where
 /// Fast (deferred-reduction) counterpart of [`eval_ring_at_pows`].
 ///
 /// Same signature and result as [`eval_ring_at_pows`], but accumulates all `D`
-/// widening `E × F` products into a single [`Unreduced::Product`] and
+/// widening `E × F` products into a single unreduced product accumulator and
 /// reduces **once** instead of reducing after every coefficient. On a 128-bit
 /// prime the modular reduction is a large fraction of each multiply, so this
 /// turns ~`D` reductions into one.

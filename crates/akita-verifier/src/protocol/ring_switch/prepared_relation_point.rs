@@ -30,8 +30,6 @@ pub(super) struct PreparedLiftedRelationPoint<E: Field> {
     outer: Arc<PreparedRolePoint<E>>,
     opening: Arc<PreparedRolePoint<E>>,
     additional: Vec<Arc<PreparedRolePoint<E>>>,
-    #[cfg(test)]
-    role_dims: CommitmentRingDims,
 }
 
 pub(super) struct PreparedReducedRelationPoint<E: Field> {
@@ -130,8 +128,6 @@ impl<E: Field> PreparedLiftedRelationPoint<E> {
             outer,
             opening,
             additional,
-            #[cfg(test)]
-            role_dims,
         })
     }
 
