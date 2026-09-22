@@ -1,6 +1,8 @@
 //! Fold-challenge preview drawing for prover-side Fiat–Shamir grinding.
 
-use crate::sampler::MAX_STACK_RING_DIM;
+mod frame;
+pub use frame::FoldChallengeFrame;
+
 use crate::{Challenges, OperatorNormRejection, SparseChallengeConfig};
 use akita_error::AkitaError;
 use akita_transcript::labels::{ABSORB_SPARSE_CHALLENGE, CHALLENGE_SPARSE_CHALLENGE};
@@ -93,60 +95,17 @@ pub trait FoldDraw {
         grind_nonce: u32,
         rejection: Option<OperatorNormRejection>,
     ) -> Result<Challenges, AkitaError> {
-        if let FoldChallengeDrawDomain::SubringCoefficientPacking {
-            challenge_subring_dimension,
-        } = domain
-        {
-            if ring_d != challenge_subring_dimension {
-                return Err(AkitaError::InvalidInput(
-                    "coefficient-packing draw dimension mismatch".into(),
-                ));
-            }
-            if rejection.is_some() {
-                return Err(AkitaError::InvalidInput(
-                    "coefficient-packing draws require the L-infinity security route".into(),
-                ));
-            }
-        }
-        if ring_d > MAX_STACK_RING_DIM {
-            return Err(AkitaError::InvalidInput(format!(
-                "ring dimension {ring_d} exceeds supported stack sampler limit ({MAX_STACK_RING_DIM})"
-            )));
-        }
-        cfg.validate_dyn(ring_d).map_err(|e| {
-            AkitaError::InvalidInput(format!("invalid sparse challenge config: {e}"))
-        })?;
-        if let Some(rejection) = rejection {
-            rejection
-                .validate(ring_d, cfg)
-                .map_err(|error| AkitaError::InvalidInput(error.into()))?;
-        }
-        if num_live_blocks == 0 || num_claims == 0 {
-            return Err(AkitaError::InvalidInput(
-                "fold challenges require positive num_live_blocks and claims".to_string(),
-            ));
-        }
-
-        let total = num_live_blocks.checked_mul(num_claims).ok_or_else(|| {
-            AkitaError::InvalidSetup("sparse challenge count overflow".to_string())
-        })?;
-        let sample_label = fold_challenge_sample_label(group_index, num_live_blocks, num_claims)?;
-        let domain_sep = cfg.domain_separator_bytes();
-        let mut absorb_buf = Vec::with_capacity(sample_label.len() + 8 + 8 + domain_sep.len() + 4);
-        absorb_buf.extend_from_slice(&sample_label);
-        absorb_buf.extend_from_slice(&(total as u64).to_le_bytes());
-        absorb_buf.extend_from_slice(&(ring_d as u64).to_le_bytes());
-        absorb_buf.extend_from_slice(&domain_sep);
-        absorb_buf.extend_from_slice(&grind_nonce.to_le_bytes());
-        if matches!(
+        let frame = FoldChallengeFrame::new(
             domain,
-            FoldChallengeDrawDomain::SubringCoefficientPacking { .. }
-        ) {
-            absorb_buf.extend_from_slice(SUBRING_COEFFICIENT_PACKING_DRAW_DOMAIN);
-        }
-        if let Some(rejection) = rejection {
-            absorb_buf.extend_from_slice(&rejection.domain_separator_bytes());
-        }
+            ring_d,
+            group_index,
+            num_live_blocks,
+            num_claims,
+            cfg,
+            rejection,
+        )?;
+        let total = frame.coordinate_count();
+        let absorb_buf = frame.encode(grind_nonce);
         let seed = self.absorb_and_squeeze(ABSORB_SPARSE_CHALLENGE, &absorb_buf);
         let challenges = crate::sampler::sample_indexed_challenges_from_seed(
             &seed, ring_d, total, cfg, rejection,
