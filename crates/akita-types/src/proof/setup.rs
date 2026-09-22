@@ -6,20 +6,18 @@ use akita_error::AkitaError;
 use akita_serialization::{
     AkitaDeserialize, AkitaSerialize, Compress, SerializationError, Valid, Validate,
 };
+use akita_transcript::blake2b_stream::Blake2bStream;
 #[allow(unused_imports)]
 use jolt_field::solinas::parallel::*;
 use jolt_field::{CanonicalEncoding, Field};
-use rand_core::{CryptoRng, RngCore};
-use shake::digest::{ExtendableOutput, Update, XofReader};
-use shake::Shake256;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
 /// Versioned derivation algorithm for the public field stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicMatrixDerivation {
-    /// Fixed 4096-field-element SHAKE256 pages with exact field sampling.
-    Shake256PagedV1,
+    /// Fixed 4096-field-element Blake2b-512 pages with exact field sampling.
+    Blake2b512PagedV2,
 }
 
 impl PublicMatrixDerivation {
@@ -27,7 +25,7 @@ impl PublicMatrixDerivation {
     #[must_use]
     pub const fn page_field_elements(self) -> usize {
         match self {
-            Self::Shake256PagedV1 => 4096,
+            Self::Blake2b512PagedV2 => 4096,
         }
     }
 }
@@ -42,11 +40,11 @@ pub struct AkitaSetupSeed {
 }
 
 impl AkitaSetupSeed {
-    /// Construct a v1 paged SHAKE256 public-matrix identity.
+    /// Construct a v2 paged Blake2b-512 public-matrix identity.
     #[must_use]
-    pub const fn shake256_paged_v1(seed: [u8; 32]) -> Self {
+    pub const fn blake2b512_paged_v2(seed: [u8; 32]) -> Self {
         Self {
-            derivation: PublicMatrixDerivation::Shake256PagedV1,
+            derivation: PublicMatrixDerivation::Blake2b512PagedV2,
             seed,
         }
     }
@@ -54,7 +52,7 @@ impl AkitaSetupSeed {
 
 impl From<[u8; 32]> for AkitaSetupSeed {
     fn from(seed: [u8; 32]) -> Self {
-        Self::shake256_paged_v1(seed)
+        Self::blake2b512_paged_v2(seed)
     }
 }
 
@@ -67,8 +65,8 @@ impl From<[u8; 32]> for AkitaSetupSeed {
 /// enforce an expected shape and caller-supplied resource budget.
 pub const MAX_GENERIC_SETUP_DECODE_FIELD_ELEMENTS: usize = 1 << 26;
 
-const PUBLIC_MATRIX_DOMAIN: &[u8] = b"akita/commitment/public-field-stream";
-const PUBLIC_MATRIX_DERIVATION_TAG: &[u8] = b"shake256-paged-v1";
+/// Domain for epoch-6 seed, field modulus, page size and page index contexts.
+pub const PUBLIC_MATRIX_STREAM_DOMAIN: &[u8] = b"akita/public-matrix/blake2b512-paged/v2";
 
 /// Exact base-field capacity of the shared public setup vector.
 ///
@@ -320,7 +318,7 @@ where
 pub fn sample_akita_setup_seed() -> AkitaSetupSeed {
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
-    AkitaSetupSeed::shake256_paged_v1(seed)
+    AkitaSetupSeed::blake2b512_paged_v2(seed)
 }
 
 /// Derive an exact flat prefix of public field elements from a seed.
@@ -332,27 +330,27 @@ pub fn sample_akita_setup_seed() -> AkitaSetupSeed {
 /// ring-matrix views. Equal field-length requests therefore derive identical
 /// coefficient prefixes for every schedule.
 ///
-/// Each page owns one SHAKE256 stream and repeated [`Field::random`]
+/// Each page owns one Blake2b stream and exact canonical rejection-sampling
 /// calls consume that stream sequentially. Pages may be derived in parallel,
 /// while concatenation in page-index order preserves deterministic prefix
 /// semantics.
 #[tracing::instrument(skip_all, name = "derive_public_matrix_prefix")]
-#[must_use]
 pub fn derive_public_matrix_prefix<F: Field + CanonicalEncoding>(
     num_field_elements: usize,
     id: &AkitaSetupSeed,
-) -> FlatMatrix<F> {
+) -> Result<FlatMatrix<F>, AkitaError> {
     let mut data = vec![F::zero(); num_field_elements];
     cfg_chunks_mut!(data, id.derivation.page_field_elements())
         .enumerate()
-        .for_each(|(page_index, coeffs)| {
-            let mut page_rng = SetupSeedPageXof::new::<F>(id, page_index);
+        .try_for_each(|(page_index, coeffs)| -> Result<(), AkitaError> {
+            let mut page_rng = SetupSeedPageXof::new::<F>(id, page_index)?;
             for coeff in coeffs.iter_mut() {
-                *coeff = F::random(&mut page_rng);
+                *coeff = page_rng.sample::<F>()?;
             }
-        });
+            Ok(())
+        })?;
 
-    FlatMatrix::from_flat_data(data)
+    Ok(FlatMatrix::from_flat_data(data))
 }
 
 /// Check that a materialized public matrix has exactly the shape declared by
@@ -394,9 +392,12 @@ pub fn validate_public_matrix_matches_seed<F: Field + CanonicalEncoding + Valid>
         .chunks(descriptor.setup_seed.derivation.page_field_elements())
         .enumerate()
     {
-        let mut page_rng = SetupSeedPageXof::new::<F>(&descriptor.setup_seed, page_index);
+        let mut page_rng = SetupSeedPageXof::new::<F>(&descriptor.setup_seed, page_index)
+            .map_err(|e| SerializationError::InvalidData(e.to_string()))?;
         for value in &mut expected[..coeffs.len()] {
-            *value = F::random(&mut page_rng);
+            *value = page_rng
+                .sample::<F>()
+                .map_err(|e| SerializationError::InvalidData(e.to_string()))?;
         }
         if coeffs != &expected[..coeffs.len()] {
             return Err(SerializationError::InvalidData(
@@ -407,70 +408,52 @@ pub fn validate_public_matrix_matches_seed<F: Field + CanonicalEncoding + Valid>
     Ok(())
 }
 
-/// Concrete SHAKE256 XOF reader for one public-matrix page.
-type SetupSeedXofReader = <Shake256 as ExtendableOutput>::Reader;
-
 struct SetupSeedPageXof {
-    reader: SetupSeedXofReader,
+    stream: Blake2bStream,
 }
 
 impl SetupSeedPageXof {
-    fn new<F: Field + CanonicalEncoding>(id: &AkitaSetupSeed, page_index: usize) -> Self {
-        let mut xof = Shake256::default();
-        absorb_len_prefixed(&mut xof, b"domain", PUBLIC_MATRIX_DOMAIN);
-        let derivation_tag = match id.derivation {
-            PublicMatrixDerivation::Shake256PagedV1 => PUBLIC_MATRIX_DERIVATION_TAG,
-        };
-        absorb_len_prefixed(&mut xof, b"derivation", derivation_tag);
-        absorb_len_prefixed(
-            &mut xof,
-            b"page_field_elements",
-            &(id.derivation.page_field_elements() as u64).to_le_bytes(),
-        );
-        absorb_len_prefixed(&mut xof, b"seed", &id.seed);
-        absorb_len_prefixed(&mut xof, b"field", &field_modulus_bytes::<F>());
-        absorb_len_prefixed(&mut xof, b"page", &(page_index as u64).to_le_bytes());
-        Self {
-            reader: xof.finalize_xof(),
+    fn new<F: Field + CanonicalEncoding>(
+        id: &AkitaSetupSeed,
+        page_index: usize,
+    ) -> Result<Self, AkitaError> {
+        let mut context = id.seed.to_vec();
+        context.extend_from_slice(&crate::field_modulus_be_bytes::<F>()?);
+        let page_size = u64::try_from(id.derivation.page_field_elements())
+            .map_err(|_| AkitaError::InvalidSetup("page size exceeds u64".into()))?;
+        let page_index = u64::try_from(page_index)
+            .map_err(|_| AkitaError::InvalidSetup("page index exceeds u64".into()))?;
+        context.extend_from_slice(&page_size.to_le_bytes());
+        context.extend_from_slice(&page_index.to_le_bytes());
+        Ok(Self {
+            stream: Blake2bStream::new(PUBLIC_MATRIX_STREAM_DOMAIN, &context)?,
+        })
+    }
+
+    // Same canonical byte consumption as Jolt Solinas sample_uniform_below:
+    // ceil(modulus_bits/8) LE bytes per attempt, high-bit mask, then reject >=p.
+    // Epoch 6 applies this canonical mapping to every field, including BN254;
+    // BN254 no longer interprets accepted draws as Montgomery residues.
+    // No infallible RngCore adapter can suppress a stream error.
+    fn sample<F: Field + CanonicalEncoding>(&mut self) -> Result<F, AkitaError> {
+        let byte_len = usize::try_from(F::MODULUS_BITS.div_ceil(8))
+            .map_err(|_| AkitaError::InvalidSetup("field width exceeds usize".into()))?;
+        if byte_len == 0 || byte_len > F::NUM_BYTES {
+            return Err(AkitaError::InvalidSetup(
+                "unsupported setup field encoding".into(),
+            ));
+        }
+        let mut bytes = vec![0; F::NUM_BYTES];
+        loop {
+            self.stream.read(&mut bytes[..byte_len])?;
+            if F::MODULUS_BITS % 8 != 0 {
+                bytes[byte_len - 1] &= (1u8 << (F::MODULUS_BITS % 8)) - 1;
+            }
+            if let Some(value) = F::from_bytes_le_checked(&bytes) {
+                return Ok(value);
+            }
         }
     }
-}
-
-fn field_modulus_bytes<F: Field + CanonicalEncoding>() -> [u8; 32] {
-    crate::field_modulus_be_bytes::<F>()
-        .expect("setup fields must have a modulus of at most 256 bits")
-}
-
-impl RngCore for SetupSeedPageXof {
-    fn next_u32(&mut self) -> u32 {
-        let mut buf = [0u8; 4];
-        self.fill_bytes(&mut buf);
-        u32::from_le_bytes(buf)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut buf = [0u8; 8];
-        self.fill_bytes(&mut buf);
-        u64::from_le_bytes(buf)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        XofReader::read(&mut self.reader, dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl CryptoRng for SetupSeedPageXof {}
-
-fn absorb_len_prefixed(xof: &mut Shake256, label: &[u8], data: &[u8]) {
-    xof.update(&(label.len() as u64).to_le_bytes());
-    xof.update(label);
-    xof.update(&(data.len() as u64).to_le_bytes());
-    xof.update(data);
 }
 
 impl Valid for PublicMatrixDerivation {
@@ -486,7 +469,7 @@ impl AkitaSerialize for PublicMatrixDerivation {
         compress: Compress,
     ) -> Result<(), SerializationError> {
         let tag = match self {
-            Self::Shake256PagedV1 => 1u8,
+            Self::Blake2b512PagedV2 => 2u8,
         };
         tag.serialize_with_mode(&mut writer, compress)
     }
@@ -506,7 +489,7 @@ impl AkitaDeserialize for PublicMatrixDerivation {
         _ctx: &(),
     ) -> Result<Self, SerializationError> {
         match u8::deserialize_with_mode(&mut reader, compress, validate, &())? {
-            1 => Ok(Self::Shake256PagedV1),
+            2 => Ok(Self::Blake2b512PagedV2),
             tag => Err(SerializationError::InvalidData(format!(
                 "unsupported public matrix derivation tag {tag}"
             ))),
@@ -812,7 +795,8 @@ mod tests {
         use crate::proof::{RingVec, SetupPrefixPublicCommitment, SetupPrefixVerifierSlot};
 
         let setup_seed = seed([7u8; 32]);
-        let shared_matrix = derive_public_matrix_prefix::<F>(2 * D, &setup_seed.setup_seed);
+        let shared_matrix =
+            derive_public_matrix_prefix::<F>(2 * D, &setup_seed.setup_seed).unwrap();
         let mut prefix_slots = SetupPrefixVerifierRegistry::new(setup_seed.setup_seed.clone());
         let d_setup = 64;
         let commitment_params = prefix_commitment_params(d_setup, d_setup);
@@ -875,7 +859,8 @@ mod tests {
     #[test]
     fn verifier_setup_rejects_prefix_registry_from_another_public_matrix() {
         let setup_seed = seed([7u8; 32]);
-        let shared_matrix = derive_public_matrix_prefix::<F>(2 * D, &setup_seed.setup_seed);
+        let shared_matrix =
+            derive_public_matrix_prefix::<F>(2 * D, &setup_seed.setup_seed).unwrap();
         let expanded = Arc::new(
             AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(
                 setup_seed,
@@ -883,7 +868,7 @@ mod tests {
             ),
         );
         let foreign_registry =
-            SetupPrefixVerifierRegistry::new(AkitaSetupSeed::shake256_paged_v1([9u8; 32]));
+            SetupPrefixVerifierRegistry::new(AkitaSetupSeed::blake2b512_paged_v2([9u8; 32]));
 
         let err = AkitaVerifierSetup::from_parts(expanded, foreign_registry)
             .expect_err("cross-seed prefix registry must be rejected");
@@ -894,8 +879,8 @@ mod tests {
     fn strict_verifier_setup_decode_rejects_matrix_not_derived_from_seed() {
         let descriptor = seed([7u8; 32]);
         let setup_seed = descriptor.setup_seed.clone();
-        let wrong_seed = AkitaSetupSeed::shake256_paged_v1([9u8; 32]);
-        let wrong_matrix = derive_public_matrix_prefix::<F>(2 * D, &wrong_seed);
+        let wrong_seed = AkitaSetupSeed::blake2b512_paged_v2([9u8; 32]);
+        let wrong_matrix = derive_public_matrix_prefix::<F>(2 * D, &wrong_seed).unwrap();
         let setup = AkitaVerifierSetup {
             expanded: Arc::new(
                 AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(
@@ -920,7 +905,7 @@ mod tests {
     fn strict_verifier_setup_decode_rejects_truncated_seed_prefix_matrix() {
         let descriptor = seed([7u8; 32]);
         let setup_seed = descriptor.setup_seed.clone();
-        let short_matrix = derive_public_matrix_prefix::<F>(D, &setup_seed);
+        let short_matrix = derive_public_matrix_prefix::<F>(D, &setup_seed).unwrap();
         let setup = AkitaVerifierSetup {
             expanded: Arc::new(
                 AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(
@@ -989,17 +974,17 @@ mod tests {
 
     #[test]
     fn flat_derivation_is_deterministic_for_same_seed() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([42u8; 32]);
-        let m1 = derive_public_matrix_prefix::<SmallF>(15 * SMALL_D, &seed);
-        let m2 = derive_public_matrix_prefix::<SmallF>(15 * SMALL_D, &seed);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([42u8; 32]);
+        let m1 = derive_public_matrix_prefix::<SmallF>(15 * SMALL_D, &seed).unwrap();
+        let m2 = derive_public_matrix_prefix::<SmallF>(15 * SMALL_D, &seed).unwrap();
         assert_eq!(m1, m2);
     }
 
     #[test]
     fn flat_derivation_is_prefix_stable() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([7u8; 32]);
-        let small = derive_public_matrix_prefix::<SmallF>(6 * SMALL_D, &seed);
-        let large = derive_public_matrix_prefix::<SmallF>(24 * SMALL_D, &seed);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([7u8; 32]);
+        let small = derive_public_matrix_prefix::<SmallF>(6 * SMALL_D, &seed).unwrap();
+        let large = derive_public_matrix_prefix::<SmallF>(24 * SMALL_D, &seed).unwrap();
         let small_view = small.ring_view::<SMALL_D>(1, 6).unwrap();
         let large_view = large.ring_view::<SMALL_D>(1, 6).unwrap();
         for c in 0..6 {
@@ -1009,11 +994,11 @@ mod tests {
 
     #[test]
     fn flat_derivation_matches_sequential_page_stream() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([5u8; 32]);
-        let got = derive_public_matrix_prefix::<SmallF>(6 * SMALL_D, &seed);
-        let mut page = SetupSeedPageXof::new::<SmallF>(&seed, 0);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([5u8; 32]);
+        let got = derive_public_matrix_prefix::<SmallF>(6 * SMALL_D, &seed).unwrap();
+        let mut page = SetupSeedPageXof::new::<SmallF>(&seed, 0).unwrap();
         let expected = (0..6 * SMALL_D)
-            .map(|_| SmallF::random(&mut page))
+            .map(|_| page.sample::<SmallF>().unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(got.as_field_slice(), expected.as_slice());
@@ -1021,19 +1006,21 @@ mod tests {
 
     #[test]
     fn flat_derivation_is_independent_of_ring_dimension() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([17u8; 32]);
-        let d64 = derive_public_matrix_prefix::<SmallF>(8 * 64, &seed);
-        let d128 = derive_public_matrix_prefix::<SmallF>(4 * 128, &seed);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([17u8; 32]);
+        let d64 = derive_public_matrix_prefix::<SmallF>(8 * 64, &seed).unwrap();
+        let d128 = derive_public_matrix_prefix::<SmallF>(4 * 128, &seed).unwrap();
 
         assert_eq!(d64.as_field_slice(), d128.as_field_slice());
     }
 
     #[test]
     fn flat_derivation_is_prefix_stable_across_page_boundary() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([23u8; 32]);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([23u8; 32]);
         let page_field_elements = seed.derivation.page_field_elements();
-        let through_page_zero = derive_public_matrix_prefix::<SmallF>(page_field_elements, &seed);
-        let into_page_one = derive_public_matrix_prefix::<SmallF>(page_field_elements + 64, &seed);
+        let through_page_zero =
+            derive_public_matrix_prefix::<SmallF>(page_field_elements, &seed).unwrap();
+        let into_page_one =
+            derive_public_matrix_prefix::<SmallF>(page_field_elements + 64, &seed).unwrap();
 
         assert_eq!(
             through_page_zero.as_field_slice(),
@@ -1043,10 +1030,10 @@ mod tests {
 
     #[test]
     fn paged_derivation_golden_vector() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([31u8; 32]);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([31u8; 32]);
         fn samples<F: Field + CanonicalEncoding>(seed: &AkitaSetupSeed) -> [u128; 3] {
             let page_field_elements = seed.derivation.page_field_elements();
-            let derived = derive_public_matrix_prefix::<F>(page_field_elements + 64, seed);
+            let derived = derive_public_matrix_prefix::<F>(page_field_elements + 64, seed).unwrap();
             let canonical = derived
                 .as_field_slice()
                 .iter()
@@ -1065,22 +1052,30 @@ mod tests {
 
         assert_eq!(
             samples::<Prime32Offset99>(&seed),
-            [985_701_565, 215_851_758, 196_317_274]
+            [2_747_537_039, 2_619_083_704, 2_013_241_243]
         );
         assert_eq!(
             samples::<Prime64Offset59>(&seed),
             [
-                15_459_661_060_209_904_737,
-                1_106_841_764_157_043_686,
-                11_841_567_322_073_738_392,
+                12_648_695_004_588_512_934,
+                3_344_598_516_900_523_574,
+                897_125_855_502_376_385,
+            ]
+        );
+        assert_eq!(
+            samples::<Prime128OffsetA7F7>(&seed),
+            [
+                145_959_443_756_467_794_520_262_854_373_472_073_634,
+                223_713_176_082_637_938_135_576_771_346_588_946_760,
+                241_518_123_698_792_648_615_314_846_481_604_222_190,
             ]
         );
         assert_eq!(
             samples::<Prime128Offset275>(&seed),
             [
-                9_840_922_769_526_400_152_209_492_837_491_680_711,
-                87_058_165_705_274_552_119_584_186_413_843_782_366,
-                214_441_952_004_995_181_775_787_633_634_410_275_750,
+                247_240_647_133_723_316_793_221_735_485_723_619_175,
+                158_173_053_057_120_683_187_633_514_183_428_704_954,
+                72_128_563_880_154_482_315_034_442_191_864_010_376,
             ]
         );
     }
@@ -1089,26 +1084,137 @@ mod tests {
     fn page_xof_binds_the_field_modulus() {
         type OtherF = Fp32<4294967291>;
 
-        let seed = AkitaSetupSeed::shake256_paged_v1([29u8; 32]);
-        let mut small = SetupSeedPageXof::new::<SmallF>(&seed, 0);
-        let mut other = SetupSeedPageXof::new::<OtherF>(&seed, 0);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([29u8; 32]);
+        let mut small = SetupSeedPageXof::new::<SmallF>(&seed, 0).unwrap();
+        let mut other = SetupSeedPageXof::new::<OtherF>(&seed, 0).unwrap();
         let mut small_bytes = [0u8; 32];
         let mut other_bytes = [0u8; 32];
-        small.fill_bytes(&mut small_bytes);
-        other.fill_bytes(&mut other_bytes);
+        small.stream.read(&mut small_bytes).unwrap();
+        other.stream.read(&mut other_bytes).unwrap();
 
         assert_ne!(small_bytes, other_bytes);
     }
 
     #[test]
     fn different_shapes_from_same_flat() {
-        let seed = AkitaSetupSeed::shake256_paged_v1([13u8; 32]);
-        let flat = derive_public_matrix_prefix::<SmallF>(12 * SMALL_D, &seed);
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([13u8; 32]);
+        let flat = derive_public_matrix_prefix::<SmallF>(12 * SMALL_D, &seed).unwrap();
         let view_3x4 = flat.ring_view::<SMALL_D>(3, 4).unwrap();
         let view_2x6 = flat.ring_view::<SMALL_D>(2, 6).unwrap();
 
         assert_eq!(view_3x4.row(0).unwrap()[0], view_2x6.row(0).unwrap()[0]);
         assert_eq!(view_3x4.row(0).unwrap()[3], view_2x6.row(0).unwrap()[3]);
         assert_ne!(view_3x4.row(1).unwrap()[0], view_2x6.row(1).unwrap()[0]);
+    }
+    #[test]
+    fn canonical_sampler_matches_solinas_field_random() {
+        use rand_core::RngCore;
+        struct TestRng(Blake2bStream);
+        impl RngCore for TestRng {
+            fn fill_bytes(&mut self, out: &mut [u8]) {
+                self.0.read(out).unwrap();
+            }
+            fn next_u32(&mut self) -> u32 {
+                let mut b = [0; 4];
+                self.fill_bytes(&mut b);
+                u32::from_le_bytes(b)
+            }
+            fn next_u64(&mut self) -> u64 {
+                let mut b = [0; 8];
+                self.fill_bytes(&mut b);
+                u64::from_le_bytes(b)
+            }
+            fn try_fill_bytes(&mut self, out: &mut [u8]) -> Result<(), rand_core::Error> {
+                self.fill_bytes(out);
+                Ok(())
+            }
+        }
+        fn check<F: Field + CanonicalEncoding>() {
+            let seed = AkitaSetupSeed::blake2b512_paged_v2([71; 32]);
+            let mut page = SetupSeedPageXof::new::<F>(&seed, 0).unwrap();
+            let mut native = TestRng(page.stream.clone());
+            for _ in 0..257 {
+                assert_eq!(page.sample::<F>().unwrap(), F::random(&mut native));
+            }
+        }
+        check::<jolt_field::Prime24Offset3>();
+        check::<Prime32Offset99>();
+        check::<Prime64Offset59>();
+        check::<Prime128Offset275>();
+        check::<Prime128OffsetA7F7>();
+    }
+    #[test]
+    fn production_a7f7_sampling_consumption_vector() {
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([71; 32]);
+        let mut page = SetupSeedPageXof::new::<Prime128OffsetA7F7>(&seed, 0).unwrap();
+        // Independent hashlib vector: eight accepted 16-byte draws, then suffix.
+        let expected = [
+            291_247_137_895_573_119_295_029_205_577_813_119_110,
+            68_153_673_745_160_040_577_167_392_256_230_836_239,
+            322_881_561_755_709_032_477_739_425_028_150_445_207,
+            256_231_412_712_432_632_834_658_260_240_473_882_569,
+            22_036_653_535_127_250_014_525_428_159_420_818_066,
+            5_224_142_567_341_477_832_753_305_482_197_751_646,
+            256_599_641_076_248_507_490_914_711_564_464_170_851,
+            14_580_395_030_421_277_202_459_756_261_464_921_725,
+        ];
+        for value in expected {
+            assert_eq!(
+                page.sample::<Prime128OffsetA7F7>()
+                    .unwrap()
+                    .to_u128_checked(),
+                Some(value)
+            );
+        }
+        let mut suffix = [0; 16];
+        page.stream.read(&mut suffix).unwrap();
+        assert_eq!(
+            suffix,
+            [
+                0x65, 0xba, 0x23, 0xce, 0x8a, 0xf3, 0xcd, 0xd2, 0x88, 0xff, 0x84, 0x52, 0x5e, 0xc3,
+                0x95, 0xf1
+            ]
+        );
+    }
+    #[test]
+    fn bn254_canonical_sampling_vector_and_rejected_draw_consumption() {
+        use jolt_field::Fr;
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([71; 32]);
+        let mut page = SetupSeedPageXof::new::<Fr>(&seed, 0).unwrap();
+        // Independent hashlib vector: eight accepts consume nine 32-byte draws.
+        let expected = [
+            "ec97d172dc9d293a507d1c07d96c8adfa2daef9e0c1aa200154a2139a73b0400",
+            "83c63e5d497ae61f482d54ebb93243e0ced13578b7f32d1c445608d727e34f08",
+            "e8b93770986657dd93bcebf277184cff07b524314b2ab35d01e4069d9754c42b",
+            "d7b87b850e5aad8a5842e2f7279c1e9c35c9f415604895164e1bb968f164f405",
+            "1ac91ed87787de6529e8c1fcbf4c89fc58a11bc991fc4d420bbba3c7fd6a6d20",
+            "95690b2ab3056187ef04e921f992f682f343a54daa28916b5ece95eefbb62b0b",
+            "6f4252bd0eab3c123779ba8149e4ae3754b3079b78a3620fa153511bd3363428",
+            "7a5dae878d089bca2cf5e7485f19db81cf152989a27c657a024965196606540d",
+        ];
+        let decode = |hex: &str| {
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for hex in expected {
+            let canonical = Fr::from_bytes_le_checked(&decode(hex)).unwrap();
+            assert_eq!(page.sample::<Fr>().unwrap(), canonical);
+        }
+        let mut suffix = [0; 32];
+        page.stream.read(&mut suffix).unwrap();
+        assert_eq!(
+            suffix.as_slice(),
+            decode("eeaf15d72efdd3335d1bf8791a56549aeae65173ebb8fdb6d76f20db1a00ae5c")
+        );
+    }
+    #[test]
+    fn old_setup_derivation_tag_is_rejected() {
+        assert!(PublicMatrixDerivation::deserialize_compressed(&[1u8][..], &()).is_err());
+        assert_eq!(
+            PublicMatrixDerivation::deserialize_compressed(&[2u8][..], &()).unwrap(),
+            PublicMatrixDerivation::Blake2b512PagedV2
+        );
     }
 }

@@ -144,7 +144,7 @@ impl IndexedChallengeWorker {
         cfg: &SparseChallengeConfig,
     ) -> Result<SparseChallenge, AkitaError> {
         self.cursor
-            .reset_indexed_prefix(&self.prefix, coordinate_index);
+            .reset_indexed_prefix(&self.prefix, coordinate_index)?;
         let IndexedSamplingPolicy::OperatorNorm { threshold, table } = &self.policy else {
             self.scratch
                 .sample(&mut self.cursor, ring_d, cfg.count_pm1, cfg.count_pm2)?;
@@ -181,8 +181,7 @@ pub(crate) fn sample_indexed_challenges_from_seed(
         AkitaError::InvalidSetup("sparse challenge coordinate index exceeds u64".into())
     })?;
     let policy = IndexedSamplingPolicy::new(ring_d, cfg, rejection)?;
-    let prefix =
-        IndexedXofPrefix::new(seed).map_err(|message| AkitaError::InvalidSetup(message.into()))?;
+    let prefix = IndexedXofPrefix::new(seed)?;
     #[cfg(feature = "parallel")]
     {
         let work = n
@@ -276,6 +275,8 @@ where
     let seed = transcript.challenge_block(CHALLENGE_SPARSE_CHALLENGE);
     sample_indexed_challenges_from_seed(&seed, ring_d, n, cfg, None)
 }
+
+pub use xof::SPARSE_CHALLENGE_STREAM_DOMAIN;
 
 #[cfg(test)]
 mod tests {

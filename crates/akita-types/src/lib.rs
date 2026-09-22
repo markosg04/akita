@@ -157,7 +157,7 @@ pub use proof::{
     TerminalLevelProofShape, TerminalResponse, TerminalResponseGroupParts, TerminalResponseShape,
     TerminalWitnessTranscriptParts, WitnessCoefficientSink,
     MAX_GENERIC_SETUP_DECODE_FIELD_ELEMENTS, MAX_UNTRUSTED_COMMITMENT_COEFFICIENTS,
-    SETUP_PREFIX_CONTENT_TAG, SETUP_SUMCHECK_DEGREE,
+    PUBLIC_MATRIX_STREAM_DOMAIN, SETUP_PREFIX_CONTENT_TAG, SETUP_SUMCHECK_DEGREE,
 };
 pub use proof::{
     append_digit_range_child_claims, batch_l2_virtual_evaluations, reconstruct_l2_sq_from_gram,

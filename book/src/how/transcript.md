@@ -59,8 +59,8 @@ opening methods.
 
 ### One indexed stream per coordinate
 
-For coordinate index $i$, the sampler initializes a fresh SHAKE256 reader
-from
+For coordinate index $i$, the sampler initializes a fresh Blake2b-512 counter stream under
+`akita/sparse-challenge/blake2b512/v1` with context
 
 ```text
 group_root || little_endian_u64(i).
@@ -113,7 +113,7 @@ Implementation:
 
 - `crates/akita-challenges/src/fold_draw.rs` binds the group context and owns
   the single transcript squeeze.
-- `crates/akita-challenges/src/sampler/xof.rs` defines the indexed SHAKE256
+- `crates/akita-challenges/src/sampler/xof.rs` defines the indexed Blake2b-512
   stream and unbiased bounded draws.
 - `crates/akita-challenges/src/sampler/position_sample.rs` implements the
   partial Fisher--Yates paths.

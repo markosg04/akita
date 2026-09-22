@@ -9,6 +9,10 @@ pub mod checked;
 /// Errors that can occur in Akita PCS operations.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AkitaError {
+    /// A deterministic stream consumed its complete u64 block-counter domain.
+    #[error("deterministic Blake2b stream exhausted")]
+    RandomStreamExhausted,
+
     /// Proof verification failed.
     #[error("Invalid proof")]
     InvalidProof,

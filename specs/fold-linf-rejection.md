@@ -1,5 +1,8 @@
 # Spec: Folded-Witness ∞-Norm Grinding
 
+> The epoch-5 SHAKE derivation passages below are historical. Protocol epoch 6
+> supersedes those bytes and identities; see [Blake-only migration](blake-only-migration.md).
+
 | Field | Value |
 |---|---|
 | Author(s) | Quang Dao |

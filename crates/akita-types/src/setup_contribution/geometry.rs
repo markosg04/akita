@@ -379,7 +379,7 @@ mod tests {
             num_field_elements: 32,
             setup_seed: [1u8; 32].into(),
         };
-        let shared = crate::derive_public_matrix_prefix::<F>(32, &seed.setup_seed);
+        let shared = crate::derive_public_matrix_prefix::<F>(32, &seed.setup_seed).unwrap();
         let expanded =
             crate::AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(seed, shared);
         let err = ensure_setup_envelope(&expanded, 2, 32).expect_err("undersized");

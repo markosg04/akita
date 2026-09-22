@@ -46,11 +46,6 @@ fn schedule_is_replayable_with_akita_labels() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../fixtures/jolt-field-cutover/transcript.txt"
     ));
-    #[cfg(feature = "transcript-keccak")]
-    let expected = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/jolt-field-cutover/transcript-keccak.txt"
-    ));
     let actual = [
         prover_challenges.0.to_u64_checked().unwrap(),
         prover_challenges.1.to_u64_checked().unwrap(),

@@ -1,21 +1,19 @@
 //! Protocol transcript contracts and implementations.
 
+pub mod blake2b_stream;
 mod grinding;
 mod label;
 pub mod labels;
 #[cfg(feature = "logging-transcript")]
 mod logging;
-#[cfg(any(
-    all(feature = "transcript-blake2b", not(feature = "transcript-keccak")),
-    all(feature = "transcript-keccak", not(feature = "transcript-blake2b"))
-))]
+#[cfg(feature = "transcript-blake2b")]
 mod sponge;
 
-#[cfg(not(any(feature = "transcript-blake2b", feature = "transcript-keccak")))]
-compile_error!("enable exactly one transcript backend: transcript-blake2b or transcript-keccak");
+#[cfg(not(feature = "transcript-blake2b"))]
+compile_error!("protocol epoch 6 requires transcript-blake2b");
 
-#[cfg(all(feature = "transcript-blake2b", feature = "transcript-keccak"))]
-compile_error!("enable exactly one transcript backend: transcript-blake2b or transcript-keccak");
+#[cfg(feature = "transcript-keccak")]
+compile_error!("protocol epoch 6 requires transcript-blake2b; Keccak is retired");
 
 use akita_serialization::AkitaSerialize;
 use jolt_field::{CanonicalEncoding, ExtField, Field};
@@ -28,11 +26,8 @@ pub use grinding::{
 pub use label::Label;
 #[cfg(feature = "logging-transcript")]
 pub use logging::{clear_thread_events, thread_events, LoggingTranscript, TranscriptEvent};
-#[cfg(any(
-    all(feature = "transcript-blake2b", not(feature = "transcript-keccak")),
-    all(feature = "transcript-keccak", not(feature = "transcript-blake2b"))
-))]
-pub use sponge::{AkitaTranscript, TranscriptSponge, PROTOCOL_TAG};
+#[cfg(feature = "transcript-blake2b")]
+pub use sponge::{AkitaTranscript, TranscriptSponge, PROTOCOL_TAG, SESSION_DOMAIN_TAG};
 
 /// Transcript interface for protocol Fiat-Shamir transforms.
 ///

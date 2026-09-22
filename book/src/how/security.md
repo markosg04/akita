@@ -341,8 +341,8 @@ family, group order, claim count, and block count. After challenge folding, the
 prover binds `Q_pack` and the next witness before sampling `alpha`.
 
 Both opening methods squeeze one dedicated 32-byte root per commitment group.
-They then derive coordinate `(claim, block)` from a fresh SHAKE256 stream whose
-input is exactly that root followed by the claim-major coordinate index as a
+They then derive coordinate `(claim, block)` from a fresh framed Blake2b-512 counter stream under
+`akita/sparse-challenge/blake2b512/v1`, whose context is that root followed by the claim-major coordinate index as a
 little-endian `u64`. The fixed widths make this encoding unambiguous. The
 coordinate streams do not mutate the live transcript. Sequential and parallel
 samplers therefore return the same ordered vector, and one coordinate can be
