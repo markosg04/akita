@@ -108,7 +108,8 @@ jobs:
 
   test:
     name: Test (${{ matrix.shard }}/${{ strategy.job-total }})
-    runs-on: GitHubRunner-Large-Public
+    runs-on: ${{ github.repository == 'LayerZero-Labs/akita' && 'GitHubRunner-Large-Public' || 'ubuntu-latest' }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
