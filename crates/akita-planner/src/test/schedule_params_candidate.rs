@@ -1,5 +1,3 @@
-#[cfg(feature = "catalog-gen")]
-use super::recursive::RecursiveRelationCandidate;
 use super::recursive::{
     recursive_candidate_order_key, recursive_split_lower_bound, recursive_split_search_domain,
     RecursiveSplitLowerBoundInput,
@@ -493,7 +491,7 @@ fn packing_split_bounds_preserve_the_exhaustive_candidate_frontier() {
                 FoldCandidatePolicy::Frontier(split_bounds),
             )
         };
-        let canonical = |candidates: Vec<(RecursiveRelationCandidate, usize)>| {
+        let canonical = |candidates: Vec<(CommittedGroupParams, usize)>| {
             candidates
                 .into_iter()
                 .map(|(candidate, next)| (candidate.canonical_descriptor_bytes(), next))
