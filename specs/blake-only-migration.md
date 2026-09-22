@@ -54,8 +54,11 @@ vectors. The production path no longer uses an infallible RngCore adapter.
 
 ## Identity and migration audit
 
-- Instance descriptor version is 6; the existing decoder rejects every other
-  version before accepting descriptor contents.
+- Instance descriptor version is 6. Checked decoding (`Validate::Yes`) and
+  `Valid::check` reject every other version; unchecked decoding does not.
+  Production verification constructs a fresh v6 descriptor from active
+  configuration, setup and call before transcript replay. Callers using
+  unchecked parsing remain responsible for validation.
 - Public setup derivation wire tag is 2; the decoder rejects the retired tag 1.
   The default seed conversion selects the new derivation. Public expansion and
   validated deserialization both use the same new fallible implementation.
@@ -79,7 +82,9 @@ rejected. No runtime Poseidon was found.
 ## Reproduction and evidence
 
 `python3 scripts/blake_only_vectors.py` emits independent Python hashlib
-stream blocks, setup boundary samples, BN254 canonical samples and consumption,
+stream blocks, setup boundary samples (including the production A7F7 modulus
+2^128 - 2^32 + 22537 at indices 0/4095/4096), A7F7 candidate consumption and
+following suffix, BN254 canonical samples and consumption,
 and v2 duplex challenges (including the label-schedule fixture). Rust tests pin those values. The initial label-schedule Python oracle omitted
 public-message framing and failed. It was corrected from the production
 `FramedBytes::encode` rule (`u64le(message.len) || message`) for each individual

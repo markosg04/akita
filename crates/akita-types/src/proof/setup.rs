@@ -1063,6 +1063,14 @@ mod tests {
             ]
         );
         assert_eq!(
+            samples::<Prime128OffsetA7F7>(&seed),
+            [
+                145_959_443_756_467_794_520_262_854_373_472_073_634,
+                223_713_176_082_637_938_135_576_771_346_588_946_760,
+                241_518_123_698_792_648_615_314_846_481_604_222_190,
+            ]
+        );
+        assert_eq!(
             samples::<Prime128Offset275>(&seed),
             [
                 247_240_647_133_723_316_793_221_735_485_723_619_175,
@@ -1133,6 +1141,40 @@ mod tests {
         check::<Prime32Offset99>();
         check::<Prime64Offset59>();
         check::<Prime128Offset275>();
+        check::<Prime128OffsetA7F7>();
+    }
+    #[test]
+    fn production_a7f7_sampling_consumption_vector() {
+        let seed = AkitaSetupSeed::blake2b512_paged_v2([71; 32]);
+        let mut page = SetupSeedPageXof::new::<Prime128OffsetA7F7>(&seed, 0).unwrap();
+        // Independent hashlib vector: eight accepted 16-byte draws, then suffix.
+        let expected = [
+            291_247_137_895_573_119_295_029_205_577_813_119_110,
+            68_153_673_745_160_040_577_167_392_256_230_836_239,
+            322_881_561_755_709_032_477_739_425_028_150_445_207,
+            256_231_412_712_432_632_834_658_260_240_473_882_569,
+            22_036_653_535_127_250_014_525_428_159_420_818_066,
+            5_224_142_567_341_477_832_753_305_482_197_751_646,
+            256_599_641_076_248_507_490_914_711_564_464_170_851,
+            14_580_395_030_421_277_202_459_756_261_464_921_725,
+        ];
+        for value in expected {
+            assert_eq!(
+                page.sample::<Prime128OffsetA7F7>()
+                    .unwrap()
+                    .to_u128_checked(),
+                Some(value)
+            );
+        }
+        let mut suffix = [0; 16];
+        page.stream.read(&mut suffix).unwrap();
+        assert_eq!(
+            suffix,
+            [
+                0x65, 0xba, 0x23, 0xce, 0x8a, 0xf3, 0xcd, 0xd2, 0x88, 0xff, 0x84, 0x52, 0x5e, 0xc3,
+                0x95, 0xf1
+            ]
+        );
     }
     #[test]
     fn bn254_canonical_sampling_vector_and_rejected_draw_consumption() {

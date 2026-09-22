@@ -30,6 +30,20 @@ def setup_samples(bits, offset):
     return result
 
 
+def a7f7_samples():
+    modulus = 2**128 - 2**32 + 22537
+    context = bytes([71])*32 + modulus.to_bytes(32, 'big') + struct.pack('<QQ', 4096, 0)
+    domain = b'akita/public-matrix/blake2b512-paged/v2'
+    raw = b''.join(block(domain, context, i) for i in range(4))
+    values, consumed = [], 0
+    while len(values) < 8:
+        candidate = int.from_bytes(raw[consumed:consumed+16], 'little')
+        consumed += 16
+        if candidate < modulus:
+            values.append(candidate)
+    return dict(values=values, consumed=consumed, suffix=raw[consumed:consumed+16].hex())
+
+
 def bn254_samples():
     modulus = 21888242871839275222246405745257275088548364400416034343698204186575808495617
     context = bytes([71])*32 + modulus.to_bytes(32, 'big') + struct.pack('<QQ', 4096, 0)
@@ -83,4 +97,6 @@ if __name__ == '__main__':
         'transcript': transcript_challenge(),
         'transcript_schedule': transcript_schedule(),
         'bn254_canonical': bn254_samples(),
+        'a7f7_boundary': setup_samples(128, 2**32 - 22537),
+        'a7f7_consumption': a7f7_samples(),
     }, indent=2))
