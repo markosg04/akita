@@ -69,7 +69,7 @@ pub(crate) enum Decision {
 /// error bound `eps_root`, with accumulator overflow validated for a stated
 /// `max_l1` / `max_t`.
 #[derive(Debug, Clone)]
-pub(crate) struct OpNormTable {
+pub struct OpNormTable {
     d: usize,
     q: u32,
     /// Certified `2^q cos/sin(pi t / D)` source tables, retained only for the
@@ -91,6 +91,22 @@ pub(crate) struct OpNormTable {
 }
 
 impl OpNormTable {
+    /// Fixed-point exponent of the actual production tables.
+    pub fn fractional_bits(&self) -> u32 {
+        self.q
+    }
+
+    /// Actual table enclosure error; distinct from a policy containment ceiling.
+    pub fn root_coordinate_error(&self) -> i128 {
+        self.eps_root
+    }
+
+    /// Certified transposed coefficients, indexed by position*(D/2)+frequency.
+    /// Slices are immutable and contain exactly D*(D/2) entries each.
+    pub fn frequency_tables(&self) -> (&[i64], &[i64]) {
+        (&self.freq_cos_at, &self.freq_sin_at)
+    }
+
     /// Build the certified table for ring degree `d` at fixed-point scale `q`,
     /// validating that the predicate's `i128` accumulators cannot overflow for
     /// any challenge with `||c||_1 <= max_l1` and any threshold `t <= max_t`.
@@ -224,7 +240,7 @@ impl OpNormTable {
     }
 
     /// Slice form of the production (strict) predicate for stack-buffered rejection draws.
-    pub(crate) fn accept_strict_parts(
+    pub fn accept_strict_parts(
         &self,
         positions: &[u32],
         coeffs: &[i8],

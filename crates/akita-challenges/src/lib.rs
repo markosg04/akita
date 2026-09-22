@@ -37,6 +37,6 @@ pub use config::{
 pub use fold_draw::{
     fold_challenge_sample_label, FoldChallengeDrawDomain, FoldDraw, LiveFoldDraw, PreviewFoldDraw,
 };
-pub use sampler::sample_sparse_challenges;
+pub use sampler::{d64_selective_l2_op_norm_table, sample_sparse_challenges, OpNormTable};
 
 pub use sampler::SPARSE_CHALLENGE_STREAM_DOMAIN;
