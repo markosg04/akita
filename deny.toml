@@ -1,8 +1,13 @@
 [advisories]
 version = 2
 yanked = "deny"
-# Transitive through spongefish -> Plonky3. No safe upstream replacement exists.
-ignore = ["RUSTSEC-2024-0436"]
+ignore = [
+  # Transitive through spongefish -> Plonky3. No safe upstream replacement exists.
+  "RUSTSEC-2024-0436",
+  # Maintenance advisory: retain bincode 2.0.1 for the existing
+  # bounded, application-trusted binary schedule format. See docs/security-posture.md.
+  "RUSTSEC-2025-0141",
+]
 
 [bans]
 multiple-versions = "warn"
