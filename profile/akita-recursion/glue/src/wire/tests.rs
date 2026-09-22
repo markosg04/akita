@@ -242,7 +242,8 @@ fn strict_setup_decoder_preserves_prefix_slots() {
         num_field_elements: 2 * TEST_D,
         setup_seed: setup_seed.clone(),
     };
-    let shared_matrix = derive_public_matrix_prefix::<TestF>(2 * TEST_D, &setup_seed);
+    let shared_matrix = derive_public_matrix_prefix::<TestF>(2 * TEST_D, &setup_seed)
+        .expect("derive test setup matrix");
     let commitment_params = prefix_commitment_params();
     let matrix = &commitment_params.profile.outer.matrix;
     let payload_coefficients = CompressionChainPlan::for_complete_source(

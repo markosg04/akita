@@ -2,7 +2,7 @@
 use akita_error::AkitaError;
 use akita_transcript::blake2b_stream::Blake2bStream;
 
-/// Domain for root[32] || claim-major coordinate index as LE-u64.
+/// Domain for `root[32] || claim-major coordinate index as LE-u64`.
 pub const SPARSE_CHALLENGE_STREAM_DOMAIN: &[u8] = b"akita/sparse-challenge/blake2b512/v1";
 
 #[derive(Clone)]

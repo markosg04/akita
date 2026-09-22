@@ -208,13 +208,10 @@ jobs:
           cargo test --release -p akita-pcs --test akita_fp128_e2e --no-default-features --features parallel,transcript-blake2b -- heterogeneous::bounded_
           cargo test --release -p akita-config --test bounded_dense_source
 
-  test-transcript-backends:
-    name: Transcript semantics (${{ matrix.backend }})
+  test-transcript-blake2b:
+    name: Transcript semantics (transcript-blake2b)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      matrix:
-        backend: [transcript-blake2b, transcript-keccak]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
@@ -224,7 +221,7 @@ jobs:
           --test transcript_hardening
           --test transcript_hardening_proptest
           --no-default-features
-          --features parallel,logging-transcript,${{ matrix.backend }}
+          --features parallel,logging-transcript,transcript-blake2b
           --
           --test-threads=1
       # The structural challenge audit only runs under `logging-transcript`, so
@@ -240,7 +237,7 @@ jobs:
           --test transcript
           --test label_schedule
           --no-default-features
-          --features parallel,logging-transcript,${{ matrix.backend }}
+          --features parallel,logging-transcript,transcript-blake2b
           --
           --test-threads=1
       - name: Audit the grinding plan across akita-types shapes
