@@ -25,7 +25,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::{OperatorNormRejection, SparseChallenge, SparseChallengeConfig};
 
-use op_norm::OpNormTable;
+pub use op_norm::OpNormTable;
 
 const OP_NORM_PREDICATE_SCALE: u32 = 48;
 const MAX_OP_NORM_ATTEMPTS: usize = 4096;
@@ -73,6 +73,15 @@ static D128_SELECTIVE_L2_OP_NORM_TABLE: LazyLock<Result<Arc<OpNormTable>, &'stat
         }
         Ok(Arc::new(table))
     });
+
+/// The same validated D64 table used by native selective-L2 rejection sampling.
+/// Read-only access lets constrained consumers bind actual constants and error.
+pub fn d64_selective_l2_op_norm_table() -> Result<&'static OpNormTable, AkitaError> {
+    D64_SELECTIVE_L2_OP_NORM_TABLE
+        .as_ref()
+        .map(Arc::as_ref)
+        .map_err(|message| AkitaError::InvalidSetup((*message).into()))
+}
 
 #[derive(Clone)]
 enum IndexedSamplingPolicy {
