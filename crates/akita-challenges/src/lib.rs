@@ -14,7 +14,7 @@
 //! - [`Challenges`] — sampled folding challenges in claim-major block order.
 //!
 //! Sampling uses the signed-sparse path in a private `sampler` submodule. The
-//! SHAKE256-backed XOF cursor is crate-internal and not part of the public API.
+//! Blake2b-backed stream cursor is crate-internal and not part of the public API.
 
 mod challenge;
 mod challenges;
@@ -38,3 +38,5 @@ pub use fold_draw::{
     fold_challenge_sample_label, FoldChallengeDrawDomain, FoldDraw, LiveFoldDraw, PreviewFoldDraw,
 };
 pub use sampler::sample_sparse_challenges;
+
+pub use sampler::SPARSE_CHALLENGE_STREAM_DOMAIN;

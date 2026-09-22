@@ -325,7 +325,7 @@ mod tests {
             setup_seed,
         };
         let shared_matrix =
-            derive_public_matrix_prefix::<F>(natural_field_len, &descriptor.setup_seed);
+            derive_public_matrix_prefix::<F>(natural_field_len, &descriptor.setup_seed).unwrap();
         let expanded = Arc::new(
             AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(
                 descriptor,

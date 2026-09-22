@@ -20,35 +20,22 @@ identity. Loading a cached coefficient matrix checks that it matches the seed.
 
 ### Exact public-stream derivation
 
-`AkitaSetupSeed` contains two values: a 32-byte public seed and a versioned
-derivation method. The current method is `Shake256PagedV1`. Versioning the
-method prevents a change to page size, domain separation, or field sampling
-from silently changing the setup identified by an existing seed.
+`AkitaSetupSeed` contains a 32-byte public seed and the versioned derivation
+`Blake2b512PagedV2` (wire tag 2). Tag 1 is retired and rejected.
 
-The derivation splits the infinite field stream into pages of 4096 elements.
-For page index $i$, it initializes one SHAKE256 stream with the following
-length-prefixed fields, in order:
+The field stream is split into independently derived pages of 4096 elements.
+The domain is `akita/public-matrix/blake2b512-paged/v2`; the context is the seed,
+the field modulus as 32 big-endian bytes, page size as LE-u64, and page index as
+LE-u64. Each 64-byte block is unkeyed Blake2b-512 of
+`u32le(domain.len) || domain || u64le(context.len) || context || u64le(block)`.
+Block counters start at zero. Partial reads preserve their unused suffix;
+exhaustion after the final u64 counter block returns an error without partial output.
 
-| Label | Value |
-| --- | --- |
-| `domain` | `akita/commitment/public-field-stream` |
-| `derivation` | `shake256-paged-v1` |
-| `page_field_elements` | 4096 as little-endian `u64` |
-| `seed` | the 32-byte public seed |
-| `field` | the protocol-field modulus as 32 big-endian bytes |
-| `page` | $i$ as little-endian `u64` |
-
-A length-prefixed field is encoded as the little-endian `u64` length of its
-label, the label, the little-endian `u64` length of its value, and the value.
-The explicit field modulus prevents equal seed bytes from identifying the same
-coefficient stream in two different fields.
-
-The page then calls `Field::random` repeatedly on that SHAKE256 reader. The
-production fields use exact rejection sampling, so this is a uniform field
-stream rather than a fixed-width integer stream reduced modulo the field
-modulus. Pages
-may be generated in parallel; concatenating them by page index gives the same
-prefix as sequential generation.
+Each field attempt reads ceil(modulus-bits / 8) little-endian bytes, masks unused
+high bits and rejects noncanonical values. Epoch 6 uses canonical decoding for
+all fields; BN254 no longer maps accepted bytes as Montgomery residues. Exhaustion propagates through setup
+derivation. Pages may be generated in parallel; concatenating them by page index
+preserves prefix identity. Ring dimension and A/B/D role do not enter this context.
 
 ### One stream, several matrix views
 

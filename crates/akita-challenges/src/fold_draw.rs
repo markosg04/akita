@@ -223,9 +223,8 @@ mod tests {
     use super::*;
     use akita_transcript::labels::DOMAIN_AKITA_PROTOCOL;
     use akita_transcript::AkitaTranscript;
+    use blake2::{Blake2b512, Digest};
     use jolt_field::{Fp64, Ring};
-    use shake::digest::{ExtendableOutput, Update, XofReader};
-    use shake::Shake256;
 
     type TestField = Fp64<4294967197>;
 
@@ -246,20 +245,20 @@ mod tests {
     }
 
     fn challenge_fingerprint(challenges: &Challenges) -> [u8; 32] {
-        let mut xof = Shake256::default();
+        let mut xof = Blake2b512::new();
         xof.update(b"akita/indexed-fold-challenge-test-vector/v1");
         for challenge in challenges.as_slice() {
-            xof.update(&(challenge.positions.len() as u64).to_le_bytes());
+            xof.update((challenge.positions.len() as u64).to_le_bytes());
             for &position in challenge.positions.iter() {
-                xof.update(&position.to_le_bytes());
+                xof.update(position.to_le_bytes());
             }
-            xof.update(&(challenge.coeffs.len() as u64).to_le_bytes());
+            xof.update((challenge.coeffs.len() as u64).to_le_bytes());
             for &coefficient in challenge.coeffs.iter() {
-                xof.update(&coefficient.to_le_bytes());
+                xof.update(coefficient.to_le_bytes());
             }
         }
         let mut fingerprint = [0u8; 32];
-        xof.finalize_xof().read(&mut fingerprint);
+        fingerprint.copy_from_slice(&xof.finalize()[..32]);
         fingerprint
     }
 
@@ -426,42 +425,23 @@ mod tests {
             challenge_fingerprint(&rejected_d64),
             challenge_fingerprint(&rejected_d128),
         ];
-        #[cfg(feature = "transcript-blake2b")]
+        // Production-derived epoch-6 vectors; provenance in specs/blake-only-migration.md.
         let expected = [
             [
-                225, 68, 222, 77, 115, 62, 167, 225, 108, 115, 143, 222, 246, 232, 154, 117, 54,
-                149, 6, 181, 16, 86, 107, 181, 8, 132, 152, 50, 215, 177, 72, 148,
+                123, 63, 185, 246, 170, 67, 147, 2, 10, 76, 88, 151, 99, 214, 142, 114, 59, 234,
+                35, 199, 37, 249, 176, 110, 251, 72, 164, 156, 125, 108, 155, 178,
             ],
             [
-                79, 224, 242, 67, 178, 245, 55, 135, 65, 197, 201, 217, 138, 252, 160, 116, 6, 208,
-                97, 54, 48, 103, 113, 124, 92, 111, 34, 166, 132, 56, 241, 157,
+                216, 132, 231, 125, 20, 25, 169, 82, 196, 204, 152, 36, 168, 183, 84, 59, 192, 62,
+                2, 103, 17, 62, 33, 117, 205, 211, 150, 219, 143, 151, 107, 177,
             ],
             [
-                211, 56, 140, 154, 235, 102, 212, 222, 171, 51, 243, 146, 217, 134, 16, 136, 179,
-                148, 119, 92, 243, 228, 174, 3, 210, 173, 246, 7, 37, 194, 53, 62,
+                162, 174, 81, 62, 20, 79, 61, 219, 150, 246, 242, 77, 104, 189, 124, 240, 244, 74,
+                84, 238, 236, 217, 68, 222, 222, 91, 235, 150, 180, 141, 68, 172,
             ],
             [
-                58, 50, 193, 231, 187, 62, 62, 138, 58, 0, 63, 68, 192, 83, 34, 15, 190, 215, 248,
-                28, 11, 250, 234, 69, 227, 254, 209, 7, 129, 128, 179, 116,
-            ],
-        ];
-        #[cfg(feature = "transcript-keccak")]
-        let expected = [
-            [
-                12, 35, 8, 128, 37, 25, 196, 151, 138, 141, 61, 179, 150, 159, 56, 220, 177, 190,
-                231, 32, 210, 98, 197, 105, 249, 40, 67, 75, 63, 20, 65, 126,
-            ],
-            [
-                76, 222, 54, 199, 84, 130, 152, 62, 173, 18, 255, 189, 122, 49, 90, 186, 235, 104,
-                32, 211, 191, 104, 242, 130, 4, 210, 231, 87, 234, 31, 137, 61,
-            ],
-            [
-                67, 24, 217, 195, 195, 169, 174, 25, 213, 64, 1, 194, 246, 248, 171, 154, 180, 254,
-                50, 133, 110, 73, 142, 85, 50, 124, 227, 48, 239, 34, 229, 69,
-            ],
-            [
-                123, 154, 74, 122, 147, 201, 134, 195, 107, 152, 133, 165, 56, 209, 151, 38, 63,
-                73, 100, 182, 132, 196, 230, 34, 37, 216, 110, 63, 100, 185, 43, 174,
+                44, 200, 126, 215, 97, 214, 141, 52, 89, 126, 227, 62, 208, 125, 72, 83, 38, 223,
+                163, 113, 117, 135, 3, 195, 75, 85, 230, 141, 179, 159, 120, 154,
             ],
         ];
         assert_eq!(fingerprints, expected);

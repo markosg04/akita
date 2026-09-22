@@ -42,11 +42,11 @@ shape, and packed nonce-stream width. The decoder validates the stream byte
 bound and final padding before allocation; replay rejects a wrong site or query
 kind, truncation, incomplete consumption, and an out-of-range nonce.
 
-Sparse fold coordinates are verifier-reachable indexed SHAKE256 queries. Their
+Sparse fold coordinates are verifier-reachable indexed Blake2b-512 counter streams. Their
 group root has a fixed 32-byte boundary, coordinate indices are checked before
-conversion, and buffered fixed-width reads use bounded copies rather than
-panicking slice conversions. A refill boundary changes neither the byte stream
-nor the challenge law.
+conversion, and fixed-width reads propagate typed counter exhaustion without accepting
+a fallback value. Read boundaries change neither the byte stream nor the
+challenge law.
 
 ## Rules
 

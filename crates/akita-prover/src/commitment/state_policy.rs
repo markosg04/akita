@@ -999,7 +999,7 @@ mod tests {
                 max_num_vars: 8,
                 max_num_batched_polys: 1,
                 num_field_elements: 64,
-                setup_seed: AkitaSetupSeed::shake256_paged_v1([7; 32]),
+                setup_seed: AkitaSetupSeed::blake2b512_paged_v2([7; 32]),
             },
             plan,
             1,

@@ -59,7 +59,7 @@ impl<F: Field> AkitaProverSetup<F> {
         })?;
 
         let shared_flat =
-            derive_public_matrix_prefix::<F>(setup_capacity.num_field_elements, &setup_seed);
+            derive_public_matrix_prefix::<F>(setup_capacity.num_field_elements, &setup_seed)?;
         let expanded = Arc::new(
             AkitaExpandedSetup::from_trusted_seed_derived_parts_unchecked(seed, shared_flat),
         );

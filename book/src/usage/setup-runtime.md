@@ -21,8 +21,8 @@ The public matrix stream has one identity across ring dimensions. A trusted
 schedule row takes the exact widths and dimensions needed by each operation from
 a prefix of that stream.
 
-The current identity is `Shake256PagedV1`: independently derived 4096-element
-SHAKE256 pages followed by exact field rejection sampling. [Setup and
+The current identity is `Blake2b512PagedV2`: independently derived 4096-element
+Blake2b-512 counter-stream pages followed by exact field rejection sampling. [Setup and
 commitment](../how/commitment.md#exact-public-stream-derivation) gives the byte
 encoding. A host that regenerates setup must use that versioned derivation,
 not an application-specific PRG expansion of the 32-byte seed.

@@ -47,7 +47,7 @@ impl SignedSparseScratch {
         let mut written = 0;
         while written < self.total {
             let take = (self.total - written).min(SIGN_BYTE_CHUNK);
-            cursor.fill_bytes(&mut sign_bytes[..take]);
+            cursor.fill_bytes(&mut sign_bytes[..take])?;
             for (offset, &b) in sign_bytes[..take].iter().enumerate() {
                 let i = written + offset;
                 let magnitude = if i < count_pm1 { 1 } else { 2 };

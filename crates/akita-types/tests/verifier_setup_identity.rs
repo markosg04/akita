@@ -11,8 +11,8 @@ type F = Prime32Offset99;
 const D: usize = 64;
 
 fn setup(seed_byte: u8) -> AkitaVerifierSetup<F> {
-    let seed = AkitaSetupSeed::shake256_paged_v1([seed_byte; 32]);
-    let matrix = derive_public_matrix_prefix::<F>(2 * D, &seed);
+    let seed = AkitaSetupSeed::blake2b512_paged_v2([seed_byte; 32]);
+    let matrix = derive_public_matrix_prefix::<F>(2 * D, &seed).unwrap();
     let expanded = AkitaExpandedSetup::from_verified_parts(
         AkitaSetupDescriptor {
             max_num_vars: 7,

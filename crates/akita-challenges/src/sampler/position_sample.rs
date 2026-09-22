@@ -166,7 +166,7 @@ fn sample_distinct_positions_into_sparse(
     scratch.prepare(out.len())?;
     scratch.clear();
     for (i, dst) in out.iter_mut().enumerate() {
-        let j = i + cursor.next_usize_mod(universe - i);
+        let j = i + cursor.next_usize_mod(universe - i)?;
         let left = scratch.get(i)?;
         let right = scratch.get(j)?;
         scratch.insert(i, right)?;
@@ -196,7 +196,7 @@ where
         *slot = T::try_from(i).map_err(|_| AkitaError::InvalidProof)?;
     }
     for (i, dst) in out.iter_mut().enumerate() {
-        let j = i + cursor.next_usize_mod(universe - i);
+        let j = i + cursor.next_usize_mod(universe - i)?;
         perm.swap(i, j);
         *dst = u32::from(perm[i]);
     }

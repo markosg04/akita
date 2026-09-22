@@ -9,6 +9,7 @@ repository = "https://github.com/LayerZero-Labs/akita"
 readme = "../../README.md"
 
 [dependencies]
+akita-error = { version = "0.1.0", path = "../akita-error" }
 jolt-field = { version = "=0.1.0", git = "https://github.com/a16z/jolt", rev = "72dc6451628d8b1dd794147a1f1cc40be0d77963", default-features = false, features = [
   "asm",
   "solinas",
@@ -23,10 +24,11 @@ spongefish = { git = "https://github.com/arkworks-rs/spongefish", rev = "d2d190b
 default = ["transcript-blake2b"]
 logging-transcript = []
 # spongefish 0.7 imports StdHash from its prover/verifier/domain modules
-# even when Akita selects Blake2b or Keccak explicitly, so sha3 is required
+# even when Akita selects Blake2b explicitly, so sha3 is required
 # for the crate to compile with default-features disabled.
 transcript-blake2b = ["dep:spongefish", "spongefish/blake2", "spongefish/sha3"]
-transcript-keccak = ["dep:spongefish", "spongefish/keccak", "spongefish/sha3"]
+# Retained only to report a clear compile-time error for retired callers.
+transcript-keccak = []
 
 [lints]
 workspace = true
