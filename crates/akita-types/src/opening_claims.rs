@@ -10,7 +10,9 @@ use crate::{CommittedGroup, GrindingSite, OpeningScheduleSelection, TranscriptGr
 use akita_error::{checked, AkitaError};
 use akita_transcript::labels::ABSORB_BATCH_SHAPE;
 use akita_transcript::{sample_ext_challenge, Transcript};
+#[cfg(not(feature = "blake2-inline"))]
 use blake2::digest::consts::U32;
+#[cfg(not(feature = "blake2-inline"))]
 use blake2::{Blake2b, Digest};
 use jolt_field::{CanonicalEncoding, ExtField, Field};
 
@@ -637,11 +639,21 @@ where
         .collect())
 }
 
+#[cfg(not(feature = "blake2-inline"))]
 fn blake2b_256(bytes: &[u8]) -> DescriptorDigest {
     type Blake2b256 = Blake2b<U32>;
     let digest = Blake2b256::digest(bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
+    out
+}
+
+#[cfg(feature = "blake2-inline")]
+fn blake2b_256(bytes: &[u8]) -> DescriptorDigest {
+    let mut hasher = jolt_inlines_blake2::Blake2b::new_with_output_len(32);
+    hasher.update(bytes);
+    let mut out = [0u8; 32];
+    hasher.finalize_into(&mut out);
     out
 }
 

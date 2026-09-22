@@ -196,6 +196,20 @@ impl<Cfg: CommitmentConfig> TrustedScheduleCatalog<Cfg> {
         Ok(Self::from_validated(catalog))
     }
 
+    /// Load a prepared binary catalog from the application's trusted setup path.
+    /// Audits every available row and binds it to this config. A selected-row
+    /// verifier view retains omitted identities only in its catalog commitment.
+    pub fn from_trusted_artifact_binary(bytes: &[u8]) -> Result<Self, AkitaError> {
+        validate_config_policy::<Cfg>()?;
+        let catalog = ValidatedScheduleCatalog::from_trusted_artifact_binary(
+            bytes,
+            Cfg::schedule_family_name(),
+            &policy_of::<Cfg>(),
+            Cfg::ring_challenge_config,
+        )?;
+        Ok(Self::from_validated(catalog))
+    }
+
     /// The config-free validated catalog used for row lookup and artifact I/O.
     #[must_use]
     pub fn catalog(&self) -> &ValidatedScheduleCatalog {

@@ -9,7 +9,6 @@ use akita_algebra::ntt::tables::{
 };
 use akita_algebra::{
     CrtCapacity, CrtNttParamSet, CyclotomicCrtNtt, I16TailParams, Ifma52NttMatrix, Ifma52Params,
-    MontCoeff,
 };
 use akita_error::AkitaError;
 #[allow(unused_imports)]
@@ -33,11 +32,13 @@ mod prepared_artifact;
 use exact::ifma52_cache_enabled;
 pub use exact::ntt_cache_requires_exactness_tail;
 use exact::{exact_cache_plan, ifma52_cache_enabled_for_ring_dimension, prepare_exact_ntt_cache};
-pub(crate) use prepared_artifact::decode_riscv64_scalar_q128_cache;
 pub use prepared_artifact::{
     build_riscv64_scalar_q128_cache_artifact, prepared_verifier_ntt_cache_metadata,
     PreparedVerifierNttCacheBinding, PreparedVerifierNttCacheMetadata,
     PREPARED_VERIFIER_NTT_CACHE_MAX_BYTES,
+};
+pub(crate) use prepared_artifact::{
+    decode_riscv64_scalar_q128_cache, view_riscv64_scalar_q128_cache,
 };
 
 /// Transform representation stored by one exact-prefix NTT cache entry.
@@ -381,8 +382,69 @@ pub enum NttCacheMode {
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct PreparedI16Tail<const K: usize, const D: usize> {
-    negacyclic: Vec<CyclotomicCrtNtt<i16, 1, D>>,
+    negacyclic: PreparedRows<CyclotomicCrtNtt<i16, 1, D>>,
     params: I16TailParams<K, D>,
+}
+
+/// Prepared transform rows: owned, or viewed in a trusted prepared artifact
+/// that outlives the program (see
+/// [`crate::AkitaVerifierSetup::install_trusted_prepared_verifier_ntt_cache_in_place`]).
+/// `Static` stands in for a `&'static [T]` without a `'static` bound on `T`.
+#[derive(Debug)]
+pub(crate) enum PreparedRows<T> {
+    Owned(Vec<T>),
+    /// Invariant: `ptr` and `len` were taken from a `&'static [T]`.
+    Static {
+        ptr: *const T,
+        len: usize,
+    },
+}
+
+// SAFETY: `Static` is a shared view of immutable memory that lives for the
+// whole program, exactly a `&'static [T]`; `Owned` carries a `Vec<T>`.
+unsafe impl<T: Send + Sync> Send for PreparedRows<T> {}
+// SAFETY: as above; no interior mutability behind the view.
+unsafe impl<T: Sync> Sync for PreparedRows<T> {}
+
+impl<T> PreparedRows<T> {
+    pub(crate) fn from_static(rows: &'static [T]) -> Self {
+        Self::Static {
+            ptr: rows.as_ptr(),
+            len: rows.len(),
+        }
+    }
+}
+
+impl<T> From<Vec<T>> for PreparedRows<T> {
+    fn from(rows: Vec<T>) -> Self {
+        Self::Owned(rows)
+    }
+}
+
+impl<T> FromIterator<T> for PreparedRows<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::Owned(iter.into_iter().collect())
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl<T: Send> rayon::iter::FromParallelIterator<T> for PreparedRows<T> {
+    fn from_par_iter<I: rayon::iter::IntoParallelIterator<Item = T>>(iter: I) -> Self {
+        Self::Owned(iter.into_par_iter().collect())
+    }
+}
+
+impl<T> std::ops::Deref for PreparedRows<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Owned(rows) => rows,
+            // SAFETY: by the `Static` invariant, `ptr`/`len` describe a live
+            // `&'static [T]`.
+            Self::Static { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
 }
 
 /// Read-only view of an exactness-only i16 tail pair.
@@ -465,8 +527,8 @@ enum PreparedNttCacheRepr<const D: usize> {
     },
     #[non_exhaustive]
     Q32 {
-        neg: Option<Vec<CyclotomicCrtNtt<i32, Q32_NUM_PRIMES, D>>>,
-        cyc: Option<Vec<CyclotomicCrtNtt<i32, Q32_NUM_PRIMES, D>>>,
+        neg: Option<PreparedRows<CyclotomicCrtNtt<i32, Q32_NUM_PRIMES, D>>>,
+        cyc: Option<PreparedRows<CyclotomicCrtNtt<i32, Q32_NUM_PRIMES, D>>>,
         params: CrtNttParamSet<i32, Q32_NUM_PRIMES, D>,
         tail: Option<PreparedI16Tail<Q32_NUM_PRIMES, D>>,
         exact: bool,
@@ -478,8 +540,8 @@ enum PreparedNttCacheRepr<const D: usize> {
     },
     #[non_exhaustive]
     Q64 {
-        neg: Option<Vec<CyclotomicCrtNtt<i32, Q64_NUM_PRIMES, D>>>,
-        cyc: Option<Vec<CyclotomicCrtNtt<i32, Q64_NUM_PRIMES, D>>>,
+        neg: Option<PreparedRows<CyclotomicCrtNtt<i32, Q64_NUM_PRIMES, D>>>,
+        cyc: Option<PreparedRows<CyclotomicCrtNtt<i32, Q64_NUM_PRIMES, D>>>,
         params: CrtNttParamSet<i32, Q64_NUM_PRIMES, D>,
         tail: Option<PreparedI16Tail<Q64_NUM_PRIMES, D>>,
         exact: bool,
@@ -488,8 +550,8 @@ enum PreparedNttCacheRepr<const D: usize> {
     Q64Ifma52 { neg: Ifma52NttMatrix<2, D> },
     #[non_exhaustive]
     Q128 {
-        neg: Option<Vec<CyclotomicCrtNtt<i32, Q128_NUM_PRIMES, D>>>,
-        cyc: Option<Vec<CyclotomicCrtNtt<i32, Q128_NUM_PRIMES, D>>>,
+        neg: Option<PreparedRows<CyclotomicCrtNtt<i32, Q128_NUM_PRIMES, D>>>,
+        cyc: Option<PreparedRows<CyclotomicCrtNtt<i32, Q128_NUM_PRIMES, D>>>,
         params: CrtNttParamSet<i32, Q128_NUM_PRIMES, D>,
         tail: Option<PreparedI16Tail<Q128_NUM_PRIMES, D>>,
         exact: bool,
@@ -610,8 +672,8 @@ impl<const D: usize> PreparedNttCacheRepr<D> {
     fn cache_bytes(&self) -> usize {
         macro_rules! bytes {
             ($neg:expr, $cyc:expr, $tail:expr, $k:expr) => {{
-                let base_entries =
-                    $neg.as_ref().map_or(0, Vec::len) + $cyc.as_ref().map_or(0, Vec::len);
+                let base_entries = $neg.as_ref().map_or(0, |rows| rows.len())
+                    + $cyc.as_ref().map_or(0, |rows| rows.len());
                 let base = base_entries * D * $k * core::mem::size_of::<i32>();
                 let tail = $tail.as_ref().map_or(0, |tail| {
                     tail.negacyclic.len() * D * core::mem::size_of::<i16>()
@@ -1086,8 +1148,8 @@ fn prepare_ntt_cache_with_tail_prefix<F: Field + CanonicalEncoding, const D: usi
                 NttCacheMode::BothTransforms => {
                     let (neg, cyc) = convert_flat_pair(matrix, &params);
                     PreparedNttCacheRepr::$variant {
-                        neg: Some(neg),
-                        cyc: Some(cyc),
+                        neg: Some(neg.into()),
+                        cyc: Some(cyc.into()),
                         params,
                         tail: None,
                         exact: false,

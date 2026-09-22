@@ -61,6 +61,7 @@ impl SetupRequirements {
         max_num_vars: usize,
         max_num_batched_polys: usize,
     ) -> Result<Self, AkitaError> {
+        catalog.validate_complete()?;
         validate_setup_capacity_metadata(max_num_vars, max_num_batched_polys)?;
 
         let mut scan = SetupCapacityScan::new();

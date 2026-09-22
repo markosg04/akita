@@ -3,8 +3,7 @@
 use super::CyclotomicRing;
 use crate::fft::field_pow;
 use akita_error::AkitaError;
-use jolt_field::Unreduced;
-use jolt_field::{ExtField, Field, MulBaseUnreduced, Zero};
+use jolt_field::{ExtField, Field, MulBaseUnreduced};
 
 /// Return the first `len` powers of `alpha`, starting with one.
 pub fn scalar_powers<F: Field>(alpha: F, len: usize) -> Vec<F> {
@@ -127,11 +126,7 @@ where
     E: MulBaseUnreduced<F>,
 {
     debug_assert_eq!(alpha_pows.len(), coeffs.len());
-    let accum = coeffs.iter().zip(alpha_pows.iter()).fold(
-        <E as Unreduced>::Product::zero(),
-        |acc, (coeff, alpha_pow)| acc + alpha_pow.mul_base_unreduced(*coeff),
-    );
-    <E as Unreduced>::reduce_product(accum)
+    E::dot_base(alpha_pows, coeffs)
 }
 
 /// Fast (deferred-reduction) counterpart of [`eval_ring_at_pows`].
@@ -160,18 +155,14 @@ where
     E: MulBaseUnreduced<F>,
 {
     debug_assert_eq!(alpha_pows.len(), D);
-    let accum = r.coefficients().iter().zip(alpha_pows.iter()).fold(
-        <E as Unreduced>::Product::zero(),
-        |acc, (coeff, alpha_pow)| acc + alpha_pow.mul_base_unreduced(*coeff),
-    );
-    <E as Unreduced>::reduce_product(accum)
+    E::dot_base(alpha_pows, r.coefficients())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::poly::multilinear_eval;
-    use jolt_field::{CanonicalEncoding, One, Prime128OffsetA7F7};
+    use jolt_field::{CanonicalEncoding, One, Prime128OffsetA7F7, Zero};
 
     type F = Prime128OffsetA7F7;
     const D: usize = 64;

@@ -3,7 +3,14 @@
 //! Block j hashes u32le(domain length) || domain || u64le(context length) ||
 //! context || u64le(j). Counter exhaustion is an atomic, fallible boundary.
 use akita_error::AkitaError;
-use blake2::{Blake2b512, Digest};
+#[cfg(not(feature = "blake2-inline"))]
+use blake2::Blake2b512;
+use blake2::Digest;
+#[cfg(feature = "blake2-inline")]
+use jolt_inlines_blake2::digest_adapter::{Blake2b, U64};
+
+#[cfg(feature = "blake2-inline")]
+type Blake2b512 = Blake2b<U64>;
 
 /// Total bytes in the full u64 counter domain, including the final block.
 pub const BLAKE2B_STREAM_BYTES: u128 = 1u128 << 70;

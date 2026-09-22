@@ -231,6 +231,33 @@ impl<const K: usize> GarnerData<K> {
         if K == 0 {
             return digits;
         }
+        // Fast path: when every modulus is below `2^31` the inner Garner
+        // products (`digit * gamma`, both already reduced below the modulus)
+        // stay within `i64`, so the whole reconstruction runs in native 64-bit
+        // arithmetic. The i128 path pays the guest's soft 128-bit div/rem on
+        // every `rem_euclid`; the small-prime NTTs (the `i32` primes below
+        // `2^30`) never need it. The initial residue reduction stays in i128
+        // so an out-of-range residue is still handled correctly.
+        if moduli.iter().all(|&modulus| modulus < (1u64 << 31)) {
+            let mut digits64 = [0i64; K];
+            digits64[0] = center_mod_i64(
+                residues[0].rem_euclid(i128::from(moduli[0])) as i64,
+                moduli[0] as i64,
+            );
+            for index in 1..K {
+                let modulus = moduli[index] as i64;
+                let mut digit = residues[index].rem_euclid(i128::from(moduli[index])) as i64;
+                for (prior, prior_digit) in digits64.iter().enumerate().take(index) {
+                    digit = (digit - prior_digit).rem_euclid(modulus);
+                    digit = (digit * self.gamma[index][prior] as i64).rem_euclid(modulus);
+                }
+                digits64[index] = center_mod_i64(digit, modulus);
+            }
+            for (digit, digit64) in digits.iter_mut().zip(digits64) {
+                *digit = i128::from(digit64);
+            }
+            return digits;
+        }
         let first_modulus = i128::from(moduli[0]);
         digits[0] = center_mod(residues[0], first_modulus);
         for index in 1..K {
@@ -243,6 +270,15 @@ impl<const K: usize> GarnerData<K> {
             digits[index] = center_mod(digit, modulus);
         }
         digits
+    }
+}
+
+fn center_mod_i64(value: i64, modulus: i64) -> i64 {
+    let value = value.rem_euclid(modulus);
+    if value > modulus / 2 {
+        value - modulus
+    } else {
+        value
     }
 }
 
