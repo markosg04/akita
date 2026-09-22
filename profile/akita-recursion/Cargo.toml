@@ -34,3 +34,20 @@ ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/tw
 ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
+
+# The immutable Jolt SDK anchor otherwise selects pre-Blake upstream Akita.
+# Use the matching public companion source ancestor; Git patches avoid sibling
+# paths and a self-referential pin when this profile lock is committed.
+[patch."https://github.com/LayerZero-Labs/akita.git"]
+akita-algebra = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-challenges = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-config = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-error = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-pcs = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-planner = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-prover = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-schedules = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-serialization = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-transcript = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-types = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
+akita-verifier = { git = "https://github.com/markosg04/akita.git", rev = "2bceddba86e07971bbd0538e46060df3caf3031b" }
