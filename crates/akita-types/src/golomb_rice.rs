@@ -10,11 +10,21 @@ use akita_error::AkitaError;
 pub(crate) struct BitReader<'a> {
     bytes: &'a [u8],
     bit_pos: usize,
+    aligned_words: &'a [u64],
+    aligned_prefix: usize,
 }
 
 impl<'a> BitReader<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, bit_pos: 0 }
+        // SAFETY: every u64 bit pattern is valid and the view is immutable;
+        // align_to supplies only aligned, complete words inside the input.
+        let (prefix, aligned_words, _) = unsafe { bytes.align_to::<u64>() };
+        Self {
+            bytes,
+            bit_pos: 0,
+            aligned_words,
+            aligned_prefix: prefix.len(),
+        }
     }
 
     pub(crate) fn bit_pos(&self) -> usize {
@@ -54,6 +64,10 @@ impl<'a> BitReader<'a> {
             .bit_pos
             .checked_add(needed)
             .ok_or(AkitaError::InvalidProof)?;
+        if let Some(word) = self.word_window(count) {
+            self.bit_pos = end_bit;
+            return Ok(word & ((1u64 << count) - 1));
+        }
         let byte_start = self.bit_pos / 8;
         let byte_end = end_bit.div_ceil(8);
         let bytes = self
@@ -70,6 +84,20 @@ impl<'a> BitReader<'a> {
         Ok(((word >> shift) & mask) as u64)
     }
 
+    #[inline]
+    fn word_window(&self, count: u32) -> Option<u64> {
+        let offset = self.bit_pos.checked_sub(self.aligned_prefix * 8)?;
+        let index = offset / 64;
+        let shift = offset % 64;
+        let low = u64::from_le(*self.aligned_words.get(index)?) >> shift;
+        if shift + count as usize <= 64 {
+            Some(low)
+        } else {
+            let high = u64::from_le(*self.aligned_words.get(index + 1)?);
+            Some(low | (high << (64 - shift)))
+        }
+    }
+
     fn read_unary_ones(&mut self, max_quotient: u64) -> Result<u64, AkitaError> {
         let mut quotient = 0u64;
         loop {
@@ -80,6 +108,22 @@ impl<'a> BitReader<'a> {
             let bit_index = self.bit_pos % 8;
             let byte = *self.bytes.get(byte_index).ok_or(AkitaError::InvalidProof)?;
             let available = 8usize - bit_index;
+            #[cfg(any(target_arch = "riscv64", test))]
+            let ones = {
+                // RV64IM has no count-trailing-zero instruction. Word entries
+                // also avoid a subword load in the guest's unary-prefix loop.
+                const ONES: [usize; 256] = {
+                    let mut table = [0; 256];
+                    let mut value = 0;
+                    while value < table.len() {
+                        table[value] = (value as u8).trailing_ones() as usize;
+                        value += 1;
+                    }
+                    table
+                };
+                ONES[usize::from(byte >> bit_index)].min(available)
+            };
+            #[cfg(not(any(target_arch = "riscv64", test)))]
             let ones = ((byte >> bit_index).trailing_ones() as usize).min(available);
             quotient = quotient
                 .checked_add(ones as u64)
@@ -355,6 +399,42 @@ mod tests {
         golomb_rice_l2_planner_payload_bytes, rice_low_bits_for_cap, tail_z_planner_bits_per_coord,
         wire_rice_low_bits,
     };
+
+    #[test]
+    fn bit_reader_extracts_every_width_across_byte_and_word_boundaries() {
+        let storage: [u8; 40] = std::array::from_fn(|i| (i * 37 + 11) as u8);
+        for alignment in 0..8 {
+            let bytes = &storage[alignment..];
+            for offset in 0..64 {
+                for count in 0..=63 {
+                    let mut reader = BitReader::new(bytes);
+                    reader.bit_pos = offset;
+                    let window =
+                        u128::from_le_bytes(bytes[offset / 8..offset / 8 + 16].try_into().unwrap());
+                    let expected = ((window >> (offset % 8)) as u64) & ((1u64 << count) - 1);
+                    assert_eq!(reader.read_bits(count).unwrap(), expected);
+                    assert_eq!(reader.bit_pos(), offset + count as usize);
+                }
+            }
+        }
+        let bytes = [0xa5; 9];
+        for offset in 0..8 {
+            for count in 0..=63 {
+                let mut reader = BitReader::new(&bytes);
+                reader.bit_pos = offset;
+                let expected =
+                    0xa5a5_a5a5_a5a5_a5a5u64.rotate_right(offset as u32) & ((1u64 << count) - 1);
+                assert_eq!(reader.read_bits(count).unwrap(), expected);
+                assert_eq!(reader.bit_pos(), offset + count as usize);
+            }
+        }
+        let mut reader = BitReader::new(&bytes[..8]);
+        reader.bit_pos = 7;
+        assert!(reader.read_bits(58).is_err());
+        assert_eq!(reader.bit_pos(), 7);
+        assert!(reader.read_bits(64).is_err());
+        assert_eq!(reader.bit_pos(), 7);
+    }
 
     fn max_quotient_for_values(values: &[i64], rice_low_bits: u32, zigzag_w: u32) -> u64 {
         values
