@@ -579,9 +579,24 @@ fn fused_signed_digit_transform_preserves_coefficients() {
         let converter = CenteredI16NttConverter::new(&params, &[coefficients]);
         let mut actual = CyclotomicCrtNtt::zero();
         converter.transform_inline(&coefficients, &mut actual);
+        // The doubleword-store path needs 8-byte limbs; a target 4 bytes past
+        // an 8-byte boundary takes the element-wise path.
+        let mut misaligned = Misaligned {
+            _pad: 0,
+            ntt: CyclotomicCrtNtt::zero(),
+        };
+        assert_eq!(core::ptr::addr_of!(misaligned.ntt) as usize % 8, 4);
+        converter.transform_inline(&coefficients, &mut misaligned.ntt);
+        assert_eq!(misaligned.ntt, actual);
         let actual = actual.centered_coefficients_with_params(&params);
         for limb in actual {
             assert_eq!(limb, coefficients.map(i32::from));
         }
+    }
+
+    #[repr(C, align(8))]
+    struct Misaligned {
+        _pad: u32,
+        ntt: CyclotomicCrtNtt<i32, 6, 64>,
     }
 }
